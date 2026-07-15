@@ -243,6 +243,16 @@ def get_generic_profile() -> DomainProfile:
 
 # Ordered list: first match wins (more specific patterns first).
 _KEYWORD_RULES: list[tuple[list[str], str]] = [
+    # Automatic algorithm design / evolution (LLM4AD) — placed BEFORE the ML
+    # sub-domains so that "evolve an algorithm" style topics route here rather
+    # than being swallowed by the generic ML / "llm" patterns below.
+    (["llm4ad", "automatic algorithm design", "algorithm evolution",
+      "evolve algorithm", "evolve an algorithm", "evolve a heuristic",
+      "heuristic evolution", "evolutionary program synthesis",
+      "program synthesis", "island genetic algorithm", "island model ga",
+      "eureka heuristic", "funsearch", "automatic heuristic design"],
+     "algorithm_evolution"),
+
     # ML sub-domains (most specific first)
     (["reinforcement learning", "rl agent", "policy gradient", "q-learning",
       "actor-critic", "reward shaping", "gymnasium", "stable-baselines"],

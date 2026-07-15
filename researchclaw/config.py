@@ -105,6 +105,7 @@ EXPERIMENT_MODES = {
     "collider_agent",  # Physics: ColliderAgent via Claude Code + Magnus
     "biology_agent",   # Biology: Biology-Agent (FBA / pFBA / FVA via COBRApy + BIGG) via Claude Code
     "stat_agent",      # Statistics: stat_research_agent (sim studies, CI/coverage) via Claude Code
+    "llm4ad_agent",    # Algorithm evolution: LLM4AD build-task + island GA evolution
 }
 CLI_AGENT_PROVIDERS = {"llm", "claude_code", "codex"}
 
@@ -415,6 +416,74 @@ class StatAgentConfig:
 
 
 @dataclass(frozen=True)
+class Llm4adAgentConfig:
+    """Configuration for LLM4AD algorithm-evolution experiment mode.
+
+    Unlike the Claude-Code agent sandboxes (ColliderAgent / Biology-Agent /
+    stat_research_agent), this backend drives the external **LLM4AD**
+    framework directly: it (1) turns a natural-language problem description
+    into a full evolution task directory via ``build_task_sync`` (seed
+    algorithm + evaluator + dataset + config), then (2) runs the island
+    genetic-algorithm evolution loop (``LLM4AD.run``) to optimise
+    individuals.  Stage 12 executes both phases in one child process and
+    writes a canonical ``results.json`` at the workspace root.
+
+    The build phase and the evolution phase each use their OWN LLM,
+    independent of the AutoResearchClaw pipeline LLM:
+    * Build LLM   — configured by ``build_*`` fields below.
+    * Evolve LLM  — configured inside the generated ``config.yaml`` (it
+      references ``LLM_BASE_URL`` / ``LLM_API_KEY`` / ``LLM_MODEL``, which
+      are passed through the child-process environment).
+    """
+
+    # Optional path to the LLM4AD project.  Leave EMPTY (the default) when
+    # AutoResearchClaw is installed as a package inside the LLM4AD repo's
+    # own environment — ``import llm4ad`` then resolves directly and no
+    # PYTHONPATH manipulation is needed.  Only set this if llm4ad lives in a
+    # different location that is NOT already importable; when set, it is
+    # prepended to the child process's PYTHONPATH.
+    llm4ad_dir: str = ""
+    # Working directory for the evolution task + run artifacts.
+    working_dir: str = "llm4ad_workspace"
+    # Overall wall-clock timeout for the (legacy) combined build+evolve child
+    # process (seconds).  Kept for backward compatibility; when the pipeline
+    # splits build (Stage 10) and evolve (Stage 12) into separate stages, the
+    # per-phase timeouts below take precedence and this is used only as a
+    # fallback ceiling.
+    timeout_sec: int = 7200  # 2 hours — evolution can run many generations
+    # Per-phase timeouts (Stage 10 build vs Stage 12 evolve).  Split so a
+    # runaway build doesn't eat into the evolution wall-clock budget.  When
+    # ``timeout_sec`` alone is set (legacy configs), each phase falls back
+    # to it.
+    build_timeout_sec: int = 900     # 15 minutes — description → task_dir
+    evolve_timeout_sec: int = 7200   # 2 hours   — island GA
+    # Python interpreter used to launch the driver (empty = same as parent,
+    # i.e. sys.executable).  Point this at the venv that has llm4ad installed
+    # if it differs from the AutoResearchClaw interpreter.
+    python_binary: str = ""
+
+    # ── Build phase (Stage 1: description -> task directory) ───────────────
+    # These configure the LLM that generates seed/evaluator/dataset code.
+    # A capable model is strongly recommended — weak/flash models often emit
+    # buggy driver+evaluator code that exhausts the repair budget.
+    build_api_key: str = ""      # empty = read LLM4AD_BUILD_API_KEY / LLM_API_KEY from env
+    build_model: str = ""        # empty = read LLM4AD_BUILD_MODEL / LLM_MODEL from env
+    build_base_url: str = ""     # empty = read LLM4AD_BUILD_BASE_URL / LLM_BASE_URL from env
+    # validator's internal auto-repair budget per build (LLM4AD default is 3;
+    # 10 gives the repair loop more chances under a weaker build model).
+    max_repair_attempts: int = 10
+    # Whole-build retry budget (each BuildError re-rolls the stochastic
+    # generation; retrying usually succeeds).
+    build_max_tries: int = 3
+
+    # ── Evolution phase (Stage 2: island GA) ───────────────────────────────
+    # Optional resume from a prior evolution checkpoint (empty = fresh run).
+    resume_from_checkpoint: str = ""
+    # Direction the pipeline should treat ``primary_metric`` (best score).
+    metric_direction: str = "maximize"
+
+
+@dataclass(frozen=True)
 class CodeAgentConfig:
     """Configuration for the advanced multi-phase code generation agent."""
 
@@ -556,6 +625,7 @@ class ExperimentConfig:
     collider_agent: ColliderAgentConfig = field(default_factory=ColliderAgentConfig)
     biology_agent: BiologyAgentConfig = field(default_factory=BiologyAgentConfig)
     stat_agent: StatAgentConfig = field(default_factory=StatAgentConfig)
+    llm4ad_agent: Llm4adAgentConfig = field(default_factory=Llm4adAgentConfig)
     ssh_remote: SshRemoteConfig = field(default_factory=SshRemoteConfig)
     colab_drive: ColabDriveConfig = field(default_factory=ColabDriveConfig)
     code_agent: CodeAgentConfig = field(default_factory=CodeAgentConfig)
@@ -1231,6 +1301,32 @@ def _parse_stat_agent_config(data: dict[str, Any]) -> StatAgentConfig:
     )
 
 
+def _parse_llm4ad_agent_config(data: dict[str, Any]) -> Llm4adAgentConfig:
+    if not data:
+        return Llm4adAgentConfig()
+    return Llm4adAgentConfig(
+        llm4ad_dir=data.get("llm4ad_dir", ""),
+        working_dir=data.get("working_dir", "llm4ad_workspace"),
+        timeout_sec=_safe_int(data.get("timeout_sec"), 7200),
+        build_timeout_sec=_safe_int(
+            data.get("build_timeout_sec"),
+            _safe_int(data.get("timeout_sec"), 900),
+        ),
+        evolve_timeout_sec=_safe_int(
+            data.get("evolve_timeout_sec"),
+            _safe_int(data.get("timeout_sec"), 7200),
+        ),
+        python_binary=data.get("python_binary", ""),
+        build_api_key=data.get("build_api_key", ""),
+        build_model=data.get("build_model", ""),
+        build_base_url=data.get("build_base_url", ""),
+        max_repair_attempts=_safe_int(data.get("max_repair_attempts"), 10),
+        build_max_tries=_safe_int(data.get("build_max_tries"), 3),
+        resume_from_checkpoint=data.get("resume_from_checkpoint", ""),
+        metric_direction=data.get("metric_direction", "maximize"),
+    )
+
+
 def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
     sandbox_data = data.get("sandbox") or {}
     docker_data = data.get("docker") or {}
@@ -1300,6 +1396,7 @@ def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
         collider_agent=_parse_collider_agent_config(data.get("collider_agent") or {}),
         biology_agent=_parse_biology_agent_config(data.get("biology_agent") or {}),
         stat_agent=_parse_stat_agent_config(data.get("stat_agent") or {}),
+        llm4ad_agent=_parse_llm4ad_agent_config(data.get("llm4ad_agent") or {}),
         code_agent=_parse_code_agent_config(data.get("code_agent") or {}),
         opencode=_parse_opencode_config(data.get("opencode") or {}),
         benchmark_agent=_parse_benchmark_agent_config(

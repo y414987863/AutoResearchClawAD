@@ -197,6 +197,7 @@ _SEQUENCE_FIELD_MAP: dict[str, str] = {
 # has not set anything.
 _NESTED_BLOCK_FIELDS: tuple[str, ...] = (
     "collider_agent",
+    "llm4ad_agent",
     "agentic",
     "figure_agent",
     "code_agent",

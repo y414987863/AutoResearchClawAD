@@ -1,0 +1,136 @@
+domain_id: algorithm_evolution
+display_name: Automatic Algorithm Design (LLM4AD)
+parent_domain: ml
+
+# --- Deployment defaults ---------------------------------------------------
+# Consumed by researchclaw.domains.deploy when this profile is selected via
+# --profile algorithm_evolution or project.profile: algorithm_evolution.
+# preferred_experiment_mode is hardcoded to llm4ad_agent so that selecting
+# this domain ALWAYS routes stage-12 through the LLM4AD build+evolve backend.
+preferred_experiment_mode: llm4ad_agent        # maps to experiment.mode
+preferred_project_mode: full-auto              # maps to project.mode
+preferred_target_conference: neurips           # maps to export.target_conference
+default_time_budget_sec: 7200                  # 2 hours per evolution run
+default_max_iterations: 5
+default_metric_key: best_individual_score
+default_metric_direction: maximize
+
+# Nested block merged into experiment.llm4ad_agent (only fills blanks the
+# user's config.yaml leaves unset).  llm4ad_dir is left unset on purpose:
+# when AutoResearchClaw runs inside the LLM4AD repo's environment, ``import
+# llm4ad`` already resolves and no PYTHONPATH tweak is needed.  Set it only
+# if llm4ad lives somewhere that is not already importable.
+#
+# Pipeline mapping (as of the semantic-alignment refactor):
+#   Stage 9  EXPERIMENT_DESIGN   → writes llm4ad_plan.md (problem description)
+#                                  This is a *design* decision — Gate at Stage
+#                                  9 can reject a vague description before
+#                                  any build/evolve cost is spent.
+#   Stage 10 CODE_GENERATION     → runs build_task_sync (short, ~5-15 min)
+#                                  = LLM4AD's build function ①: generates
+#                                    seed.py + evaluation.py + dataset +
+#                                    config.yaml.  Analogous to ML mode
+#                                    generating train.py / evaluate.py.
+#   Stage 11 RESOURCE_PLANNING   → reads config.yaml to estimate real
+#                                  evolve cost (LLM calls, wall time)
+#   Stage 12 EXPERIMENT_RUN      → runs LLM4AD.run() island GA (long, ~1-2h)
+#                                  = LLM4AD's function ②: real evolution
+#                                    experiment producing best_individual
+#   Stage 15 refine  → rollback to Stage 10 (rebuild + re-evolve)
+#            pivot   → rollback to Stage 9  (rewrite description)
+#
+# ``build_timeout_sec`` and ``evolve_timeout_sec`` govern each phase
+# independently; ``timeout_sec`` remains as a legacy fallback for the
+# combined build+evolve path (used only when Stage 10 build_result.json is
+# absent, e.g. running against an older pipeline snapshot).
+llm4ad_agent:
+  working_dir: llm4ad_workspace
+  timeout_sec: 7200          # legacy combined fallback
+  build_timeout_sec: 900     # Stage 10 build phase — 15 min ceiling
+  evolve_timeout_sec: 7200   # Stage 12 evolve phase — 2 hour ceiling
+  max_repair_attempts: 10
+  build_max_tries: 3
+  metric_direction: maximize
+
+# FigureAgent: the default researchclaw/experiment:latest CUDA image is
+# gross overkill for algorithm-evolution charts (mostly convergence
+# curves).  Run the plot generator locally to avoid Docker image pulls.
+figure_agent:
+  use_docker: false
+
+experiment_paradigm: benchmark
+
+condition_terminology:
+  baseline: seed / hand-crafted heuristic
+  proposed: evolved algorithm (best individual)
+  variant: island / generation variation
+  input: problem instance / evaluation dataset
+  metric: best individual fitness score
+
+typical_file_structure:
+  seed.py: "Seed algorithm: a simple correct implementation to evolve from"
+  evaluation.py: "Deterministic evaluator returning a single float score"
+  main.py: "Entry point: build task, run island GA, report best individual"
+
+entry_point: main.py
+
+core_libraries:
+  - numpy
+  - scipy
+
+docker_image: researchclaw/sandbox-generic:latest
+gpu_required: false
+
+pip_packages:
+  - numpy
+  - scipy
+
+metric_types:
+  - scalar
+
+standard_baselines:
+  - seed / naive heuristic score
+  - published best-known algorithm for the problem (if any)
+
+evaluation_protocol: >
+  Run the island genetic algorithm for the configured generation / time
+  budget. Score each candidate with the deterministic evaluator and report
+  the best individual's fitness. Compare the evolved algorithm against the
+  seed baseline; success means the best score strictly improves on the seed
+  in the objective's direction.
+
+statistical_tests:
+  - best_vs_seed_improvement
+
+output_formats:
+  - latex_table
+  - convergence_plot
+
+figure_types:
+  - fitness_vs_generation
+  - best_score_bar_vs_baseline
+
+github_search_terms:
+  - llm automatic algorithm design
+  - evolutionary program synthesis python
+  - genetic algorithm heuristic evolution
+
+paper_keywords:
+  - automatic algorithm design
+  - evolutionary computation
+  - large language models
+  - heuristic optimization
+  - program synthesis
+
+code_generation_hints: |
+  Algorithm-evolution task requirements:
+  1. Define exactly ONE function to evolve, with a clear typed signature.
+  2. Provide a correct, crash-free seed algorithm (it may be naive).
+  3. The evaluator must be deterministic and return a single float score.
+  4. Keep the evaluation dataset small so many generations run quickly.
+  5. Handle edge cases (empty input, ties) so the seed never raises.
+
+  ANTI-PATTERNS (DO NOT do these):
+  - Do NOT make the evaluator stochastic without seeding — it breaks scoring.
+  - Do NOT let the seed algorithm raise on any evaluation input.
+  - Do NOT pull in heavyweight ML frameworks for a plain algorithmic task.

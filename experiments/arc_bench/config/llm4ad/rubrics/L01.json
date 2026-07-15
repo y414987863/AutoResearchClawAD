@@ -1,0 +1,109 @@
+{
+    "id": "l01-root",
+    "requirements": "A smoke study validating that the LLM4AD island genetic algorithm can evolve a constructive node-selection heuristic for the Euclidean Travelling Salesman Problem that beats nearest-neighbour construction on a small fixed suite of random instances. The agent (via the llm4ad_agent pipeline) must (a) build a well-formed LLM4AD task: one function-to-evolve with a clear signature, a correct seed algorithm reproducing nearest-neighbour, a deterministic evaluator returning a single float score, and a small fixed instance suite; (b) run the island GA to evolve the scoring function; (c) surface a canonical results.json whose primary_metric is best_individual_score = 1 - mean_tour_length/nearest_neighbour_mean; and (d) produce a writeup assigning supported / refuted / inconclusive verdicts to H1, H2, H3 with numerical evidence.",
+    "judging_note": "Algorithm-evolution smoke topics are scored on (i) whether the built LLM4AD task is well-formed (function-to-evolve, correct seed, deterministic evaluator, fixed instance suite), (ii) whether the evolve phase actually ran and produced a best individual with a finite score, (iii) whether the evolved heuristic beats the nearest-neighbour reference (best_individual_score > 0) and by how much, and (iv) whether per-hypothesis claims are backed by numerical evidence. Quantitative result leaves are scored on a graded scale: 100% if the hypothesis threshold is cleanly met, 67% if the trend is in the predicted direction but does not clear the numerical threshold, 33% if the trend is ambiguous, 0% if the result contradicts the hypothesis or evidence is missing. NOTE: the autoclaw default judge runs in results_only mode and skips Code Development leaves; they are retained so a future code-aware judge can score the built task without re-authoring the rubric.",
+    "weight": 1,
+    "sub_tasks": [
+        {
+            "id": "l01-code",
+            "requirements": "Code-development bucket: the LLM4AD task built at Stage 10 is well-formed — a single function-to-evolve with a clear signature, a correct nearest-neighbour seed, and a deterministic evaluator over a fixed instance suite.",
+            "weight": 2,
+            "sub_tasks": [
+                {
+                    "id": "l01-code-function-to-evolve",
+                    "requirements": "The built task defines exactly ONE function to evolve with a precise typed signature that scores/ranks a candidate next-city given the current partial tour and the set of unvisited cities (e.g. select_next(current_city, unvisited, coords) -> chosen_city, or a score(candidate, ...) -> float used by a greedy constructor). The signature is stable and documented in seed.py / the task config so the island GA mutates a single well-defined target. Hand-conflating construction + local search into the evolved function fails this leaf.",
+                    "weight": 10.0,
+                    "sub_tasks": [],
+                    "task_category": "Code Development",
+                    "finegrained_task_category": "Method Implementation"
+                },
+                {
+                    "id": "l01-code-seed-is-nn",
+                    "requirements": "The seed algorithm is a CORRECT constructive heuristic that reproduces nearest-neighbour construction (scores candidates by negative Euclidean distance to the current city, greedily appends the closest unvisited city) and runs without error on every evaluation instance. This anchors the evolutionary starting point at the reference (score ~0.0) so any positive best_individual_score is attributable to evolution, not to a pre-tuned seed.",
+                    "weight": 8.0,
+                    "sub_tasks": [],
+                    "task_category": "Code Development",
+                    "finegrained_task_category": "Experimental Setup"
+                },
+                {
+                    "id": "l01-code-deterministic-evaluator",
+                    "requirements": "The evaluator is deterministic: a fixed RNG seed generates a fixed suite of ~20 random Euclidean instances (~20 cities in the unit square), tour length is the sum of Euclidean edge lengths on the closed tour, and the returned score is a single float 1 - mean_tour_length/nearest_neighbour_mean_tour_length. Re-running the evaluator on the same candidate yields the same score (no per-call randomness), which is required for the island GA to compare individuals meaningfully.",
+                    "weight": 6.0,
+                    "sub_tasks": [],
+                    "task_category": "Code Development",
+                    "finegrained_task_category": "Experimental Setup"
+                }
+            ],
+            "task_category": null,
+            "finegrained_task_category": null
+        },
+        {
+            "id": "l01-exec",
+            "requirements": "Execution-validity bucket: the build succeeded and the island GA evolve phase ran to completion, producing a best individual with a finite score.",
+            "weight": 2,
+            "sub_tasks": [
+                {
+                    "id": "l01-exec-build-and-evolve-ran",
+                    "requirements": "build_result.json status is success (Stage 10 produced task_dir + config.yaml + seed + evaluator) AND the Stage 12 evolve phase completed: results.json exists with status ok/success, metric_key = best_individual_score, and structured_results carries the best evolved individual (its code/algorithm and score). llm4ad_evolve_success is 1. A run where build succeeded but evolve never produced a best individual fails this leaf.",
+                    "weight": 10.0,
+                    "sub_tasks": [],
+                    "task_category": "Code Execution",
+                    "finegrained_task_category": "Evaluation, Metrics & Benchmarking"
+                },
+                {
+                    "id": "l01-exec-numerical",
+                    "requirements": "Numerical validity: primary_metric (best_individual_score) is a finite float (no NaN/Inf). The reported mean_tour_length values for the evolved heuristic, the nearest-neighbour reference, and the random-construction baseline are all positive and finite, and random_construction is strictly worse (longer mean tour) than nearest-neighbour — confirming the evaluator actually distinguishes tour quality rather than returning a constant.",
+                    "weight": 10.0,
+                    "sub_tasks": [],
+                    "task_category": "Code Execution",
+                    "finegrained_task_category": "Evaluation, Metrics & Benchmarking"
+                }
+            ],
+            "task_category": null,
+            "finegrained_task_category": null
+        },
+        {
+            "id": "l01-results",
+            "requirements": "Results bucket: quantitative tests of H1/H2/H3 plus a per-hypothesis writeup.",
+            "weight": 3,
+            "sub_tasks": [
+                {
+                    "id": "l01-result-h1-quant",
+                    "requirements": "Quantitative test of H1. Is best_individual_score strictly greater than 0.0 (the evolved heuristic produces shorter mean tours than nearest-neighbour)? 100% if score > 0.0 by a clear margin (>= 0.01), 67% if score is marginally positive (0 < score < 0.01), 33% if score is ~0.0 (ties nearest-neighbour within noise), 0% if score is negative (evolved heuristic is worse) or missing.",
+                    "weight": 10.0,
+                    "sub_tasks": [],
+                    "task_category": "Result Analysis",
+                    "finegrained_task_category": "Evaluation, Metrics & Benchmarking"
+                },
+                {
+                    "id": "l01-result-h2-quant",
+                    "requirements": "Quantitative test of H2. Does the evolved heuristic improve mean tour length over nearest-neighbour by at least 3 percent (best_individual_score >= 0.03)? 100% if score >= 0.03, 67% if score >= 0.015, 33% if score > 0 but < 0.015, 0% if score <= 0.",
+                    "weight": 8.0,
+                    "sub_tasks": [],
+                    "task_category": "Result Analysis",
+                    "finegrained_task_category": "Evaluation, Metrics & Benchmarking"
+                },
+                {
+                    "id": "l01-result-h3-quant",
+                    "requirements": "Quantitative test of H3. Does the evolved function remain a pure constructive node-selection rule with no full-tour local search (no 2-opt / or-opt / swap-repair loop over a complete tour)? 100% if the best evolved code is inspected and confirmed selection-only, 67% if selection-only is stated and consistent with the code structure but not explicitly verified, 33% if ambiguous, 0% if the evolved function clearly performs local search (making the comparison to constructive nearest-neighbour unfair) or H3 is unaddressed.",
+                    "weight": 8.0,
+                    "sub_tasks": [],
+                    "task_category": "Result Analysis",
+                    "finegrained_task_category": "Logging, Analysis & Presentation"
+                },
+                {
+                    "id": "l01-result-writeup",
+                    "requirements": "Writeup of at least 200 words (in submission/README.md ## Agent-produced writeup section, or the results.json summary) with an explicit supported / refuted / inconclusive verdict for each of H1, H2, H3 backed by specific numbers (best_individual_score, improvement percentage over nearest-neighbour, evolved vs nearest-neighbour vs random mean tour lengths). Identifies the dominant systematic uncertainty (small fixed instance suite, LLM/GA nondeterminism across runs, ~20-city scale) and discusses whether the advantage would hold on larger instances or with more generations.",
+                    "weight": 12.0,
+                    "sub_tasks": [],
+                    "task_category": "Result Analysis",
+                    "finegrained_task_category": "Logging, Analysis & Presentation"
+                }
+            ],
+            "task_category": null,
+            "finegrained_task_category": null
+        }
+    ],
+    "task_category": null,
+    "finegrained_task_category": null
+}

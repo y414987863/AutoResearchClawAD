@@ -100,6 +100,12 @@ def create_sandbox(config: ExperimentConfig, workdir: Path) -> SandboxProtocol:
         sa_cfg = config.stat_agent
         return StatAgentSandbox(sa_cfg, workdir)
 
+    if config.mode == "llm4ad_agent":
+        from researchclaw.experiment.llm4ad_agent_sandbox import Llm4adAgentSandbox
+
+        la_cfg = config.llm4ad_agent
+        return Llm4adAgentSandbox(la_cfg, workdir)
+
     if config.mode != "sandbox":
         raise RuntimeError(
             f"Unsupported experiment mode for create_sandbox(): {config.mode}"

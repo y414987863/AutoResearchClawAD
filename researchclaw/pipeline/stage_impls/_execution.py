@@ -50,6 +50,24 @@ def _execute_resource_planning(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    # ── LLM4AD mode: real-cost estimation from Stage 10's config.yaml ─────
+    # For llm4ad_agent we have hard numbers (config.yaml carries
+    # max_sample_nums / islands / generations), so we can produce a real
+    # schedule that the pipeline / user can act on — not the generic
+    # "1 GPU, 20 min baseline" fallback that has no relation to island GA.
+    if config.experiment.mode == "llm4ad_agent":
+        schedule = _plan_llm4ad_resources(run_dir, config)
+        schedule.setdefault("generated", _utcnow_iso())
+        (stage_dir / "schedule.json").write_text(
+            json.dumps(schedule, indent=2), encoding="utf-8"
+        )
+        return StageResult(
+            stage=Stage.RESOURCE_PLANNING,
+            status=StageStatus.DONE,
+            artifacts=("schedule.json",),
+            evidence_refs=("stage-11/schedule.json",),
+        )
+
     exp_plan = _read_prior_artifact(run_dir, "exp_plan.yaml") or ""
     schedule: dict[str, Any] | None = None
     if llm is not None:
@@ -99,6 +117,185 @@ def _execute_resource_planning(
         artifacts=("schedule.json",),
         evidence_refs=("stage-11/schedule.json",),
     )
+
+
+def _plan_llm4ad_resources(run_dir: Path, config: RCConfig) -> dict[str, Any]:
+    """Estimate real evolve-phase cost from Stage 10's config.yaml.
+
+    Reads the Stage 10 build_result.json → config.yaml → extracts LLM4AD's
+    generation-count / sampler-count / max-sample-nums so the schedule
+    reflects the actual number of LLM calls the island GA will make, not
+    a hard-coded "1 GPU × 20 min" placeholder.
+
+    Falls back gracefully if any file is missing or malformed — this stage
+    is not a Gate for llm4ad, so best-effort estimation is fine.
+    """
+    la_cfg = config.experiment.llm4ad_agent
+    schedule: dict[str, Any] = {
+        "mode": "llm4ad_agent",
+        "generated": _utcnow_iso(),
+        "sources": [],
+    }
+
+    build_doc: dict[str, Any] | None = None
+    build_result_text = _read_prior_artifact(run_dir, "build_result.json")
+    if build_result_text:
+        try:
+            _cand = json.loads(build_result_text)
+            if isinstance(_cand, dict):
+                build_doc = _cand
+                schedule["sources"].append("stage-10/build_result.json")
+        except json.JSONDecodeError:
+            pass
+
+    config_yaml: dict[str, Any] = {}
+    config_path: Path | None = None
+    if build_doc and build_doc.get("config_path"):
+        _p = Path(build_doc["config_path"])
+        if _p.is_file():
+            config_path = _p
+            try:
+                import yaml as _yaml
+                _cfg_raw = _yaml.safe_load(_p.read_text(encoding="utf-8"))
+                if isinstance(_cfg_raw, dict):
+                    config_yaml = _cfg_raw
+                    schedule["sources"].append(str(_p))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Stage 11 (llm4ad_agent): could not parse config.yaml (%s)",
+                    exc,
+                )
+
+    def _dig(d: dict[str, Any], *keys: str, default: Any = None) -> Any:
+        """Look up a value by trying multiple key variants (LLM4AD versions
+        have shifted key names over time)."""
+        for k in keys:
+            if isinstance(d, dict) and k in d:
+                return d[k]
+        for section in ("evolution", "sampler", "profiler", "island_ga"):
+            sub = d.get(section) if isinstance(d, dict) else None
+            if isinstance(sub, dict):
+                for k in keys:
+                    if k in sub:
+                        return sub[k]
+        return default
+
+    max_sample_nums = _dig(config_yaml, "max_sample_nums", "num_samples")
+    num_samplers = _dig(config_yaml, "num_samplers", "n_samplers", default=1)
+    num_islands = _dig(config_yaml, "num_islands", "n_islands", default=1)
+    generations = _dig(config_yaml, "generations", "num_generations")
+    pop_size = _dig(config_yaml, "pop_size", "population_size")
+
+    # Estimated total LLM-evolve calls: prefer max_sample_nums if present,
+    # otherwise derive from generations × pop_size × islands.
+    est_llm_calls: int | None = None
+    if isinstance(max_sample_nums, int) and max_sample_nums > 0:
+        est_llm_calls = max_sample_nums
+    elif (
+        isinstance(generations, int) and generations > 0
+        and isinstance(pop_size, int) and pop_size > 0
+    ):
+        est_llm_calls = generations * pop_size * (
+            num_islands if isinstance(num_islands, int) and num_islands > 0 else 1
+        )
+
+    # Wall-clock estimate: a very rough default of 8s / evolve LLM call
+    # (mixture of API latency + evaluator run).  User can override the
+    # wall_seconds_per_call assumption via config.yaml.
+    seconds_per_call = _dig(config_yaml, "wall_seconds_per_call", default=8)
+    if not isinstance(seconds_per_call, (int, float)) or seconds_per_call <= 0:
+        seconds_per_call = 8
+    est_wall_sec: int | None = None
+    if est_llm_calls is not None:
+        # Parallelised across samplers → divide.
+        eff_samplers = (
+            num_samplers if isinstance(num_samplers, int) and num_samplers > 0 else 1
+        )
+        est_wall_sec = int(est_llm_calls * seconds_per_call / eff_samplers)
+
+    # Cap by the sandbox's configured evolve timeout.
+    evolve_budget_sec = la_cfg.evolve_timeout_sec or la_cfg.timeout_sec
+
+    schedule.update(
+        {
+            "config_path": str(config_path) if config_path else None,
+            "build_status": (
+                build_doc.get("status") if build_doc else "missing"
+            ),
+            "evolve_parameters": {
+                "max_sample_nums": max_sample_nums,
+                "num_samplers": num_samplers,
+                "num_islands": num_islands,
+                "generations": generations,
+                "pop_size": pop_size,
+                "seconds_per_call_assumed": seconds_per_call,
+            },
+            "estimated_llm_calls": est_llm_calls,
+            "estimated_wall_sec": est_wall_sec,
+            "evolve_timeout_sec": evolve_budget_sec,
+            "build_timeout_sec": la_cfg.build_timeout_sec or la_cfg.timeout_sec,
+            "will_fit_in_budget": (
+                est_wall_sec is not None
+                and evolve_budget_sec > 0
+                and est_wall_sec <= evolve_budget_sec
+            ),
+            "tasks": [
+                {
+                    "id": "llm4ad-build",
+                    "name": "LLM4AD build_task_sync (already ran in Stage 10)",
+                    "depends_on": [],
+                    "gpu_count": 0,
+                    "estimated_minutes": (
+                        round(build_doc.get("elapsed_sec", 0) / 60, 1)
+                        if build_doc and isinstance(
+                            build_doc.get("elapsed_sec"), (int, float)
+                        )
+                        else None
+                    ),
+                    "priority": "critical",
+                    "status": (
+                        "completed" if build_doc and build_doc.get("status") == "success"
+                        else "failed"
+                    ),
+                },
+                {
+                    "id": "llm4ad-evolve",
+                    "name": "LLM4AD island GA evolution (Stage 12)",
+                    "depends_on": ["llm4ad-build"],
+                    "gpu_count": 0,
+                    "estimated_minutes": (
+                        round(est_wall_sec / 60, 1)
+                        if est_wall_sec is not None else None
+                    ),
+                    "priority": "critical",
+                    "status": "pending",
+                    "estimated_llm_calls": est_llm_calls,
+                },
+            ],
+            "total_gpu_budget": 0,
+        }
+    )
+
+    if est_wall_sec is not None and evolve_budget_sec > 0 and est_wall_sec > evolve_budget_sec:
+        logger.warning(
+            "Stage 11 (llm4ad_agent): estimated evolve wall time %ds "
+            "EXCEEDS evolve_timeout_sec %ds — Stage 12 will hit the wall "
+            "clock ceiling before finishing all samples.  Consider "
+            "raising llm4ad_agent.evolve_timeout_sec or reducing config.yaml's "
+            "max_sample_nums / generations / pop_size.",
+            est_wall_sec, evolve_budget_sec,
+        )
+        schedule["warnings"] = [
+            f"estimated_wall_sec ({est_wall_sec}s) > evolve_timeout_sec ({evolve_budget_sec}s)"
+        ]
+
+    logger.info(
+        "Stage 11 (llm4ad_agent): evolve budget: est %s LLM calls, "
+        "est %s wall-sec, ceiling %ss (fits=%s)",
+        est_llm_calls, est_wall_sec, evolve_budget_sec,
+        schedule.get("will_fit_in_budget"),
+    )
+    return schedule
 
 
 def _estimate_stage12_footprint_bytes(run_dir: Path) -> int:
@@ -286,6 +483,202 @@ def _execute_experiment_run(
             evidence_refs=("stage-12/runs/",),
         )
     # ── End ColliderAgent mode ──────────────────────────────────────────
+
+    # ── LLM4AD algorithm-evolution mode ─────────────────────────────────
+    if mode == "llm4ad_agent":
+        from researchclaw.experiment.llm4ad_agent_sandbox import Llm4adAgentSandbox
+
+        la_cfg = config.experiment.llm4ad_agent
+        workspace = runs_dir / (la_cfg.working_dir or "llm4ad_workspace")
+        workspace.mkdir(parents=True, exist_ok=True)
+        sandbox = Llm4adAgentSandbox(la_cfg, workspace)
+
+        # ── Stage-split path: Stage 10 already ran build_task_sync and left
+        # a build_result.json pointing at config.yaml.  Stage 12's job is to
+        # run ONLY the evolution phase on that config.
+        build_doc: dict[str, Any] | None = None
+        build_result_text = _read_prior_artifact(run_dir, "build_result.json")
+        if build_result_text:
+            try:
+                _cand = json.loads(build_result_text)
+                if isinstance(_cand, dict):
+                    build_doc = _cand
+            except json.JSONDecodeError:
+                build_doc = None
+
+        config_path_str: str | None = None
+        if build_doc and build_doc.get("status") == "success":
+            config_path_str = build_doc.get("config_path")
+
+        if config_path_str and Path(config_path_str).is_file():
+            logger.info(
+                "Stage 12 (llm4ad_agent): evolving on Stage 10 build "
+                "(config=%s)",
+                config_path_str,
+            )
+            result = sandbox.run_evolve(
+                Path(config_path_str),
+                timeout_sec=la_cfg.evolve_timeout_sec or la_cfg.timeout_sec,
+            )
+        else:
+            # Backward-compat / build-failure fallback: Stage 10 either
+            # didn't produce a valid build_result.json (older pipeline
+            # version, or the split-stage path was skipped) OR the build
+            # failed.  Run the combined build+evolve inside Stage 12 so we
+            # still produce a canonical results.json instead of just a
+            # crash log.  The requirements gate can then judge whether to
+            # roll back to Stage 10 for a fresh description or to Stage 8
+            # for a fresh hypothesis.
+            if build_doc:
+                logger.warning(
+                    "Stage 12 (llm4ad_agent): Stage 10 build failed "
+                    "(status=%s) — falling back to combined build+evolve",
+                    build_doc.get("status"),
+                )
+            else:
+                logger.info(
+                    "Stage 12 (llm4ad_agent): no Stage 10 build_result.json "
+                    "found — running combined build+evolve for backward compat"
+                )
+            prompt_text = (
+                _read_prior_artifact(run_dir, "llm4ad_plan.md")
+                or _read_prior_artifact(run_dir, "exp_plan.yaml")
+                or _read_prior_artifact(run_dir, "hypothesis.md")
+                or ""
+            )
+            if not prompt_text:
+                prompt_text = (
+                    f"# Algorithm Evolution Task\n\n"
+                    f"Evolve an efficient algorithm for the following research "
+                    f"topic:\n\n{config.research.topic}\n"
+                )
+            result = sandbox.run(prompt_text, timeout_sec=la_cfg.timeout_sec)
+
+        structured_results = None
+        results_json_path = workspace / "results.json"
+        if results_json_path.exists():
+            try:
+                structured_results = json.loads(
+                    results_json_path.read_text(encoding="utf-8")
+                )
+                (runs_dir / "results.json").write_text(
+                    results_json_path.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+            except (json.JSONDecodeError, OSError):
+                structured_results = None
+
+        if result.returncode == 0 and not result.timed_out:
+            run_status = "completed"
+        elif result.timed_out and result.metrics:
+            run_status = "partial"
+        else:
+            run_status = "failed"
+
+        # Detect catastrophic failure: immediate crash with no data collected.
+        # This typically indicates a code/config error (import failure, syntax
+        # error, missing API key) rather than a scientific "negative result".
+        # Terminate immediately so users get fast feedback instead of waiting
+        # through Stage 13-14-15.
+        #
+        # Criteria for catastrophic failure (all must be true):
+        #   1. Non-zero exit code (actual error, not graceful completion)
+        #   2. No real scientific result was written
+        #   3. Not a timeout (timeouts may still yield partial data)
+        #   4. Failed quickly (<60s = likely code error, not slow convergence)
+        #
+        # NOTE: we must NOT test ``not result.metrics`` here — the sandbox's
+        # _build_metrics ALWAYS returns a non-empty dict (llm4ad_agent_success,
+        # figures_produced, ...) AND always synthesizes a fallback
+        # ``primary_metric`` from the success bit, so neither ``result.metrics``
+        # nor its ``primary_metric`` key can distinguish a crash from success.
+        # The only trustworthy signal is the driver's own results.json: a real
+        # evolution writes a numeric ``primary_metric``, whereas a crash writes
+        # a failure stub with ``primary_metric: null`` (or no file at all, in
+        # which case structured_results is None).
+        _real_primary = (
+            structured_results.get("primary_metric")
+            if isinstance(structured_results, dict)
+            else None
+        )
+        catastrophic_failure = (
+            result.returncode != 0
+            and not isinstance(_real_primary, (int, float))
+            and not result.timed_out
+            and result.elapsed_sec < 60
+        )
+
+        if catastrophic_failure:
+            error_summary = (
+                f"LLM4AD evolution failed immediately (rc={result.returncode}, "
+                f"elapsed={result.elapsed_sec:.1f}s) with no data collected. "
+                f"This typically indicates a code or configuration error."
+            )
+            stderr_tail = (result.stderr or "").strip()
+            if stderr_tail:
+                tail_lines = stderr_tail.splitlines()[-15:]
+                error_detail = "\n".join(tail_lines)
+                error_summary += f"\n\nLast stderr lines:\n{error_detail}"
+                logger.error(
+                    "Stage 12 (llm4ad_agent): catastrophic failure — terminating pipeline\n%s",
+                    error_detail,
+                )
+            else:
+                logger.error(
+                    "Stage 12 (llm4ad_agent): catastrophic failure — terminating pipeline"
+                )
+
+            # Still write run-1.json for debugging
+            run_payload: dict[str, Any] = {
+                "run_id": "run-1",
+                "task_id": "llm4ad-agent-main",
+                "status": "catastrophic_failure",
+                "metrics": result.metrics,
+                "elapsed_sec": result.elapsed_sec,
+                "stdout": result.stdout[:4000] if result.stdout else "",
+                "stderr": result.stderr[:2000] if result.stderr else "",
+                "timed_out": result.timed_out,
+                "completed_at": _utcnow_iso(),
+                "error": error_summary,
+            }
+            if structured_results is not None:
+                run_payload["structured_results"] = structured_results
+            (runs_dir / "run-1.json").write_text(
+                json.dumps(run_payload, indent=2), encoding="utf-8"
+            )
+
+            return StageResult(
+                stage=Stage.EXPERIMENT_RUN,
+                status=StageStatus.FAILED,
+                artifacts=("runs/",),
+                evidence_refs=("stage-12/runs/",),
+                error=error_summary,
+            )
+
+        # Normal completion path (success, partial, or recoverable failure)
+        run_payload: dict[str, Any] = {
+            "run_id": "run-1",
+            "task_id": "llm4ad-agent-main",
+            "status": run_status,
+            "metrics": result.metrics,
+            "elapsed_sec": result.elapsed_sec,
+            "stdout": result.stdout[:4000] if result.stdout else "",
+            "stderr": result.stderr[:2000] if result.stderr else "",
+            "timed_out": result.timed_out,
+            "completed_at": _utcnow_iso(),
+        }
+        if structured_results is not None:
+            run_payload["structured_results"] = structured_results
+        (runs_dir / "run-1.json").write_text(
+            json.dumps(run_payload, indent=2), encoding="utf-8"
+        )
+
+        return StageResult(
+            stage=Stage.EXPERIMENT_RUN,
+            status=StageStatus.DONE,
+            artifacts=("runs/",),
+            evidence_refs=("stage-12/runs/",),
+        )
+    # ── End LLM4AD mode ──────────────────────────────────────────────────
 
     if mode in ("sandbox", "docker"):
         # P7: Auto-install missing dependencies before subprocess sandbox
@@ -522,12 +915,13 @@ def _execute_iterative_refine(
     # repair loop in pipeline/runner.py handles separately).  Create
     # placeholder artifacts and exit so downstream stages see a non-empty
     # experiment_final/.
-    if config.experiment.mode in ("collider_agent", "biology_agent", "stat_agent"):
+    if config.experiment.mode in ("collider_agent", "biology_agent", "stat_agent", "llm4ad_agent"):
         agent_label = config.experiment.mode
         agent_pretty = {
             "collider_agent": "ColliderAgent",
             "biology_agent": "Biology-Agent",
             "stat_agent": "stat_research_agent",
+            "llm4ad_agent": "LLM4AD-Agent",
         }.get(agent_label, agent_label)
         logger.info(
             "Stage 13: Skipping iterative refinement in %s mode "

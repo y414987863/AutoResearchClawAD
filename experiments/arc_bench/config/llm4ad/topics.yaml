@@ -1,0 +1,27 @@
+# ============================================================================
+# ARC-Bench LLM4AD — open-ended automatic-algorithm-design (algorithm evolution)
+# ----------------------------------------------------------------------------
+# L01+ are CPU-only algorithm-evolution topics. They run through the LLM4AD
+# integration (experiment.mode = llm4ad_agent): Stage 10 build_task_sync
+# produces seed + evaluator + dataset + config, Stage 12 runs LLM4AD.run()
+# island GA to evolve the target function. No GPU, no external Claude-Code
+# agent — the LLM4AD library is imported directly.
+#
+# Manifests live in   config/llm4ad/manifests/LNN.yaml
+# Rubrics  live in    config/llm4ad/rubrics/LNN.json
+#
+# Entry-point wiring (to be added by the harness owner):
+#   - prepare_run.py  _PREFIX_MAP : "L" -> "llm4ad"
+#   - judge.py        _PREFIX_MAP : "L" -> "llm4ad"
+#   - run_e2e_topic.py PREFIX_TO_PROFILE : "L" -> ("algorithm_evolution", "llm4ad_agent")
+# ============================================================================
+
+topics:
+  - id: L01
+    topic: "Evolving a constructive heuristic for the Euclidean Travelling Salesman Problem: can an island genetic algorithm discover a node-selection rule that beats nearest-neighbour construction on small random instances"
+    domains:
+      - algorithm-evolution
+      - combinatorial-optimization
+      - constructive-heuristics
+    metric_key: best_individual_score
+    metric_direction: maximize

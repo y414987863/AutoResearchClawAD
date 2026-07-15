@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time as _time
 from pathlib import Path
+from typing import Callable
 
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
@@ -441,8 +442,31 @@ def execute_pipeline(
     skip_noncritical: bool = False,
     kb_root: Path | None = None,
     cancel_event: "threading.Event | None" = None,
+    progress_callback: "Callable[[dict], None] | None" = None,
 ) -> list[StageResult]:
-    """Execute pipeline stages sequentially from *from_stage* to *to_stage* (inclusive)."""
+    """Execute pipeline stages sequentially from *from_stage* to *to_stage* (inclusive).
+
+    ``progress_callback``: optional sink for structured stage-progress events.
+    When supplied, it is invoked (best-effort, exceptions swallowed) at each
+    stage boundary with a dict payload::
+
+        {"type": "stage_start", "stage": <int>, "name": <str>}
+        {"type": "stage_end",   "stage": <int>, "name": <str>,
+         "status": "done"|"failed"|"degraded"|..., "elapsed_sec": <float>,
+         "error": <str|None>}
+
+    This lets an out-of-process bridge (e.g. the LLM4AD web backend) push live
+    progress without polling the run directory.  The callback is threaded into
+    the recursive REFINE/PIVOT re-run below so rolled-back stages report too.
+    """
+
+    def _notify_progress(**payload: object) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(dict(payload))
+        except Exception:  # noqa: BLE001 — never let a bad sink break the pipeline
+            logger.debug("progress_callback raised (ignored)")
 
     results: list[StageResult] = []
     started = False
@@ -504,6 +528,9 @@ def execute_pipeline(
             except Exception:
                 pass
 
+        # ── Progress callback: stage start ──
+        _notify_progress(type="stage_start", stage=stage_num, name=stage.name)
+
         # ── Cost budget check ──
         if cost_budget > 0:
             try:
@@ -547,6 +574,13 @@ def execute_pipeline(
                 ))
             except Exception:
                 pass
+
+        # ── Progress callback: stage end ──
+        _notify_progress(
+            type="stage_end", stage=stage_num, name=stage.name,
+            status=result.status.value, elapsed_sec=round(elapsed, 1),
+            error=result.error,
+        )
 
         # ── ExperimentSpec: generate after design, validate after analysis ──
         if stage == Stage.EXPERIMENT_DESIGN and result.status == StageStatus.DONE:
@@ -678,7 +712,7 @@ def execute_pipeline(
             # sandboxes redundantly re-spawns the whole agent.  Skip the
             # python-code repair loop entirely; the proceed-or-reject decision
             # belongs in stage 15 RESEARCH_DECISION.
-            and config.experiment.mode not in ("collider_agent", "biology_agent", "stat_agent")
+            and config.experiment.mode not in ("collider_agent", "biology_agent", "stat_agent", "llm4ad_agent")
         ):
             _run_experiment_diagnosis(run_dir, config, run_id)
 
@@ -720,14 +754,29 @@ def execute_pipeline(
                 # Stage 13 ITERATIVE_REFINE is a no-op for these modes (it
                 # would refine python files the agent never executed), so
                 # routing REFINE there wastes a pipeline cycle.  Send REFINE
-                # straight back to EXPERIMENT_RUN so the sandbox re-spawns
-                # claude with the REPAIR_PROMPT.md the requirements gate
-                # just wrote.
-                if (
-                    config.experiment.mode in ("collider_agent", "biology_agent", "stat_agent")
+                # back to the earliest stage that actually produces the
+                # artifacts we want re-generated:
+                #   collider/biology/stat_agent → Stage 12 (the sandbox itself
+                #     handles the whole run atomically, so re-spawning
+                #     claude with the REPAIR_PROMPT.md gives it a fresh shot)
+                #   llm4ad_agent → Stage 10 (build lives at Stage 10 with the
+                #     stage-split; REFINE means "the built task did not
+                #     satisfy requirements, rebuild seed/evaluator")
+                #
+                # PIVOT keeps the generic target (Stage 8 HYPOTHESIS_GEN) for
+                # every agent mode, including llm4ad: the llm4ad problem
+                # description is (re)generated in Stage 10 from the injected
+                # exp_plan, so a pivot that discards hypotheses and re-derives
+                # the design upstream is the right, injection-robust behaviour.
+                if config.experiment.mode in (
+                    "collider_agent", "biology_agent", "stat_agent"
+                ) and result.decision == "refine":
+                    rollback_target = Stage.EXPERIMENT_RUN
+                elif (
+                    config.experiment.mode == "llm4ad_agent"
                     and result.decision == "refine"
                 ):
-                    rollback_target = Stage.EXPERIMENT_RUN
+                    rollback_target = Stage.CODE_GENERATION
                 _record_decision_history(
                     run_dir, result.decision, rollback_target, pivot_count + 1
                 )
@@ -751,7 +800,7 @@ def execute_pipeline(
                 # is what makes the requirements-gate retry usefully
                 # incremental rather than just a stochastic resample.
                 _agent_refine = (
-                    config.experiment.mode in ("collider_agent", "biology_agent", "stat_agent")
+                    config.experiment.mode in ("collider_agent", "biology_agent", "stat_agent", "llm4ad_agent")
                     and result.decision == "refine"
                 )
                 _version_rollback_stages(
@@ -770,6 +819,7 @@ def execute_pipeline(
                     skip_noncritical=skip_noncritical,
                     kb_root=kb_root,
                     cancel_event=cancel_event,
+                    progress_callback=progress_callback,
                 )
                 results.extend(pivot_results)
                 # BUG-211: Promote best stage-14 after REFINE completes so
@@ -1270,10 +1320,61 @@ def _version_rollback_stages(
                 version_dir.name,
             )
         else:
-            stage_dir.rename(version_dir)
+            _safe_rename_stage_dir(stage_dir, version_dir)
             logger.debug(
                 "Versioned (rename) %s → %s", stage_dir.name, version_dir.name
             )
+
+
+def _safe_rename_stage_dir(stage_dir: Path, version_dir: Path) -> None:
+    """Rename a stage directory with Windows-friendly retry + copytree fallback.
+
+    On Windows NTFS, a rename fails with ``WinError 5`` (Access Denied) if
+    any file inside the tree still has an open handle — even briefly, e.g.
+    a Docker mount that just detached, a subprocess whose file handle has
+    not yet been closed by the kernel, or an antivirus scanning a
+    freshly-written .py.  This is not a bug in our code so much as an OS
+    quirk we have to tolerate.  Strategy:
+
+    1. Try the fast atomic rename up to 5 times, waiting a bit between
+       attempts so transient handles clear.
+    2. If rename still fails, fall back to copytree + rmtree(ignore_errors).
+       That leaves the original tree "as clean as possible" while
+       guaranteeing the versioned snapshot exists so the pipeline can
+       proceed.  Any file that still can't be deleted will be re-attempted
+       (or overwritten) on the next stage re-execution.
+    """
+    import shutil as _shutil
+    import time as _time
+
+    last_err: OSError | None = None
+    for i in range(5):
+        try:
+            stage_dir.rename(version_dir)
+            return
+        except OSError as exc:
+            last_err = exc
+            logger.debug(
+                "Rename attempt %d/%d for %s → %s failed (%s); retrying",
+                i + 1, 5, stage_dir.name, version_dir.name, exc,
+            )
+            _time.sleep(0.5 * (i + 1))
+
+    logger.warning(
+        "Atomic rename %s → %s exhausted retries (%s); "
+        "falling back to copytree + rmtree",
+        stage_dir.name, version_dir.name, last_err,
+    )
+    try:
+        _shutil.copytree(stage_dir, version_dir, symlinks=False)
+    except OSError as exc:
+        # Give up: re-raise the ORIGINAL rename error so the caller sees a
+        # familiar diagnostic, but attach the copytree failure context.
+        raise OSError(
+            f"stage rollback rename failed AND copytree fallback failed: "
+            f"rename err={last_err}; copytree err={exc}"
+        ) from exc
+    _shutil.rmtree(stage_dir, ignore_errors=True)
 
 
 def _consecutive_empty_metrics(run_dir: Path, pivot_count: int) -> bool:

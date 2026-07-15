@@ -891,6 +891,39 @@ def _collect_json_context(
     return "\n\n".join(chunks)
 
 
+# Non-scientific / infrastructure metric keys emitted by the llm4ad sandbox
+# (llm4ad_agent_sandbox._build_metrics). They count produced artifacts and
+# carry success bits — useful for Stage 10 gating and observability, but they
+# must NOT be presented as scientific results (metrics_summary, LaTeX tables)
+# nor be eligible for best-run / primary-metric selection. Absent in other
+# modes, so filtering them is a no-op outside llm4ad_agent.
+_INFRA_METRIC_KEYS = frozenset(
+    {
+        "figures_produced",
+        "scripts_generated",
+        "build_task_config_present",
+        "llm4ad_agent_success",
+    }
+)
+
+# Canonical scientific headline keys, in priority order, used to pick a run's
+# primary value when no explicit metric_key matches.
+_PRIMARY_METRIC_FALLBACKS = ("primary_metric", "best_individual_score")
+
+
+def _is_scientific_metric(key: str) -> bool:
+    """False for sandbox infrastructure counters/success bits.
+
+    Covers the fixed :data:`_INFRA_METRIC_KEYS` plus the dynamic
+    ``llm4ad_{build,evolve,both}_success`` phase-success bits.
+    """
+    if key in _INFRA_METRIC_KEYS:
+        return False
+    if key.startswith("llm4ad_") and key.endswith("_success"):
+        return False
+    return True
+
+
 def _collect_experiment_results(
     run_dir: Path,
     metric_key: str = "",
@@ -945,6 +978,8 @@ def _collect_experiment_results(
 
     metrics_summary: dict[str, dict[str, float | None]] = {}
     for key in sorted(all_metric_keys):
+        if not _is_scientific_metric(key):
+            continue  # drop llm4ad sandbox infrastructure counters
         values = []
         for r in runs_data:
             m = r.get("metrics") or {}
@@ -976,10 +1011,22 @@ def _collect_experiment_results(
                         return float(m[metric_key])
                     except (ValueError, TypeError):
                         pass
-                # Fallback to first metric
-                for v in m.values():
+                # Prefer canonical scientific headline keys (fixes primary
+                # metric drift when metric_key is unset/mismatched, e.g.
+                # llm4ad's best_individual_score).
+                for pref in _PRIMARY_METRIC_FALLBACKS:
+                    if pref in m:
+                        try:
+                            return float(m[pref])
+                        except (ValueError, TypeError):
+                            pass
+                # Fallback to first scientific metric (skip infra counters so
+                # we never rank runs by figures_produced / *_success bits).
+                for k in sorted(m):
+                    if not _is_scientific_metric(k):
+                        continue
                     try:
-                        return float(v)
+                        return float(m[k])
                     except (ValueError, TypeError):
                         pass
             return 0.0

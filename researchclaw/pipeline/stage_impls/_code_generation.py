@@ -203,6 +203,314 @@ Save all figures to output/figures/ in PDF and PNG format.
 """
 
 
+def _execute_llm4ad_plan_generation(
+    stage_dir: Path,
+    run_dir: Path,
+    config: RCConfig,
+    adapters: AdapterBundle,
+    *,
+    llm: LLMClient | None = None,
+    prompts: PromptManager | None = None,
+) -> StageResult:
+    """Stage 10 (llm4ad_agent mode): translate the design into a runnable
+    LLM4AD task, then BUILD it.
+
+    Semantically Stage 10 is CODE_GENERATION, and for the llm4ad_agent
+    mode "the code that will be run" **is** the seed algorithm + evaluator
+    + dataset + config that LLM4AD's ``build_task_sync`` produces.  That
+    is exactly parallel to what Stage 10 does for ML mode (generating
+    train.py + evaluate.py + data_loader.py + hyperparams).
+
+    Two steps, both inside Stage 10 (mirrors ``collider_agent`` mode):
+      1. Generate the five-section ``llm4ad_plan.md`` (natural-language
+         problem description) from the injected ``exp_plan.yaml`` +
+         hypotheses, via the LLM (deterministic fallback if unavailable).
+      2. Run ``build_task_sync`` on that description → seed + evaluator +
+         dataset + config, surfaced as ``build_result.json``.
+
+    Why Stage 10 (not Stage 9): Stage 9 EXPERIMENT_DESIGN is *injected*
+    (arc_bench prepare_run.py, and any ``--from-stage CODE_GENERATION``
+    run) rather than executed, so a Stage-9 branch would never fire under
+    the bench.  ``collider_agent`` produces its ``collider_plan.md`` at
+    Stage 10 for the same reason — Stage 10 reads the injected exp_plan
+    and regenerates deterministically, which is injection-robust.
+
+    Failure mode
+    ------------
+    If ``build_task_sync`` fails (all repair attempts exhausted), we still
+    write a failing ``build_result.json``; Stage 12 aborts early with a
+    clear diagnostic instead of evolving a non-existent task.  The
+    requirements-gate REFINE rollback returns to Stage 10 to rebuild.
+    """
+    import json as _json
+
+    from researchclaw.experiment.llm4ad_agent_sandbox import Llm4adAgentSandbox
+
+    topic = config.research.topic
+
+    # ── Generate the LLM4AD problem description in Stage 10 ───────────────
+    # Read the injected experiment design (Stage 9 is injected under the
+    # bench, not executed) and translate it into the five-section problem
+    # description LLM4AD's build_task_sync consumes.  Falls back to a
+    # deterministic template if the LLM is unavailable — same LLM→fallback
+    # shape as _execute_collider_plan_generation.
+    exp_plan = _read_prior_artifact(run_dir, "exp_plan.yaml") or ""
+    hypotheses = _read_prior_artifact(run_dir, "hypotheses.json") or ""
+
+    system_prompt = (
+        "You are an expert in automatic algorithm design. You produce a "
+        "concise, self-contained problem description for the LLM4AD framework, "
+        "which evolves algorithms via an island genetic algorithm.\n\n"
+        "The description must let LLM4AD generate: (1) ONE function to evolve "
+        "with a precise typed signature, (2) a simple CORRECT seed algorithm, "
+        "(3) a deterministic evaluator returning a single float score, and "
+        "(4) a small fast evaluation dataset.\n\n"
+        "Use this Markdown structure EXACTLY (headings must match):\n"
+        "  # Problem\n  (what to solve, in plain terms)\n"
+        "  # Function to evolve\n  (name, signature, inputs, outputs)\n"
+        "  # Objective / score\n  (the single scalar to maximise or minimise, "
+        "state direction explicitly)\n"
+        "  # Seed algorithm\n  (a naive but correct approach to start from)\n"
+        "  # Evaluation\n  (how a candidate is scored; keep the dataset small "
+        "and deterministic)\n\n"
+        "Be concrete and unambiguous. Avoid ML-framework jargon; this is a "
+        "classical algorithm-design task unless the topic clearly requires "
+        "otherwise."
+    )
+    user_prompt = (
+        f"Research topic: {topic}\n\n"
+        f"Experiment design plan (exp_plan.yaml):\n{exp_plan}\n\n"
+        f"Hypotheses:\n{hypotheses}\n\n"
+        "Generate the LLM4AD problem description as a Markdown document."
+    )
+
+    plan_from_llm = False
+    if llm is not None:
+        try:
+            resp = _chat_with_prompt(llm, system_prompt, user_prompt, max_tokens=3072)
+            plan_text = resp.content.strip()
+            plan_from_llm = bool(plan_text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Stage 10 (llm4ad_agent): LLM call failed (%s) — using fallback "
+                "problem description",
+                exc,
+            )
+            plan_text = _fallback_llm4ad_plan(topic, exp_plan)
+    else:
+        plan_text = _fallback_llm4ad_plan(topic, exp_plan)
+
+    if not plan_text:
+        plan_text = _fallback_llm4ad_plan(topic, exp_plan)
+
+    logger.info(
+        "Stage 10 (llm4ad_agent): wrote LLM4AD problem description "
+        "(%d chars, source=%s)",
+        len(plan_text),
+        "llm" if plan_from_llm else "fallback",
+    )
+
+    # Write the plan at stage-10 root (the canonical location Stage 12's
+    # legacy build+evolve fallback reads via _read_prior_artifact).
+    (stage_dir / "llm4ad_plan.md").write_text(plan_text, encoding="utf-8")
+
+    # ── Run LLM4AD build_task_sync in a child sandbox ─────────────────────
+    la_cfg = config.experiment.llm4ad_agent
+    workspace = stage_dir / (la_cfg.working_dir or "llm4ad_workspace")
+    workspace.mkdir(parents=True, exist_ok=True)
+    sandbox = Llm4adAgentSandbox(la_cfg, workspace)
+
+    logger.info(
+        "Stage 10 (llm4ad_agent): running build_task_sync in %s "
+        "(timeout=%ds)",
+        workspace, la_cfg.build_timeout_sec or la_cfg.timeout_sec,
+    )
+    build_result = sandbox.run_build(plan_text)
+
+    # Surface build_result.json at stage-10 root so Stage 11 / Stage 12
+    # can find it via _read_prior_artifact("build_result.json").
+    workspace_build_result = workspace / "build_result.json"
+    if workspace_build_result.is_file():
+        try:
+            (stage_dir / "build_result.json").write_text(
+                workspace_build_result.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning(
+                "Stage 10 (llm4ad_agent): failed to copy build_result.json: %s",
+                exc,
+            )
+
+    build_ok = (
+        build_result.returncode == 0
+        and not build_result.timed_out
+        and workspace_build_result.is_file()
+    )
+
+    # Satisfy the Stage 10 contract (experiment/ + experiment_spec.md) — the
+    # `experiment/` here is the LLM4AD task directory, not python source.
+    exp_dir = stage_dir / "experiment"
+    exp_dir.mkdir(exist_ok=True)
+    (exp_dir / "llm4ad_plan.md").write_text(plan_text, encoding="utf-8")
+
+    spec_parts = [
+        "# Experiment Specification (llm4ad_agent mode)",
+        "",
+        f"**Topic:** {topic}",
+        "",
+        "**Backend:** LLM4AD",
+        "  - Stage 10 CODE_GENERATION  → writes `llm4ad_plan.md` (problem "
+        "description) then runs `build_task_sync` → seed + evaluator + "
+        "dataset + config",
+        "  - Stage 12 EXPERIMENT_RUN   → runs `LLM4AD.run()` island GA on the "
+        "built task",
+        "",
+        f"**Problem description:** `llm4ad_plan.md` (generated in Stage 10)",
+        "",
+        f"**Build status:** {'success' if build_ok else 'FAILED'}",
+    ]
+    if build_ok:
+        try:
+            build_doc = json.loads(
+                workspace_build_result.read_text(encoding="utf-8")
+            )
+            spec_parts.extend(
+                [
+                    "",
+                    f"**Task directory:** `{build_doc.get('task_dir', '')}`",
+                    f"**Config path:** `{build_doc.get('config_path', '')}`",
+                    f"**Seed algorithm:** `{build_doc.get('seed_path', '')}`",
+                    f"**Evaluator:** `{build_doc.get('evaluation_path', '')}`",
+                ]
+            )
+        except (json.JSONDecodeError, OSError):
+            pass
+        spec_parts.extend(
+            [
+                "",
+                "Stage 12 will run `LLM4AD(config).run()` (island GA) on the "
+                "built task and produce the canonical `results.json`.",
+            ]
+        )
+    else:
+        spec_parts.extend(
+            [
+                "",
+                "Stage 10 build failed — Stage 12 will surface the error "
+                "without running evolution.  The requirements gate's REFINE "
+                "will roll back here to rebuild the seed/evaluator.",
+            ]
+        )
+    (stage_dir / "experiment_spec.md").write_text(
+        "\n".join(spec_parts) + "\n", encoding="utf-8"
+    )
+
+    meta = {
+        "generated": _utcnow_iso(),
+        "mode": "llm4ad_agent",
+        "topic": topic,
+        "build_status": "success" if build_ok else "failed",
+        "returncode": build_result.returncode,
+        "timed_out": build_result.timed_out,
+        "elapsed_sec": build_result.elapsed_sec,
+        "plan_source": "stage-10/llm" if plan_from_llm else "stage-10/fallback",
+    }
+    (stage_dir / "llm4ad_meta.json").write_text(
+        _json.dumps(meta, indent=2), encoding="utf-8"
+    )
+
+    if build_ok:
+        logger.info(
+            "Stage 10 (llm4ad_agent): build succeeded — task ready for Stage 12"
+        )
+        return StageResult(
+            stage=Stage.CODE_GENERATION,
+            status=StageStatus.DONE,
+            artifacts=(
+                "llm4ad_plan.md",
+                "llm4ad_meta.json",
+                "build_result.json",
+                "llm4ad_workspace/",
+                "experiment/",
+                "experiment_spec.md",
+            ),
+            evidence_refs=(
+                "stage-10/build_result.json",
+                "stage-10/llm4ad_workspace/task/",
+            ),
+        )
+    else:
+        # Stage 10 build failure should terminate the pipeline immediately
+        # because there's no task directory for Stage 12 to evolve on.
+        # The REFINE mechanism will roll back here to retry the build.
+        err_tail = (build_result.stderr or "").strip()
+        error_summary = f"LLM4AD build failed (rc={build_result.returncode}"
+        if build_result.timed_out:
+            error_summary += ", timed out"
+        error_summary += ")"
+
+        if err_tail:
+            tail_lines = err_tail.splitlines()[-20:]
+            error_detail = "\n".join(tail_lines)
+            logger.error(
+                "Stage 10 (llm4ad_agent): build failed — terminating pipeline\n"
+                "Last %d lines of stderr:\n%s",
+                len(tail_lines), error_detail,
+            )
+            error_summary += f"\n\nLast stderr lines:\n{error_detail}"
+        else:
+            logger.error("Stage 10 (llm4ad_agent): build failed — terminating pipeline")
+
+        return StageResult(
+            stage=Stage.CODE_GENERATION,
+            status=StageStatus.FAILED,
+            artifacts=(
+                "llm4ad_plan.md",
+                "llm4ad_meta.json",
+                "build_result.json",
+                "llm4ad_workspace/",
+                "experiment/",
+                "experiment_spec.md",
+            ),
+            evidence_refs=(
+                "stage-10/build_result.json",
+            ),
+            error=error_summary,
+        )
+
+
+def _fallback_llm4ad_plan(topic: str, exp_plan: str) -> str:
+    """Minimal fallback LLM4AD problem description when the LLM is unavailable."""
+    return f"""# Problem
+
+Design and evolve an algorithm for the following topic:
+**{topic}**
+
+{exp_plan or "Infer a concrete, well-scoped algorithm-design problem from the topic above."}
+
+# Function to evolve
+
+Define one function with a clear typed signature that takes a problem
+instance and returns a solution.
+
+# Objective / score
+
+Maximise a single scalar score measuring solution quality (state the exact
+metric based on the problem).
+
+# Seed algorithm
+
+Provide a simple, correct baseline (a greedy or naive heuristic) that runs
+without error on every evaluation instance.
+
+# Evaluation
+
+Score candidates deterministically on a small, fixed set of problem
+instances so that many generations run quickly.
+"""
+
+
 def _check_rl_compatibility(code: str) -> list[str]:
     """Detect DQN + continuous-action environment mismatches.
 
@@ -239,6 +547,18 @@ def _execute_code_generation(
             stage_dir, run_dir, config, adapters, llm=llm, prompts=prompts
         )
     # ── End ColliderAgent bypass ──────────────────────────────────────────────
+
+    # ── LLM4AD mode: generate a problem description instead of Python code ─────
+    # The real algorithm code is produced inside LLM4AD's build+evolve at
+    # Stage 12, so Stage 10 must NOT generate/execute python (doing so hits the
+    # exec-fix sandbox, which fails on Windows with WinError 2).  Instead we
+    # write llm4ad_plan.md — a clean problem description the Stage 12 sandbox
+    # refines into the LLM4AD build description.
+    if config.experiment.mode == "llm4ad_agent":
+        return _execute_llm4ad_plan_generation(
+            stage_dir, run_dir, config, adapters, llm=llm, prompts=prompts
+        )
+    # ── End LLM4AD bypass ──────────────────────────────────────────────────────
 
     exp_plan = _read_prior_artifact(run_dir, "exp_plan.yaml") or ""
     metric = config.experiment.metric_key

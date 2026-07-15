@@ -1,0 +1,149 @@
+# ============================================================================
+# L01 — Evolving a constructive TSP heuristic (llm4ad_agent smoke topic)
+# ----------------------------------------------------------------------------
+# Open algorithm-design question. NOT a paper reproduction. This is the SMOKE
+# topic that validates the llm4ad_agent integration end-to-end through the
+# arc_bench harness: Stage 10 build_task_sync generates the seed/evaluator/
+# dataset/config from the problem description, Stage 12 runs the LLM4AD island
+# GA to evolve a node-selection scoring function, and the canonical
+# results.json carries the best evolved individual's score.
+#
+# The task is deliberately classical and small so that a full build+evolve
+# cycle completes within the autoclaw time budget on CPU.
+# ============================================================================
+
+id: L01
+title: "Evolving a constructive heuristic for the Euclidean TSP with an island genetic algorithm"
+arxiv_id: null
+venue: "ARC-Bench 2026"
+paper_asset: null
+
+synthesis: |
+  Constructive heuristics build a Travelling Salesman Problem (TSP) tour one
+  node at a time. The classic nearest-neighbour rule always appends the
+  closest unvisited city; it is fast but myopic, routinely producing tours
+  20-25% longer than optimal on random Euclidean instances. A large body of
+  work (greedy edge insertion, Christofides, savings algorithms, and more
+  recently learned heuristics) shows there is substantial headroom above
+  nearest-neighbour that a smarter *selection rule* can capture without
+  abandoning the cheap one-node-at-a-time construction paradigm.
+
+  This topic asks whether automatic algorithm design — specifically the
+  LLM4AD framework's island genetic algorithm, which mutates and recombines
+  LLM-authored Python functions across isolated populations — can discover a
+  node-selection scoring function that consistently beats nearest-neighbour
+  construction on small random Euclidean TSP instances, while remaining a
+  pure constructive heuristic (no 2-opt or other local search post-pass).
+
+  The function to evolve scores each candidate next-city given the current
+  partial tour and the set of unvisited cities; the constructor greedily
+  appends the highest-scoring candidate. A trivial seed that scores by
+  negative distance-to-current-city reproduces nearest-neighbour exactly, so
+  any evolved improvement over the seed is directly attributable to the
+  evolutionary search rather than to a hand-tuned starting point.
+
+  Evaluation protocol. Candidate scoring functions are evaluated
+  deterministically on a fixed suite of random Euclidean instances (fixed RNG
+  seed, cities sampled uniformly in the unit square). The objective is the
+  mean tour-length ratio versus a reference: a candidate scores
+  `1 - (mean_tour_length / nearest_neighbour_mean_tour_length)`, so a value
+  of 0.0 ties nearest-neighbour, positive means shorter (better) tours, and
+  the island GA maximises it. Instances are small (about 20 cities) and few
+  (about 20 instances) so that many generations run quickly on CPU.
+
+  Research question: *Can an island genetic algorithm evolve a constructive
+  node-selection heuristic that produces measurably shorter Euclidean TSP
+  tours than nearest-neighbour construction on small random instances,
+  without any local-search post-processing?*
+
+hypotheses:
+  - id: H1
+    statement: "The best evolved individual achieves best_individual_score strictly greater than 0.0, i.e. it produces shorter mean tours than the nearest-neighbour reference on the fixed evaluation suite."
+    measurable: true
+  - id: H2
+    statement: "The best evolved individual improves mean tour length over nearest-neighbour by at least 3 percent (best_individual_score >= 0.03), a margin larger than instance-to-instance noise on the fixed suite."
+    measurable: true
+  - id: H3
+    statement: "The evolved heuristic remains a pure constructive rule (the evolved function only scores/ranks candidate next-cities and performs no full-tour local search such as 2-opt), so its advantage comes from smarter selection rather than post-hoc repair."
+    measurable: true
+
+experiment_design:
+  research_question: "Can an island genetic algorithm evolve a constructive node-selection heuristic that yields shorter Euclidean TSP tours than nearest-neighbour construction on small random instances, with no local-search post-pass?"
+  conditions:
+    - name: "evolved_heuristic"
+      description: "The best node-selection scoring function discovered by the LLM4AD island GA. The greedy constructor appends the highest-scoring unvisited city at each step. Evaluated on the fixed instance suite; its mean tour length defines best_individual_score relative to the nearest-neighbour reference."
+    - name: "seed_heuristic"
+      description: "The LLM4AD seed algorithm: a node-selection function that scores candidates by negative Euclidean distance to the current city, reproducing nearest-neighbour construction exactly. Establishes that the evolutionary starting point is the reference itself (score 0.0), so any positive score is attributable to evolution."
+  baselines:
+    - "nearest_neighbour: greedy nearest-neighbour construction (always append the closest unvisited city). This is the reference denominator for best_individual_score; the seed_heuristic reproduces it."
+    - "random_construction: append a uniformly random unvisited city at each step (fixed RNG). A weak lower-bound sanity baseline that any competent heuristic must beat, confirming the evaluator distinguishes tour quality."
+  metrics:
+    - name: "best_individual_score"
+      direction: "maximize"
+      description: "Primary metric. 1 - (mean_tour_length_of_candidate / mean_tour_length_of_nearest_neighbour) over the fixed evaluation suite. 0.0 ties nearest-neighbour, positive means shorter tours. This is the fitness LLM4AD's island GA maximises and the value surfaced as primary_metric in results.json."
+    - name: "mean_tour_length"
+      direction: "minimize"
+      description: "Mean Euclidean tour length of the constructed tours over the evaluation suite, reported for the evolved heuristic, the seed/nearest-neighbour reference, and the random-construction baseline."
+    - name: "improvement_pct_over_nn"
+      direction: "maximize"
+      description: "100 * best_individual_score. The percentage reduction in mean tour length over nearest-neighbour; used directly in H2 (threshold 3 percent)."
+  datasets:
+    - name: "random_euclidean_tsp_suite"
+      source: "generated (numpy uniform sampling, fixed seed)"
+      description: "A fixed suite of ~20 random Euclidean TSP instances, each ~20 cities sampled uniformly in the unit square with a fixed RNG seed so evaluation is fully deterministic across generations and seeds. Tour length is the sum of Euclidean edge lengths on the closed tour. Kept small so a full island-GA evolution completes within the CPU time budget."
+  compute_requirements:
+    gpu_required: false
+    estimated_wall_clock_sec: 3600
+
+# ── Stage-15 requirements gate (agent-mode LLM proceed/refine/pivot) ────────
+# The llm4ad_agent requirements gate reads these at Stage 15 and judges the
+# canonical results.json against them. must_pass=true items force a REFINE
+# rerun (rebuild+evolve) if unmet and retry budget remains.
+requirements:
+  - id: req_results_json
+    type: artifact
+    description: >-
+      A canonical results.json exists with at least: primary_metric (number),
+      metric_key = "best_individual_score", metrics (object of numeric keys),
+      hypotheses (object with h1/h2/h3 entries each carrying a `supported`
+      boolean), summary (non-empty string). This is written by the LLM4AD
+      evolve phase (Stage 12) and is what Stage 14 / the judge read.
+    must_pass: true
+
+  - id: req_build_succeeded
+    type: artifact
+    description: >-
+      The Stage 10 build produced a task directory with a seed algorithm, a
+      deterministic evaluator, and a config.yaml (build_result.json status =
+      success). Without a successful build there is nothing for the island GA
+      to evolve.
+    must_pass: true
+
+  - id: req_beats_nearest_neighbour
+    type: numeric
+    description: >-
+      results.json primary_metric (best_individual_score) is a finite number
+      strictly greater than 0.0 — the evolved heuristic produces shorter mean
+      tours than the nearest-neighbour reference. This is the H1 threshold and
+      the core scientific claim of the topic.
+    must_pass: true
+
+  - id: req_h_supported_flags
+    type: discussion
+    description: >-
+      Each of hypotheses.h1, hypotheses.h2, hypotheses.h3 in results.json has
+      an explicit `supported` boolean and a `details` string of at least 40
+      characters citing the numeric evidence (best_individual_score,
+      improvement percentage) used to reach that verdict.
+    must_pass: true
+
+  - id: req_constructive_only
+    type: discussion
+    description: >-
+      The evolved function is a node-selection / scoring rule only and does
+      not perform full-tour local search (no 2-opt, or-opt, or similar
+      post-construction repair). Discussed in summary or structured_results.
+      Supports H3; nice-to-have rather than blocking.
+    must_pass: false
+
+rubric_path: "experiments/arc_bench/config/llm4ad/rubrics/L01.json"

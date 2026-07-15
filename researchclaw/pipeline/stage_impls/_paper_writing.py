@@ -25,6 +25,7 @@ from researchclaw.pipeline._helpers import (
     _generate_framework_diagram_prompt,
     _generate_neurips_checklist,
     _get_evolution_overlay,
+    _is_scientific_metric,
     _read_best_analysis,
     _read_prior_artifact,
     _safe_json_loads,
@@ -178,9 +179,14 @@ def _collect_raw_experiment_metrics(run_dir: Path) -> tuple[str, bool]:
             # Extract from parsed metrics (check both 'metrics' and 'key_metrics')
             metrics = payload.get("metrics", {}) or payload.get("key_metrics", {})
             if isinstance(metrics, dict) and metrics:
-                has_parsed_metrics = True
-                for k, v in metrics.items():
-                    metric_lines.append(f"  {k}: {v}")
+                # Only count/emit scientific metrics — drop llm4ad sandbox
+                # infrastructure counters (figures_produced, *_success, ...)
+                # so they don't masquerade as experiment results in the paper.
+                _sci = {k: v for k, v in metrics.items() if _is_scientific_metric(k)}
+                if _sci:
+                    has_parsed_metrics = True
+                    for k, v in _sci.items():
+                        metric_lines.append(f"  {k}: {v}")
 
             # Also extract from stdout for full detail
             # BUG-23: Filter out infrastructure lines that are NOT experiment results

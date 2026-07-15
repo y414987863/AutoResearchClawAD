@@ -994,15 +994,25 @@ def _write_repair_prompt(run_dir: Path, delta_feedback: str, verdict: dict[str, 
     )
     out = run_dir / "REPAIR_PROMPT.md"
     out.write_text(body, encoding="utf-8")
-    # Also drop a copy into the live stage-12 workspace as a backup for runs
+    # Also drop a copy into the live sandbox workspace(s) as a backup for runs
     # that don't go through the rollback machinery (e.g. if a future code path
-    # invokes the gate without triggering ``_version_rollback_stages``).
-    sandbox_ws = run_dir / "stage-12" / "runs" / "workspace" / "sandbox"
-    if sandbox_ws.is_dir():
-        try:
-            (sandbox_ws / "REPAIR_PROMPT.md").write_text(body, encoding="utf-8")
-        except OSError:
-            pass
+    # invokes the gate without triggering ``_version_rollback_stages``).  The
+    # different agent backends put their workspace at different depths, so we
+    # cover each known layout:
+    #   * collider/biology/stat → stage-12/runs/workspace/sandbox
+    #   * llm4ad evolve         → stage-12/runs/llm4ad_workspace
+    #   * llm4ad build (REFINE rolls back to Stage 10) → stage-10/llm4ad_workspace
+    backup_workspaces = (
+        run_dir / "stage-12" / "runs" / "workspace" / "sandbox",
+        run_dir / "stage-12" / "runs" / "llm4ad_workspace",
+        run_dir / "stage-10" / "llm4ad_workspace",
+    )
+    for sandbox_ws in backup_workspaces:
+        if sandbox_ws.is_dir():
+            try:
+                (sandbox_ws / "REPAIR_PROMPT.md").write_text(body, encoding="utf-8")
+            except OSError:
+                pass
     return out
 
 
@@ -1151,7 +1161,7 @@ def _execute_research_decision(
     # the verdict + per-run retry budget.  ML modes fall through to the
     # existing decision logic below.
     # ----------------------------------------------------------------------
-    if config.experiment.mode in ("collider_agent", "biology_agent", "stat_agent"):
+    if config.experiment.mode in ("collider_agent", "biology_agent", "stat_agent", "llm4ad_agent"):
         agent_decision = _agent_requirements_decision(
             stage_dir=stage_dir, run_dir=run_dir, config=config, llm=llm,
         )
