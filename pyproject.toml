@@ -34,8 +34,8 @@ researchclaw = "researchclaw.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["researchclaw", "sibyl", "arc"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"researchclaw/templates/styles" = "researchclaw/templates/styles"
+#[tool.hatch.build.targets.wheel.force-include]
+#"researchclaw/templates/styles" = "researchclaw/templates/styles"
 
 [build-system]
 requires = ["hatchling"]
