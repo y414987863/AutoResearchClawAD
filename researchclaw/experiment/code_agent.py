@@ -498,13 +498,17 @@ class _CliAgentBase:
             "INSTRUCTIONS:\n"
             "1. Create a multi-file Python project in the current directory.\n"
             "2. The entry point MUST be main.py.\n"
-            "3. main.py must print metrics as 'name: value' lines to stdout.\n"
-            f"4. Use condition labels: 'condition=<name> {metric_key}: <value>'\n"
-            "5. FORBIDDEN: subprocess, os.system, eval, exec, shutil, socket, "
+            "3. main.py MUST print metrics to stdout following the STDOUT\n"
+            "   METRIC CONTRACT given above, character for character. That\n"
+            "   contract is the single source of truth — do not invent a\n"
+            "   variant. Output that does not match it is discarded and the\n"
+            "   whole experiment counts as a failure even if it computed the\n"
+            "   right numbers.\n"
+            "4. FORBIDDEN: subprocess, os.system, eval, exec, shutil, socket, "
             "network calls, external data files.\n"
-            "6. Use deterministic seeds (numpy.random.seed or random.seed).\n"
-            "7. Write ALL files to the current working directory.\n"
-            "8. Do NOT create subdirectories.\n"
+            "5. Use deterministic seeds (numpy.random.seed or random.seed).\n"
+            "6. Write ALL files to the current working directory.\n"
+            "7. Do NOT create subdirectories.\n"
         )
 
     @staticmethod
@@ -532,8 +536,12 @@ class _CliAgentBase:
             "1. Read existing code, understand the experiment structure.\n"
             "2. Modify files to improve the metric.\n"
             "3. Keep the entry point as main.py.\n"
-            "4. Write modified files to the current directory.\n"
-            "5. FORBIDDEN: subprocess, os.system, eval, exec, shutil, socket.\n"
+            "4. PRESERVE METRIC OUTPUT: do not change, reformat, reorder, or\n"
+            "   remove any print() that emits a metric line. The exact stdout\n"
+            "   format is a machine-parsed contract — altering it discards the\n"
+            "   entire run's results.\n"
+            "5. Write modified files to the current directory.\n"
+            "6. FORBIDDEN: subprocess, os.system, eval, exec, shutil, socket.\n"
         )
 
     @staticmethod
@@ -551,8 +559,17 @@ class _CliAgentBase:
             "INSTRUCTIONS:\n"
             "1. Read the existing files in the current directory.\n"
             "2. Fix ALL reported issues.\n"
-            "3. Write the corrected files back.\n"
-            "4. FORBIDDEN: subprocess, os.system, eval, exec, shutil, socket.\n"
+            "3. MINIMAL DIFF: change only what is needed to fix the issues.\n"
+            "   Do not restructure, rename, or 'clean up' working code.\n"
+            "4. PRESERVE METRIC OUTPUT: do not change, reformat, reorder, or\n"
+            "   remove any print() that emits a metric line. The exact stdout\n"
+            "   format is a machine-parsed contract — altering it discards the\n"
+            "   entire run's results.\n"
+            "5. Do NOT add assertions or validation gates that were not\n"
+            "   required to fix a reported issue. A new check that fires on a\n"
+            "   normal run turns a working experiment into a crash.\n"
+            "6. Write the corrected files back.\n"
+            "7. FORBIDDEN: subprocess, os.system, eval, exec, shutil, socket.\n"
         )
 
 

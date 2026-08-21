@@ -211,6 +211,34 @@ _STOP_WORDS = frozenset(
         "work",
         "propose",
         "proposed",
+        # Academic boilerplate — these appear in nearly every abstract, so
+        # keeping them makes the Stage 5 keyword pre-filter non-discriminative
+        # (a topic phrased as "Systematically quantify empirical ... densities"
+        # matched 962/1346 candidates, most of them cross-domain noise).
+        "systematically",
+        "systematic",
+        "quantify",
+        "quantifying",
+        "quantitative",
+        "empirical",
+        "empirically",
+        "analysis",
+        "analyze",
+        "evaluate",
+        "evaluating",
+        "evaluation",
+        "investigate",
+        "investigating",
+        "framework",
+        "model",
+        "models",
+        "testing",
+        "test",
+        "tests",
+        "across",
+        "component",
+        "components",
+        "lightweight",
     }
 )
 
@@ -597,6 +625,18 @@ def _extract_code_block(content: str) -> str:
     return stripped
 
 
+def _looks_like_entrypoint(code: str) -> bool:
+    """Whether *code* can plausibly run as ``python <file>`` and do work.
+
+    Thin delegate — the criterion lives in ``experiment.validator`` so that
+    the build-time check here and the repair-time check in
+    ``check_repaired_files`` can never drift apart.
+    """
+    from researchclaw.experiment.validator import looks_like_entrypoint
+
+    return looks_like_entrypoint(code)
+
+
 def _extract_multi_file_blocks(content: str) -> dict[str, str]:
     """Parse LLM response containing multiple files with filename markers.
 
@@ -667,9 +707,22 @@ def _extract_multi_file_blocks(content: str) -> dict[str, str]:
         if files:
             # Ensure there is a main.py entry point
             if "main.py" not in files:
-                # Pick the first file as main.py
-                first_key = next(iter(files))
-                files["main.py"] = files.pop(first_key)
+                # A truncated response (unclosed fence) drops the tail blocks,
+                # so the first surviving block is often a config/util module.
+                # Renaming it to main.py silently produces an experiment with
+                # no entrypoint.  Only promote a file that actually is one.
+                entry = [f for f in files if _looks_like_entrypoint(files[f])]
+                if len(entry) == 1:
+                    files["main.py"] = files.pop(entry[0])
+                else:
+                    logger.warning(
+                        "_extract_multi_file_blocks: %d file(s) extracted "
+                        "(%s) but none is main.py and %d look like an "
+                        "entrypoint — refusing to promote an arbitrary file; "
+                        "the response was likely truncated",
+                        len(files), ", ".join(sorted(files)), len(entry),
+                    )
+                    return {}
             return files
 
     # Fallback: single code block → main.py

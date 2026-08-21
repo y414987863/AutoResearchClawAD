@@ -1155,3 +1155,130 @@ def deep_validate_files(
         warnings.extend(check_api_correctness(code, fname))
         warnings.extend(check_undefined_calls(code, fname))
     return warnings
+
+
+# ---------------------------------------------------------------------------
+# P0-2: post-repair gate — never ship un-revalidated repaired code
+# ---------------------------------------------------------------------------
+
+
+def looks_like_entrypoint(code: str) -> bool:
+    """Whether *code* can plausibly run as ``python <file>`` and do work.
+
+    A ``__main__`` guard is the strong signal.  Failing that, accept a module
+    that makes at least one top-level call — but reject one that is purely
+    declarative (a config/constants/dataclass module), since promoting such a
+    file to ``main.py`` yields an experiment that runs silently and produces
+    no metrics.
+
+    Single source of truth: ``check_repaired_files`` below and
+    ``researchclaw.pipeline._helpers._looks_like_entrypoint`` both use this.
+    Two different criteria would mean a ``main.py`` accepted when built is
+    rejected as "entrypoint lost" when repaired, rolling back every repair.
+    """
+    if "__main__" in code:
+        return True
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    return any(
+        isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+        for node in tree.body
+    )
+
+
+def check_repaired_files(files: dict[str, str]) -> list[str]:
+    """Blocking checks a repair result must pass before it may be adopted.
+
+    Returns a list of blocker strings.  Empty = safe to adopt.  This is
+    deliberately *narrow*: it only catches damage a repair can plausibly do
+    (truncated output, syntax breakage, dangling cross-file imports, a lost
+    entrypoint).  Quality concerns belong in ``deep_validate_files``.
+    """
+    blockers: list[str] = []
+
+    py_files = {f: c for f, c in files.items() if f.endswith(".py")}
+    if not py_files:
+        return ["repair produced no .py files"]
+
+    main = files.get("main.py")
+    if main is None:
+        return ["repair dropped main.py"]
+
+    # 1. Every file must parse.
+    for fname, code in sorted(py_files.items()):
+        if not code.strip():
+            blockers.append(f"[{fname}] repair produced an empty file")
+            continue
+        try:
+            ast.parse(code)
+        except SyntaxError as exc:
+            blockers.append(
+                f"[{fname}] repair introduced a SyntaxError at line "
+                f"{exc.lineno}: {exc.msg}"
+            )
+
+    # 2. main.py must still be runnable as a script.
+    if not looks_like_entrypoint(main):
+        blockers.append(
+            "[main.py] repair removed the entrypoint (no `__main__` guard and "
+            "no top-level call) — the experiment would produce no output"
+        )
+
+    # 3. Cross-file `from <sibling> import <name>` must resolve within the
+    #    file set.  Third-party/stdlib module names are ignored.
+    local_modules = {f.removesuffix(".py") for f in py_files}
+    for fname, code in sorted(py_files.items()):
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            continue  # already reported above
+        self_mod = fname.removesuffix(".py")
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            if not node.module or node.level:
+                continue
+            mod = node.module.split(".")[0]
+            if mod == self_mod or mod not in local_modules:
+                continue
+            try:
+                target = _module_toplevel_names(ast.parse(py_files[mod + ".py"]))
+            except SyntaxError:
+                continue  # already reported above
+            for alias in node.names:
+                if alias.name != "*" and alias.name not in target:
+                    blockers.append(
+                        f"[{fname}] imports '{alias.name}' from '{mod}' but "
+                        f"'{mod}.py' does not define it"
+                    )
+
+    return blockers
+
+
+def _module_toplevel_names(tree: ast.Module) -> set[str]:
+    """Top-level names a module binds (defs, classes, assignments, imports)."""
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names.update(_extract_assign_targets(node))
+        elif isinstance(node, ast.AnnAssign) and isinstance(
+            node.target, ast.Name
+        ):
+            names.add(node.target.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, (ast.If, ast.Try)):
+            # Conditional/guarded definitions still bind at module level.
+            for sub in ast.walk(node):
+                if isinstance(
+                    sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    names.add(sub.name)
+                elif isinstance(sub, ast.Assign):
+                    names.update(_extract_assign_targets(sub))
+    return names

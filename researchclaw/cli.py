@@ -1509,6 +1509,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    import logging
+    # 只在调用方没配过 logging 时兜底，且不拆既有 handler：force=True 会把
+    # 把 ResearchClaw 当库嵌入的调用方的日志配置一并拆掉。
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s.%(msecs)03d | %(levelname)-8s | %(filename)s:%(lineno)d - %(message)s',
+        )
     parser = build_parser()
     args = parser.parse_args(argv)
 

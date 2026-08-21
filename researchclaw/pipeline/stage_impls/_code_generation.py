@@ -12,6 +12,7 @@ from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
 from researchclaw.experiment.validator import (
     CodeValidation,
+    check_repaired_files,
     format_issues_for_llm,
     validate_code,
 )
@@ -34,6 +35,50 @@ from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
+
+
+def _adopt_repair(
+    files: dict[str, str],
+    repaired: dict[str, str] | None,
+    exp_dir: Path,
+    label: str,
+) -> tuple[dict[str, str], bool]:
+    """P0-2: gate a repair result before it replaces working code.
+
+    A repair is only adopted if it parses, keeps ``main.py`` and its
+    entrypoint, and has no dangling cross-file imports.  Otherwise the
+    pre-repair *files* are kept and re-written to disk, so a bad repair can
+    never be what the experiment stage actually runs.
+
+    Returns ``(files_to_use, adopted)``.
+    """
+    if not repaired or "main.py" not in repaired:
+        logger.warning(
+            "Stage 10: %s produced no usable file set — keeping pre-repair "
+            "code", label,
+        )
+        return files, False
+
+    blockers = check_repaired_files(repaired)
+    if blockers:
+        logger.warning(
+            "Stage 10: %s REJECTED — rolling back to pre-repair code. "
+            "%d blocker(s): %s",
+            label, len(blockers), "; ".join(blockers[:5]),
+        )
+        # Undo any partial writes from an earlier step in this stage.
+        for fname, code in files.items():
+            (exp_dir / fname).write_text(code, encoding="utf-8")
+        for stale in set(repaired) - set(files):
+            (exp_dir / stale).unlink(missing_ok=True)
+        return files, False
+
+    for stale in set(files) - set(repaired):
+        (exp_dir / stale).unlink(missing_ok=True)
+    for fname, code in repaired.items():
+        (exp_dir / fname).write_text(code, encoding="utf-8")
+    logger.info("Stage 10: %s accepted (%d files)", label, len(repaired))
+    return repaired, True
 
 # Improvement G: Continuous-action environments that are incompatible with DQN
 _CONTINUOUS_ENVS = {
@@ -313,6 +358,22 @@ def _execute_code_generation(
 
     # --- Dataset guidance + setup script + HP reporting (docker/sandbox modes) ---
     extra_guidance = ""
+
+    # P0: STDOUT metric contract — injected UNCONDITIONALLY and FIRST.
+    # Stage 12 recovers metrics only by regex-scraping stdout; a run that
+    # invents its own print format is scored as a total failure even when the
+    # science is correct.  Every observed ML03 failure traced back to this
+    # block never reaching the model, so it must not be gated on mode and
+    # must not be silently swallowed.
+    try:
+        extra_guidance += _pm.block("stdout_contract", metric_key=metric)
+    except Exception:  # noqa: BLE001
+        logger.error(
+            "Stage 10: could not render the stdout_contract block — generated "
+            "code will not know the required metric format",
+            exc_info=True,
+        )
+
     _net_policy = getattr(getattr(config, "docker", None), "network_policy", "setup_only")
     if config.experiment.mode in ("sandbox", "docker"):
         _net_policy = (
@@ -349,7 +410,12 @@ def _execute_code_generation(
             pass
         # I-06: Multi-seed enforcement for all experiments
         try:
-            extra_guidance += _pm.block("multi_seed_enforcement")
+            # P0: pass metric_key — without kwargs the "{metric_key}" token
+            # reaches the model verbatim (PromptManager._render leaves
+            # unmatched placeholders in place).
+            extra_guidance += _pm.block(
+                "multi_seed_enforcement", metric_key=metric
+            )
         except Exception:  # noqa: BLE001
             pass
 
@@ -1044,13 +1110,13 @@ def _execute_code_generation(
                 max_tokens=_code_max_tokens,
             )
             repaired = _extract_multi_file_blocks(repair_resp.content)
-            if repaired and "main.py" in repaired:
-                files = repaired
-                for fname, code in files.items():
-                    (exp_dir / fname).write_text(code, encoding="utf-8")
+            files, _adopted = _adopt_repair(
+                files, repaired, exp_dir, "deep repair",
+            )
+            if _adopted:
                 # Re-check after repair
                 deep_warnings_after = deep_validate_files(files)
-                fixed = len(critical_deep) - len([
+                _still_critical = len([
                     w for w in deep_warnings_after
                     if any(kw in w for kw in (
                         "UnboundLocalError", "unregistered", "does not exist",
@@ -1062,13 +1128,20 @@ def _execute_code_generation(
                         "shadows stdlib/pip",
                     ))
                 ])
+                fixed = max(0, len(critical_deep) - _still_critical)
                 logger.info(
-                    "Stage 10: Deep repair fixed %d/%d critical issues",
-                    fixed, len(critical_deep),
+                    "Stage 10: Deep repair fixed %d/%d critical issues "
+                    "(%d still critical)",
+                    fixed, len(critical_deep), _still_critical,
                 )
                 complexity_warnings.append(
                     f"[REPAIR] Deep repair fixed {fixed}/{len(critical_deep)} "
                     f"critical issues"
+                )
+            else:
+                complexity_warnings.append(
+                    "[REPAIR] Deep repair rejected by post-repair validation "
+                    "— pre-repair code retained"
                 )
         except Exception as exc:
             logger.debug("Deep repair failed: %s", exc)
@@ -1180,10 +1253,10 @@ def _execute_code_generation(
                             max_tokens=_code_max_tokens,
                         )
                         fixed_files = _extract_multi_file_blocks(fix_resp.content)
-                        if fixed_files and "main.py" in fixed_files:
-                            files = fixed_files
-                            for fname, code in files.items():
-                                (exp_dir / fname).write_text(code, encoding="utf-8")
+                        files, _adopted = _adopt_repair(
+                            files, fixed_files, exp_dir, "review fix",
+                        )
+                        if _adopted:
                             logger.info(
                                 "Stage 10: Code fixed after review "
                                 "(was %d/10, %d critical issues)",
@@ -1343,9 +1416,12 @@ def _execute_code_generation(
                             _regen_attempt,
                         )
                         continue
-                    files = regen_files
-                    for fname, code in files.items():
-                        (exp_dir / fname).write_text(code, encoding="utf-8")
+                    files, _adopted = _adopt_repair(
+                        files, regen_files, exp_dir,
+                        f"regen attempt {_regen_attempt}",
+                    )
+                    if not _adopted:
+                        continue
                     # Re-check alignment on regenerated code (BUG-171 fix)
                     _rc_inv = []
                     for _fn, _cd in files.items():
@@ -1457,13 +1533,14 @@ def _execute_code_generation(
                         abl_repair_resp.content
                     )
                     if repaired_files and "main.py" in repaired_files:
-                        files = repaired_files
-                        for fname, code in files.items():
-                            (exp_dir / fname).write_text(code, encoding="utf-8")
-                        logger.info(
-                            "Stage 10: Ablation repair applied — "
-                            "rewrote duplicate conditions"
+                        files, _adopted = _adopt_repair(
+                            files, repaired_files, exp_dir, "ablation repair",
                         )
+                        if _adopted:
+                            logger.info(
+                                "Stage 10: Ablation repair applied — "
+                                "rewrote duplicate conditions"
+                            )
                 except Exception as exc:
                     logger.debug("Ablation repair failed: %s", exc)
         except Exception as exc:

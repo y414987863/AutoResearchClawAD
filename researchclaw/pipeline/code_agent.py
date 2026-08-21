@@ -280,6 +280,44 @@ class CodeAgent:
 
     # ── Phase 1: Blueprint Planning ──────────────────────────────────────
 
+    # ── Shared helpers ────────────────────────────────────────────────────
+
+    def _stdout_contract(self, metric: str) -> str:
+        """Render the stdout metric contract, or "" if unavailable."""
+        try:
+            return self._pm.block("stdout_contract", metric_key=metric)
+        except Exception:  # noqa: BLE001
+            logger.error(
+                "CodeAgent: could not render the stdout_contract block — "
+                "generated code will not know the required metric format",
+                exc_info=True,
+            )
+            return ""
+
+    def _accept_repair(
+        self,
+        before: dict[str, str],
+        after: dict[str, str],
+        label: str,
+    ) -> dict[str, str]:
+        """P0-2: only adopt a repair that survives re-validation.
+
+        A repair that breaks syntax, drops the entrypoint, or leaves a
+        dangling cross-file import is discarded in favour of *before*.
+        """
+        from researchclaw.experiment.validator import check_repaired_files
+
+        blockers = check_repaired_files(after)
+        if blockers:
+            self._log_event(
+                f"  {label} REJECTED — rolled back. "
+                f"{len(blockers)} blocker(s): {'; '.join(blockers[:3])}"
+            )
+            return before
+        return after
+
+    # ── Phase 1: Blueprint ────────────────────────────────────────────────
+
     def _phase1_blueprint(
         self, topic: str, exp_plan: str, metric: str,
     ) -> tuple[str, dict[str, Any] | None]:
@@ -295,6 +333,12 @@ class CodeAgent:
             exp_plan=exp_plan,
             metric=metric,
         )
+
+        # P0: the stdout metric contract must reach Phase 1 too — the blueprint
+        # decides which file owns reporting, so it has to know the grammar.
+        contract = self._stdout_contract(metric)
+        if contract:
+            sp = type(sp)(system=sp.system, user=sp.user + "\n\n" + contract)
 
         # Inject domain context and code search results into blueprint prompt
         domain_context = self._build_domain_context()
@@ -532,6 +576,8 @@ class CodeAgent:
 
             # Generate this file via LLM
             file_spec_str = json.dumps(file_spec, indent=2, default=str)
+            if len(exp_plan) > 8000:
+                logger.warning('The character count of exp_plan is greater than 8000 and has been truncated')
             sp = self._pm.sub_prompt(
                 "generate_single_file",
                 file_name=file_name,
@@ -540,7 +586,7 @@ class CodeAgent:
                 dependency_summaries=dep_summaries,
                 dependency_code=dep_code,
                 topic=topic,
-                exp_plan=exp_plan[:4000],  # Truncate to avoid token overflow
+                exp_plan=exp_plan[:8000],  # Truncate to avoid token overflow
                 pkg_hint=pkg_hint,
             )
             resp = self._chat(sp.system, sp.user, max_tokens=8192)
@@ -936,7 +982,7 @@ class CodeAgent:
                 f"  Repair updated {len(fixed)} file(s): "
                 f"{', '.join(sorted(fixed))}"
             )
-            return merged
+            return self._accept_repair(files, merged, "Critical-issue repair")
 
         self._log_event("  WARNING: Repair produced no extractable files")
         return files
@@ -1074,7 +1120,7 @@ class CodeAgent:
         if fixed:
             merged = dict(files)
             merged.update(fixed)
-            return merged
+            return self._accept_repair(files, merged, "Exec-fix repair")
         return files
 
     @staticmethod
@@ -1189,6 +1235,9 @@ class CodeAgent:
         if fixed and target_file in fixed:
             merged = dict(files)
             merged.update(fixed)
+            if self._accept_repair(files, merged, "Targeted repair") is files:
+                # Rejected — let the caller fall back to full-file repair.
+                return None
             self._log_event(
                 f"  Targeted repair applied to {target_file} "
                 f"({len(fixed[target_file].split(chr(10)))} lines)"

@@ -33,6 +33,8 @@ _NEW_PARAM_MODELS = frozenset(
         "gpt-5.2",
         "gpt-5.3",
         "gpt-5.4",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
     }
 )
 
