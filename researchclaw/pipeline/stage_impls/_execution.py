@@ -1416,6 +1416,101 @@ def _execute_iterative_refine(
             )
             break
 
+    # === LLM4AD Boost 可选后处理（配置控制） ===
+    # 必须在 experiment_final 落盘之前：演化产物在这里变成 Stage 13 的一个普通
+    # 候选版本，跟其他迭代一样重跑实验、按 ARC 自己的真实指标与 best_metric
+    # 比较，胜出才由下面的 _write_project(final_dir, best_files) 采纳。
+    # 这样代码和论文里的数字始终来自同一次运行。
+    boost_artifacts: list[str] = []
+    if config.experiment.llm4ad_boost.enabled:
+        try:
+            from researchclaw.pipeline.stage_impls._llm4ad_boost import run_llm4ad_boost_inline
+
+            boost_dir = stage_dir / "llm4ad_boost"
+            logger.info("Stage 13: 运行 LLM4AD boost 后处理...")
+
+            boost_result = run_llm4ad_boost_inline(
+                boost_dir=boost_dir,
+                stage_dir=stage_dir,
+                run_dir=run_dir,
+                config=config,
+                base_files=best_files,
+                adapters=adapters,
+            )
+
+            boost_artifacts.append("llm4ad_boost/")
+            evolved_files = (boost_result or {}).get("evolved_files")
+
+            if not evolved_files:
+                logger.info("Stage 13: LLM4AD boost 未产出可用候选（跳过或失败）")
+            elif config.experiment.mode not in ("sandbox", "docker"):
+                # 模拟模式下跑不出真实指标，无从判断演化版是否更优。
+                # 报告保留，但不采纳——不验证就采纳等于把代理分数当成实验结果。
+                logger.info(
+                    "Stage 13: mode=%s 无法重跑验证，LLM4AD 候选仅留报告不采纳",
+                    config.experiment.mode,
+                )
+            else:
+                boost_version = "experiment_v_llm4ad/"
+                boost_version_dir = stage_dir / "experiment_v_llm4ad"
+                _write_project(boost_version_dir, evolved_files)
+
+                if config.experiment.mode == "sandbox":
+                    _ensure_sandbox_deps(
+                        "\n".join(evolved_files.values()),
+                        config.experiment.sandbox.python_path,
+                    )
+                boost_sandbox = create_sandbox(
+                    config.experiment, stage_dir / "refine_sandbox_llm4ad"
+                )
+                boost_rerun = boost_sandbox.run_project(
+                    boost_version_dir,
+                    timeout_sec=config.experiment.time_budget_sec,
+                )
+                boost_metric = _find_metric(boost_rerun.metrics, metric_key)
+
+                boost_record = {
+                    "version_dir": boost_version,
+                    "source": "llm4ad_evolution",
+                    "metric": boost_metric,
+                    "improved": False,
+                    "sandbox": {
+                        "returncode": boost_rerun.returncode,
+                        "metrics": boost_rerun.metrics,
+                        "elapsed_sec": boost_rerun.elapsed_sec,
+                        "timed_out": boost_rerun.timed_out,
+                        "stderr": boost_rerun.stderr[:2000] if boost_rerun.stderr else "",
+                        "stdout": boost_rerun.stdout[:50000] if boost_rerun.stdout else "",
+                    },
+                }
+
+                if boost_metric is not None and _is_better(boost_metric, best_metric):
+                    best_metric = boost_metric
+                    best_files = dict(evolved_files)
+                    best_version = boost_version
+                    boost_record["improved"] = True
+                    logger.info(
+                        "Stage 13: LLM4AD 候选被采纳，%s=%s", metric_key, boost_metric
+                    )
+                else:
+                    logger.info(
+                        "Stage 13: LLM4AD 候选未优于现有最优（%s vs %s），不采纳",
+                        boost_metric,
+                        best_metric,
+                    )
+
+                log["iterations"].append(boost_record)
+                log["llm4ad_boost"] = {
+                    "adopted": boost_record["improved"],
+                    "metric": boost_metric,
+                    "merge": (boost_result or {}).get("merge", []),
+                }
+        except Exception as e:
+            if config.experiment.llm4ad_boost.fail_silently:
+                logger.warning("Stage 13: LLM4AD boost 失败（已忽略）: %s", e)
+            else:
+                raise
+
     # Write final experiment directory
     final_dir = stage_dir / "experiment_final"
     _write_project(final_dir, best_files)
@@ -1444,6 +1539,8 @@ def _execute_iterative_refine(
         for entry in log["iterations"]
         if isinstance(entry, dict) and isinstance(entry.get("version_dir"), str)
     )
+    artifacts.extend(boost_artifacts)
+
     return StageResult(
         stage=Stage.ITERATIVE_REFINE,
         status=StageStatus.DONE,

@@ -581,6 +581,45 @@ class CliAgentConfig:
 
 
 @dataclass(frozen=True)
+class Llm4adBoostConfig:
+    """LLM4AD Boost Layer — evolutionary refinement of ARC-generated algorithms.
+
+    When disabled (the default) this has zero effect on ARC's 23-stage
+    workflow.  When enabled, the evolved algorithm enters Stage 13 as one more
+    candidate version: it is re-run in the sandbox like every other refinement
+    iteration, scored with ARC's own metric, and only adopted into
+    ``experiment_final/`` if it beats the incumbent.  That keeps the shipped
+    code and the reported numbers in sync — LLM4AD's own evaluator score is a
+    proxy on its task-package benchmark and is used for reporting only.
+
+    Config accepts both the flat spelling (``max_generations: 50``) and the
+    nested one (``evolution: {max_generations: 50}``).  An explicit nested
+    value wins over an explicit flat one; both win over the defaults.
+    """
+
+    enabled: bool = False  # Master switch for boost layer
+    fail_silently: bool = True  # Graceful degradation on failure
+    parallel_evolution: bool = False  # Evolve multiple algorithms concurrently
+    max_parallel_algorithms: int = 3  # Cap for parallel evolution batches
+
+    # --- Nested sub-configs consumed by the LLM4AD task builder / boost stage.
+    # Defaults live in the _DEFAULT_LLM4AD_* module constants below (evaluated
+    # lazily here) so there is exactly one definition of each default.
+    metric_aggregation: dict[str, Any] = field(
+        default_factory=lambda: dict(_DEFAULT_LLM4AD_METRIC_AGGREGATION)
+    )
+    evolution: dict[str, Any] = field(
+        default_factory=lambda: dict(_DEFAULT_LLM4AD_EVOLUTION)
+    )
+    resources: dict[str, Any] = field(
+        default_factory=lambda: dict(_DEFAULT_LLM4AD_RESOURCES)
+    )
+    marking: dict[str, Any] = field(
+        default_factory=lambda: dict(_DEFAULT_LLM4AD_MARKING)
+    )
+
+
+@dataclass(frozen=True)
 class ExperimentConfig:
     mode: str = "simulated"
     time_budget_sec: int = 300
@@ -603,6 +642,7 @@ class ExperimentConfig:
     figure_agent: FigureAgentConfig = field(default_factory=FigureAgentConfig)
     repair: ExperimentRepairConfig = field(default_factory=ExperimentRepairConfig)
     cli_agent: CliAgentConfig = field(default_factory=CliAgentConfig)
+    llm4ad_boost: Llm4adBoostConfig = field(default_factory=Llm4adBoostConfig)
 
 
 @dataclass(frozen=True)
@@ -1336,6 +1376,92 @@ def _parse_stat_agent_config(data: dict[str, Any]) -> StatAgentConfig:
     )
 
 
+# Defaults for the LLM4AD boost nested sub-configs (LLM4AD_INTEGRATION_PLAN.md §4.1).
+_DEFAULT_LLM4AD_METRIC_AGGREGATION: dict[str, Any] = {
+    "method": "primary_only",
+    "primary_only": {"metric_key": "primary_metric", "direction": "minimize"},
+}
+_DEFAULT_LLM4AD_EVOLUTION: dict[str, Any] = {
+    "method": "island_ga",
+    "max_generations": 20,
+    "population_size": 10,
+    "elite_ratio": 0.2,
+    "mutation_rate": 0.6,
+    "crossover_rate": 0.3,
+    "island": {"count": 4, "migration_interval": 5, "migration_rate": 0.1},
+}
+_DEFAULT_LLM4AD_RESOURCES: dict[str, Any] = {
+    "time_budget_sec": 1800,
+    "eval_timeout_sec": 120,
+    "parallel_workers": 4,
+}
+_DEFAULT_LLM4AD_MARKING: dict[str, Any] = {
+    "strategy": "auto",
+    "scope": "optimize_method",
+    "preserve_imports": True,
+    "preserve_init": True,
+}
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Merge *override* into *base*, recursing into nested dicts (shallow elsewhere)."""
+    result = dict(base)
+    for key, value in override.items():
+        if (
+            isinstance(value, dict)
+            and isinstance(result.get(key), dict)
+        ):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _parse_llm4ad_boost_config(data: dict[str, Any]) -> Llm4adBoostConfig:
+    """Parse LLM4AD boost layer configuration.
+
+    Accepts the nested schema (LLM4AD_INTEGRATION_PLAN.md §4.1) as well as the
+    flat legacy spelling of a few hot knobs.  Precedence, highest first:
+    explicit nested value > explicit flat value > built-in default.
+    """
+    if not data:
+        return Llm4adBoostConfig()
+
+    def _section(name: str, defaults: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Return (merged, explicit) for one nested sub-config."""
+        explicit = dict(data.get(name) or {})
+        return _deep_merge(dict(defaults), explicit), explicit
+
+    evolution, evolution_given = _section("evolution", _DEFAULT_LLM4AD_EVOLUTION)
+    resources, resources_given = _section("resources", _DEFAULT_LLM4AD_RESOURCES)
+    marking, _ = _section("marking", _DEFAULT_LLM4AD_MARKING)
+    metric_aggregation, _ = _section(
+        "metric_aggregation", _DEFAULT_LLM4AD_METRIC_AGGREGATION
+    )
+
+    # Flat legacy aliases.  Only applied when the nested form did not spell the
+    # key out, so `evolution: {max_generations: 50}` always wins.  Plain
+    # assignment (not setdefault) — the key is always present from the defaults.
+    for flat_key, section, given, nested_key in (
+        ("max_generations", evolution, evolution_given, "max_generations"),
+        ("population_size", evolution, evolution_given, "population_size"),
+        ("time_budget_sec", resources, resources_given, "time_budget_sec"),
+    ):
+        if data.get(flat_key) is not None and nested_key not in given:
+            section[nested_key] = _safe_int(data[flat_key], section[nested_key])
+
+    return Llm4adBoostConfig(
+        enabled=bool(data.get("enabled", False)),
+        fail_silently=bool(data.get("fail_silently", True)),
+        metric_aggregation=metric_aggregation,
+        evolution=evolution,
+        resources=resources,
+        marking=marking,
+        parallel_evolution=bool(data.get("parallel_evolution", False)),
+        max_parallel_algorithms=_safe_int(data.get("max_parallel_algorithms"), 3),
+    )
+
+
 def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
     sandbox_data = data.get("sandbox") or {}
     docker_data = data.get("docker") or {}
@@ -1413,6 +1539,7 @@ def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
         figure_agent=_parse_figure_agent_config(data.get("figure_agent") or {}),
         repair=_parse_experiment_repair_config(data.get("repair") or {}),
         cli_agent=_parse_cli_agent_config(data.get("cli_agent") or {}),
+        llm4ad_boost=_parse_llm4ad_boost_config(data.get("llm4ad_boost") or {}),
     )
 
 

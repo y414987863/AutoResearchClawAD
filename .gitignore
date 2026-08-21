@@ -117,6 +117,7 @@ docs/tester_guide_cn.*
 # Public root docs are README.md, CONTRIBUTING.md, RESEARCHCLAW_AGENTS.md,
 # RESEARCHCLAW_CLAUDE.md — none of which match these patterns.
 /*_PLAN.md
+!LLM4AD_*.md
 /*_REPORT.md
 /*_SPEC.md
 /*_OVERHAUL.md
@@ -145,3 +146,4 @@ experiments/arc_bench/batch_logs/
 # README is tracked; any local checkout placed here stays local.
 external/agents/ColliderAgent/*
 !external/agents/ColliderAgent/README.md
+.idea
