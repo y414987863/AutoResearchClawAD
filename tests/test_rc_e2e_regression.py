@@ -185,7 +185,9 @@ class TestLLMFallback:
 
         call_models: list[str] = []
 
-        def mock_raw_call(model, messages, max_tokens, temperature, json_mode):
+        def mock_raw_call(
+            model, messages, max_tokens, temperature, json_mode, reasoning=None
+        ):
             _ = messages, max_tokens, temperature, json_mode
             call_models.append(model)
             if model == "gpt-blocked":

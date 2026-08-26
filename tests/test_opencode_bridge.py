@@ -290,19 +290,18 @@ class TestOpenCodeBridge:
         assert "requirements.txt" in files
         assert "main.py" in files
 
-    def test_collect_files_flattens_subdirectories(self, tmp_path):
-        """Files in subdirs should be flattened to basenames (BUG-D fix)."""
+    def test_collect_files_preserves_subdirectories(self, tmp_path):
+        """Files in subdirs keep their relative path (LLM4AD layout supported)."""
         src = tmp_path / "src"
         src.mkdir()
         (src / "model.py").write_text("class Model: pass")
         (src / "utils.py").write_text("def helper(): pass")
         (tmp_path / "main.py").write_text("from model import Model")
         files = OpenCodeBridge._collect_files(tmp_path)
-        # Keys should be flat basenames, not paths like "src/model.py"
-        assert "model.py" in files
-        assert "utils.py" in files
+        # Keys keep relative subdir paths, not flat basenames.
+        assert "src/model.py" in files
+        assert "src/utils.py" in files
         assert "main.py" in files
-        assert not any("/" in k for k in files)
 
     def test_collect_files_root_takes_priority_over_subdir(self, tmp_path):
         """Root-level file wins when basename collides with subdir file."""
@@ -411,6 +410,7 @@ class TestBuildOpencodeCommand:
         assert "opencode" in inner
         assert "run" in inner
         assert "--format json" in inner
+        assert "--auto" in inner
 
     def test_linux_wrapper_preserves_child_exit_status(self):
         """The `-e` flag is required: without it `script` can return 0 even when
@@ -437,7 +437,7 @@ class TestBuildOpencodeCommand:
             )
         assert cmd == [
             "/usr/bin/opencode", "run", "-m",
-            "anthropic/claude-sonnet-4-6", "--format", "json", "prompt",
+            "anthropic/claude-sonnet-4-6", "--format", "json", "--auto", "prompt",
         ]
 
     def test_non_linux_does_not_wrap_even_if_script_present(self):
@@ -471,8 +471,54 @@ class TestBuildOpencodeCommand:
         # A shell parsing `inner` must recover the original argv verbatim,
         # with the payload as a single token rather than separate commands.
         assert shlex.split(inner) == [
-            "/usr/bin/opencode", "run", "-m", "m", "--format", "json", payload,
+            "/usr/bin/opencode", "run", "-m", "m", "--format", "json", "--auto", payload,
         ]
+
+    def test_title_parameter_adds_title_flag(self):
+        """When title is provided, --title flag is added."""
+        with patch(
+            "researchclaw.pipeline.opencode_bridge.sys.platform", "linux"
+        ), patch(
+            "researchclaw.pipeline.opencode_bridge.shutil.which",
+            return_value=None,
+        ):
+            cmd = OpenCodeBridge._build_opencode_command(
+                "/usr/bin/opencode", "m", "p", title="test-session"
+            )
+        assert "--title" in cmd
+        assert "test-session" in cmd
+        # Check the order: should be before the prompt
+        title_idx = cmd.index("--title")
+        assert cmd[title_idx + 1] == "test-session"
+        assert cmd[-1] == "p"  # prompt is last
+
+    def test_debug_parameter_adds_logging_flags(self):
+        """When debug=True, --print-logs and --log-level DEBUG are added."""
+        with patch(
+            "researchclaw.pipeline.opencode_bridge.sys.platform", "linux"
+        ), patch(
+            "researchclaw.pipeline.opencode_bridge.shutil.which",
+            return_value=None,
+        ):
+            cmd = OpenCodeBridge._build_opencode_command(
+                "/usr/bin/opencode", "m", "p", debug=True
+            )
+        assert "--print-logs" in cmd
+        assert "--log-level" in cmd
+        assert "DEBUG" in cmd
+
+    def test_auto_flag_always_present(self):
+        """The --auto flag should always be present for non-interactive runs."""
+        with patch(
+            "researchclaw.pipeline.opencode_bridge.sys.platform", "linux"
+        ), patch(
+            "researchclaw.pipeline.opencode_bridge.shutil.which",
+            return_value=None,
+        ):
+            cmd = OpenCodeBridge._build_opencode_command(
+                "/usr/bin/opencode", "m", "p"
+            )
+        assert "--auto" in cmd
 
 
 # ============================================================
@@ -658,3 +704,101 @@ class TestCountHistoricalFailures:
         (d / "stage_health.json").write_text(json.dumps({"status": "FAILED"}))
         (d / "validation_report.md").write_text("FAILED after 3 repairs")
         assert count_historical_failures(tmp_path) == 1
+
+
+# ============================================================
+# TASK.md contract — the instructions the agent actually reads
+# ============================================================
+
+
+class TestTaskMdContract:
+    """TASK.md is the agent's task statement; it must state the whole contract.
+
+    These are the requirements that failed in real runs when TASK.md was silent
+    or self-contradictory, so each is pinned here rather than left to prose.
+    """
+
+    @staticmethod
+    def _rendered(metric: str = "ndcg_at_10", budget: int = 300) -> str:
+        from researchclaw.pipeline.opencode_bridge import _TASK_MD_TEMPLATE
+
+        return (
+            _TASK_MD_TEMPLATE
+            .replace("{python}", "/usr/bin/python3")
+            .replace("{metric}", metric)
+            .replace("{time_budget_sec}", str(budget))
+        )
+
+    def test_no_unfilled_placeholders(self):
+        body = self._rendered()
+        assert "{python}" not in body
+        assert "{metric}" not in body
+        assert "{time_budget_sec}" not in body
+
+    def test_time_guard_must_not_drop_conditions(self):
+        """The old wording said only "stop gracefully at 80%", which licenses a
+        `break` out of the condition loop — one real run lost a baseline that
+        way and produced a 3-of-4 comparison nobody noticed."""
+        body = self._rendered()
+        # Collapse wrapping so a phrase split across lines still matches.
+        flat = " ".join(body.split())
+        assert "NEVER break out of the loop over conditions" in flat
+        assert "SKIPPED_CONDITIONS" in flat
+        # The superseded phrasing must be gone, not merely supplemented.
+        assert "stop gracefully at 80% of the time budget" not in flat
+
+    def test_algorithms_must_not_read_the_clock(self):
+        """A metric that depends on elapsed time is rejected before evolution.
+
+        Scoring the same (algorithm, instance, seed) twice must give the same
+        number. A loop bounded by `time.time()` does a different amount of work
+        on a loaded machine, so the metric drifts; the Stage-13 fitness gate then
+        refuses to spend LLM budget on it and the whole evolution is skipped —
+        which is what happened to two real runs, both flagged on the same
+        instance.
+
+        The rule is absolute for algorithm files: even a timing measurement is
+        refused there, because a checker can see the call but not what it is used
+        for. Runtime figures belong in `main.py`.
+        """
+        body = self._rendered()
+        flat = " ".join(body.split())
+        assert "NEVER read the clock inside an algorithm" in flat
+        # The count-bounded replacement must be shown, not just described.
+        assert "max_evals" in flat
+        assert "while evals < max_evals" in flat
+        # And the deadline slice that caused the drift must be gone.
+        assert "per_run_budget = total_budget / n_runs" not in flat
+
+    def test_main_py_contract_is_explicit(self):
+        """`--algorithm`/`importlib` are hard requirements the validator
+        enforces, so they belong in the requirements and not only as an aside."""
+        body = self._rendered()
+        assert "--algorithm <name>" in body
+        assert "importlib" in body
+        assert "if __name__" in body
+
+    def test_argparse_is_not_blanket_forbidden(self):
+        """The blanket ban contradicted the required selector."""
+        body = self._rendered()
+        assert "Do NOT use argparse" not in body
+
+    def test_structural_self_check_covers_the_failure_modes(self):
+        body = self._rendered()
+        assert "Structural self-check" in body
+        # EVOLVE markers, and the per-algorithm standalone run.
+        assert "EVOLVE_START" in body
+        assert "Every algorithm module is evolvable" in body
+        assert "Every key an algorithm reads off" in body
+        assert "single-algorithm contract" in body
+
+    def test_no_run_specific_hardcoding(self):
+        # Render with a neutral metric: any topic token still present in the
+        # output is genuinely baked into the template.
+        body = self._rendered(metric="score").lower()
+        for token in (
+            "cma_es", "nelder", "powell", "ridge", "ndcg", "listmle",
+            "ranknet", "pointwise", "ackley", "rastrigin", "rosenbrock",
+            "ml03", "ml23", "tsp", "esn",
+        ):
+            assert token not in body, f"TASK.md hardcodes {token!r}"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import time as _time
 from dataclasses import dataclass
@@ -591,6 +592,37 @@ _STAGE_EXECUTORS: dict[Stage, Callable[..., StageResult]] = {
 }
 
 
+def _rmtree_force(path: Path) -> None:
+    """Delete *path*, including read-only files.
+
+    ``shutil.rmtree(..., ignore_errors=True)`` is not enough here: git marks
+    every object under ``.git/objects`` read-only, so on Windows the unlink
+    raises PermissionError and ``ignore_errors`` swallows it — the tree is left
+    half-deleted with the old git history intact. A resurrected history is worse
+    than no cleanup at all: llm4ad's ``auto_initialize`` then sees an existing
+    repo whose HEAD is the PREVIOUS run's snapshot, and every worktree it cuts
+    replays those stale files.
+
+    The onexc/onerror hook clears the read-only bit and retries, which is the
+    standard way to remove a git tree on Windows.
+    """
+    import shutil as _sh
+    import stat as _stat
+
+    def _on_error(func, target, _exc):  # noqa: ANN001 - shutil callback shape
+        try:
+            os.chmod(target, _stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass  # genuinely undeletable (locked by another process)
+
+    # Python 3.12 renamed the hook to onexc; keep both so this works on 3.11.
+    try:
+        _sh.rmtree(path, onexc=_on_error)
+    except TypeError:
+        _sh.rmtree(path, onerror=lambda f, p, e: _on_error(f, p, e))
+
+
 def execute_stage(
     stage: Stage,
     *,
@@ -608,6 +640,24 @@ def execute_stage(
         return hitl_result
 
     stage_dir = run_dir / f"stage-{int(stage):02d}"
+
+    # A stage always starts from an empty directory. Anything a previous run
+    # left here is stale by definition: the stage is about to regenerate it.
+    # Leaving it behind is not merely untidy — a leftover llm4ad_comparison.json
+    # or task_packages/ reads as this run's output, and evolution_results/ in
+    # particular looks like the present evolution already finished.
+    #
+    # Rollback is unaffected. `_version_rollback_stages` renames stage-NN/ to
+    # stage-NN_vN/ *before* the rollback recurses (runner.py), so by the time a
+    # revisited stage gets here the snapshot is already in place and this
+    # directory holds nothing the revisit needs — the readers that do want a
+    # snapshot look for `stage-NN_v*/…`, never the bare name.
+    #
+    # Guarded rather than unconditional because the contract below may need to
+    # distinguish "no output" from "no directory": the mkdir is what every
+    # stage writes into.
+    if stage_dir.exists():
+        _rmtree_force(stage_dir)
     stage_dir.mkdir(parents=True, exist_ok=True)
     _t_health_start = _time.monotonic()
     contract: StageContract = CONTRACTS[stage]

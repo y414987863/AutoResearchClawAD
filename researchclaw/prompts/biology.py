@@ -86,6 +86,7 @@ STAGES["hypothesis_gen"] = {
         "{domain_context}"
         "Synthesis:\n{synthesis}"
     ),
+    "max_tokens": 8192,
 }
 
 
@@ -95,6 +96,9 @@ STAGES["hypothesis_gen"] = {
 # {hardware_profile}, {time_budget_sec}, {per_condition_budget_sec},
 # {available_tier1_datasets}, {hypotheses}.
 STAGES["experiment_design"] = {
+    # Fixed-schema output: a reasoning pass buys nothing here and
+    # can eat the whole token budget before any visible output.
+    "reasoning": False,
     "system": (
         "You are a principal investigator designing rigorous in-silico "
         "metabolic-modelling experiments using COBRApy and BIGG genome-scale "
@@ -197,6 +201,10 @@ STAGES["experiment_design"] = {
         "'essentiality_heatmap', 'escher_central_carbon']).\n\n"
         "Hypotheses:\n{hypotheses}"
     ),
+    # See ml.py: without an explicit budget this stage inherits the 4096
+    # LLMConfig default and truncates mid-plan, which surfaces as a YAML parse
+    # failure rather than as a length problem.
+    "max_tokens": 8192,
 }
 
 
@@ -302,6 +310,10 @@ STAGES["code_generation"] = {
         "(`solution.objective_value`, sum of pFBA fluxes, FVA range, "
         "essential-gene recall, etc.)\n"
         "  * AGGREGATION: per-condition aggregation rule.\n"
+        "- ALSO define a module-level static dict at the top of main.py so downstream "
+        "stages agree on which way is better WITHOUT running your code:\n"
+        "  `METRIC_DEF = {\"primary_metric\": \"{metric}\", \"direction\": \"<maximize|minimize>\"}`\n"
+        "  It must match DIRECTION above.\n"
         "- Print at runtime: `METRIC_DEF: {metric} | direction=<higher/lower> "
         "| desc=<one-line description>`.\n\n"
         "REPRODUCIBILITY:\n"
@@ -366,7 +378,7 @@ STAGES["code_generation"] = {
         "saturates at the carbon-uptake bound, FVA fraction too loose.\n\n"
         "Experiment plan:\n{exp_plan}"
     ),
-    "max_tokens": 8192,
+    "max_tokens": 16384,
 }
 
 

@@ -207,7 +207,10 @@ def run_debate(
     parts = [f"### Perspective: {name}\n{text}" for name, text in current.items()]
     combined = "\n\n---\n\n".join(parts)
     sp = prompts.sub_prompt(synth_prompt, perspectives=combined)
-    synth_max = sp.max_tokens or gen_max_tokens
+    # ``max`` rather than ``or``: the bank's budget started arriving here only
+    # once sub_prompt stopped dropping it, and a bank value below the caller's
+    # would otherwise silently shrink a budget this code has always had.
+    synth_max = max(sp.max_tokens or 0, gen_max_tokens)
     final_text = ""
 
     if not split:
@@ -268,7 +271,7 @@ def run_debate(
             resp = synth_client.chat(
                 [{"role": "user", "content": sp2.user}],
                 system=synth_system,
-                max_tokens=sp2.max_tokens or gen_max_tokens,
+                max_tokens=max(sp2.max_tokens or 0, gen_max_tokens),
             )
             final_text = resp.content or combined
         except Exception as exc:  # noqa: BLE001

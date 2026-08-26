@@ -33,9 +33,12 @@ logger = logging.getLogger(__name__)
 
 MAX_REPAIR_CYCLES = 3
 
-# Regex for extracting ```python filename.py\n...\n``` blocks from LLM output
+# Regex for extracting ```python filename.py\n...\n``` blocks from LLM output.
+# The language-tag/path separator is optional whitespace OR a colon, so
+# ```python:main.py is recognized too — otherwise it fell through to
+# _UNNAMED_BLOCK_RE and every file overwrote main.py.
 _CODE_BLOCK_RE = re.compile(
-    r"```(?:python)?\s*([\w./\\-]+\.(?:py|txt))\s*\n(.*?)```",
+    r"```(?:python)?[^\S\n]*:?[^\S\n]*([\w./\\-]+\.(?:py|txt))[^\S\n]*\n(.*?)```",
     re.DOTALL,
 )
 # Fallback: unnamed python blocks
@@ -679,6 +682,7 @@ def _repair_via_opencode(
             timeout_sec=getattr(_oc_cfg, "timeout_sec", 600),
             max_retries=getattr(_oc_cfg, "max_retries", 1),
             workspace_cleanup=getattr(_oc_cfg, "workspace_cleanup", True),
+            debug=getattr(_oc_cfg, "debug", False),
         )
         workspace = run_dir / f"_repair_opencode_v{cycle}"
         workspace.mkdir(parents=True, exist_ok=True)

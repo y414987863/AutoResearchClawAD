@@ -14,33 +14,85 @@ class MathPromptAdapter(PromptAdapter):
         domain = self.domain
         paradigm = domain.experiment_paradigm
 
+        # The optimization sub-domain has no datasets — an optimizer is
+        # evaluated on synthetic objective functions, not on loaded data — so
+        # the generic numerical advice ("ODE: Lotka-Volterra", "Quadrature:
+        # singular integrands") describes the wrong experiment. It was reaching
+        # an optimization run and competing with the actual method for the
+        # model's attention, so the split here mirrors the one already made in
+        # `get_experiment_design_blocks` for the same pair of domains.
+        if domain.domain_id == "mathematics_optimization":
+            default_dataset_guidance = (
+                "No external dataset is needed — an optimizer is evaluated on "
+                "objective functions defined in code.\n"
+                "- Use standard benchmark functions with known global optima "
+                "(e.g. Sphere, Rosenbrock, Rastrigin, Ackley) so results can be "
+                "checked against ground truth.\n"
+                "- Define them in the project, parameterised by dimension and "
+                "bounds; do NOT download anything.\n"
+                "- Keep the function set small (2-4) so every condition is "
+                "evaluated on the same problems."
+            )
+        elif domain.domain_id == "mathematics_numerical":
+            default_dataset_guidance = (
+                "Use standard test problems with known solutions:\n"
+                "- ODE: Lotka-Volterra, Van der Pol, stiff systems\n"
+                "- Quadrature: smooth, oscillatory, singular integrands\n"
+                "- Linear algebra: Hilbert matrix, tridiagonal\n"
+                "- Do NOT download external datasets"
+            )
+        else:
+            default_dataset_guidance = (
+                "Use standard test problems with known solutions, defined in "
+                "code. Do NOT download external datasets."
+            )
+
         return PromptBlocks(
             compute_budget=domain.compute_budget_guidance or (
                 "Numerical methods are typically fast.\n"
                 "Use 5-8 refinement levels for convergence plots.\n"
                 "Step sizes: geometric sequence (h, h/2, h/4, ...)"
             ),
-            dataset_guidance=domain.dataset_guidance or (
-                "Use standard test problems with known solutions:\n"
-                "- ODE: Lotka-Volterra, Van der Pol, stiff systems\n"
-                "- Quadrature: smooth, oscillatory, singular integrands\n"
-                "- Linear algebra: Hilbert matrix, tridiagonal\n"
-                "- Do NOT download external datasets"
-            ),
+            dataset_guidance=domain.dataset_guidance or default_dataset_guidance,
             code_generation_hints=domain.code_generation_hints or self._hints(paradigm),
             output_format_guidance=self._output_format(paradigm),
         )
 
     def get_experiment_design_blocks(self, context: dict[str, Any]) -> PromptBlocks:
-        return PromptBlocks(
-            experiment_design_context=(
-                f"This is a **{self.domain.display_name}** experiment.\n"
+        domain = self.domain
+
+        # Specialized guidance for optimization domains
+        if domain.domain_id in ("mathematics_optimization", "mathematics_numerical"):
+            design_context = (
+                f"This is a **{domain.display_name}** experiment.\n\n"
+                "## Optimization Algorithm Runtime Estimation\n"
+                "- A single optimization run (1 seed × 1 test function × 1 algorithm) with budget B evaluations "
+                "typically takes **B/100 to B/50 seconds** (depending on function complexity)\n"
+                "- Example: B=2000 (200*d for d=10) takes ~20-40 seconds per run\n"
+                "- Example: B=4000 (200*d for d=20) takes ~40-80 seconds per run\n"
+                "- **CRITICAL**: Keep scale small to fit time budget:\n"
+                "  * Use 2-3 seeds (not 5-10) for tight budgets\n"
+                "  * Use 2-4 test functions (not 8-10)\n"
+                "  * Use 3-5 optimizers total (baselines + proposed + ablations)\n"
+                "  * Total runs should be ≤ time_budget_sec / 30\n\n"
+                "Focus on:\n"
+                "1. Correctness (verify against known optima)\n"
+                "2. Convergence quality (final objective value)\n"
+                "3. Efficiency (wall time, overhead fraction)\n"
+                "4. Test functions: Use standard benchmarks (Rosenbrock, Rastrigin, Ackley, Sphere)\n"
+            )
+        else:
+            design_context = (
+                f"This is a **{domain.display_name}** experiment.\n"
                 "Focus on:\n"
                 "1. Correctness (verify against known solutions)\n"
                 "2. Convergence order (expected vs observed)\n"
                 "3. Efficiency (operations count, wall time)\n"
-            ),
-            statistical_test_guidance="Use convergence order fitting for accuracy analysis.",
+            )
+
+        return PromptBlocks(
+            experiment_design_context=design_context,
+            statistical_test_guidance="Use paired statistical tests (Wilcoxon or t-test) for optimizer comparison across seeds.",
         )
 
     def get_result_analysis_blocks(self, context: dict[str, Any]) -> PromptBlocks:

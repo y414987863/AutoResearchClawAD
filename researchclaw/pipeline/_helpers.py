@@ -7,7 +7,7 @@ import json
 import logging
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -47,8 +47,10 @@ class StageResult:
 # Constants
 # ---------------------------------------------------------------------------
 
+# NOTE: ``torch`` is intentionally absent — the deployment server has no GPU,
+# so a torch import is a genuine error we want to surface, not auto-install.
 _SANDBOX_SAFE_PACKAGES = {
-    "numpy", "scipy", "torch", "sklearn", "matplotlib",
+    "numpy", "scipy", "sklearn", "matplotlib",
     "pandas", "seaborn", "tqdm", "gymnasium", "gym",
 }
 
@@ -334,7 +336,18 @@ def _write_stage_meta(
 
 
 def _ensure_sandbox_deps(code: str, python_path: str) -> list[str]:
-    """P7: Scan code imports and auto-install missing common packages."""
+    """P7: Scan code imports and auto-install missing common packages.
+
+    Only packages in :data:`_SANDBOX_SAFE_PACKAGES` are considered. A package is
+    skipped if it already imports; otherwise we install it and return its name.
+    A failed install does **not** block the run — per the deployment decision,
+    let the code blow up with the real ``ModuleNotFoundError`` rather than fail
+    early on our own install guess. We just stop claiming it was installed.
+
+    Prefers the interpreter's own pip first, then ``uv pip`` (uv-created venvs
+    often ship without pip). Both are silent no-ops for already-satisfied
+    packages, so re-running is harmless.
+    """
     import subprocess as _sp
 
     imports: set[str] = set()
@@ -360,21 +373,78 @@ def _ensure_sandbox_deps(code: str, python_path: str) -> list[str]:
                 capture_output=True, timeout=10,
                 encoding="utf-8", errors="replace",
             )
-            if r.returncode != 0:
-                pip_name = "scikit-learn" if pkg == "sklearn" else pkg
-                logger.info("Sandbox: installing missing dependency '%s'", pip_name)
-                _sp.run(
-                    [str(py_path), "-m", "pip", "install", pip_name, "--quiet"],
-                    capture_output=True, timeout=120,
-                    encoding="utf-8", errors="replace",
-                )
+            if r.returncode == 0:
+                continue  # already available
+            pip_name = "scikit-learn" if pkg == "sklearn" else pkg
+            logger.info("Sandbox: installing missing dependency '%s'", pip_name)
+            ok = _pip_install(str(py_path), pip_name)
+            if ok:
                 installed.append(pip_name)
-        except Exception as exc:
+            else:
+                # Not fatal per decision above — just don't claim success. The
+                # sandbox will surface the real ModuleNotFoundError if it needs
+                # this package.
+                logger.warning(
+                    "Sandbox: failed to install '%s' via pip and uv. "
+                    "Letting the experiment run; it will error on import if "
+                    "the dependency is actually required.",
+                    pip_name,
+                )
+        except Exception as exc:  # noqa: BLE001
             logger.warning("Sandbox: failed to check/install '%s': %s", pkg, exc)
 
     if installed:
         logger.info("Sandbox: auto-installed packages: %s", ", ".join(installed))
     return installed
+
+
+def _pip_install(python: str, pip_name: str) -> bool:
+    """Install *pip_name* into the sandbox interpreter or the active uv env.
+
+    Tries ``python -m pip`` first, then ``uv pip`` (which targets the active
+    environment, so it works even where pip is missing). Returns True on a
+    zero exit code — i.e. the package is now importable.
+    """
+    import subprocess as _sp
+
+    # 1) Interpreter's own pip.
+    try:
+        r = _sp.run(
+            [python, "-m", "pip", "install", pip_name, "--quiet"],
+            capture_output=True, timeout=180,
+            encoding="utf-8", errors="replace",
+        )
+        if r.returncode == 0:
+            return True
+        if "No module named pip" not in r.stderr:
+            logger.warning(
+                "Sandbox: pip install of '%s' failed: %s",
+                pip_name, (r.stderr or r.stdout).strip()[-300:],
+            )
+        # else fall through to uv
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Sandbox: pip install '%s' raised: %s", pip_name, exc)
+
+    # 2) uv as fallback for pip-less (uv-created) venvs. ``--python`` pins the
+    # target interpreter explicitly — a bare ``uv pip install`` from an unset
+    # shell targets the *system* Python, not this venv, which would install to
+    # the wrong place.
+    try:
+        r = _sp.run(
+            ["uv", "pip", "install", "--python", python, pip_name, "--quiet"],
+            capture_output=True, timeout=180,
+            encoding="utf-8", errors="replace",
+        )
+        if r.returncode == 0:
+            return True
+        logger.warning(
+            "Sandbox: uv pip install of '%s' failed: %s",
+            pip_name, (r.stderr or r.stdout).strip()[-300:],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Sandbox: uv pip install '%s' raised: %s", pip_name, exc)
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -395,21 +465,42 @@ def _read_best_analysis(run_dir: Path) -> str:
     return _read_prior_artifact(run_dir, "analysis.md") or ""
 
 
+# Numeric stage dir and version-suffix patterns for `_read_prior_artifact`.
+_STAGE_NAME_RE = re.compile(r"stage-(\d+)")
+_STAGE_VER_RE = re.compile(r"_v(\d+)")
+
+
 def _read_prior_artifact(run_dir: Path, filename: str) -> str | None:
-    # R14-2: Sort so non-versioned dirs (stage-13) come before versioned (stage-13_v1).
-    # Within the same stage number, prefer the latest (non-versioned) copy.
-    def _stage_sort_key(p: Path) -> tuple[str, int]:
-        name = p.name
-        # Extract base stage name and version
-        if "_v" in name:
-            base, _, ver = name.rpartition("_v")
-            try:
-                return (base, -int(ver))  # Versioned: lower priority (negative version)
-            except ValueError:
-                return (name, -999)
-        return (name, 0)  # Non-versioned: highest priority
+    """Read the newest prior-stage artifact by its file/directory name.
+
+    Iterates ``stage-*`` directories in DESCENDING numeric order (a higher
+    stage is a newer output) and returns the first one holding ``filename``.
+    ``_repair*`` and ``_vN`` (versioned) directories are excluded: they are
+    scratch/retry workspaces the repair machinery writes, not real stage output,
+    so a stale one must never shadow a genuine producer. The previous
+    implementation sorted the directory NAMES lexicographically, so
+    ``stage-14_repair_v1`` sorted AFTER ``stage-10`` and, iterated first, won —
+    stage-12 read a stale Stage-14 repair workspace (old code, no ``data/``)
+    instead of the stage-10 experiment and crashed with "No instances found
+    under data/*.json".
+    """
+
+    def _stage_sort_key(p: Path) -> tuple[float, int, str]:
+        m = _STAGE_NAME_RE.match(p.name)
+        num = float(m.group(1)) if m else float("inf")
+        ver = 0
+        m2 = _STAGE_VER_RE.search(p.name)
+        if m2:
+            ver = int(m2.group(1))
+        # Reverse-sort below: higher stage number first; within a stage, ver=0
+        # (clean) first. Versioned dirs are excluded anyway, so `ver` only orders
+        # anything we failed to filter — name is the final tiebreaker.
+        return (num, ver, p.name)
 
     for stage_subdir in sorted(run_dir.glob("stage-*"), key=_stage_sort_key, reverse=True):
+        name = stage_subdir.name
+        if "_repair" in name or _STAGE_VER_RE.search(name):
+            continue  # repair/versioned workspaces are never a valid artifact source
         candidate = stage_subdir / filename
         if candidate.is_file():
             try:
@@ -420,6 +511,106 @@ def _read_prior_artifact(run_dir: Path, filename: str) -> str | None:
         if filename.endswith("/") and (stage_subdir / filename.rstrip("/")).is_dir():
             return str(stage_subdir / filename.rstrip("/"))
     return None
+
+
+# The generated experiment declares which way its primary metric is judged, in
+# either the static dict (preferred — readable without running the code) or the
+# runtime line it prints. The dict pattern stays inside one brace pair
+# (``[^}]*``, which already spans newlines) rather than using a lazy ``.*?``:
+# the lazy form walks past a METRIC_DEF that omits ``direction`` and latches
+# onto the next unrelated dict that happens to have one.
+_METRIC_DIRECTION_DICT_RE = re.compile(
+    r'METRIC_DEF\s*=\s*\{[^}]*"direction"\s*:\s*"(maximize|minimize)"',
+    re.IGNORECASE,
+)
+_METRIC_DIRECTION_PRINT_RE = re.compile(
+    r"METRIC_DEF\s*:.*?direction\s*=\s*(higher|lower)", re.IGNORECASE
+)
+
+
+def correct_metric_direction(run_dir: Path, config: RCConfig) -> RCConfig:
+    """Return ``config`` with the direction the generated experiment declares.
+
+    Returns ``config`` unchanged when no experiment has been generated yet or it
+    declares nothing. Called once per stage from the pipeline loop, so every
+    stage after code generation reads a corrected value through the ordinary
+    ``config.experiment.metric_direction`` and needs no lookup of its own.
+
+    ``metric_direction`` in the config is an empty override by default; when it
+    is empty the code that computes the metric is the only thing that knows which
+    way is better, so its declaration wins. In the rc_full3 run that made promote
+    read ``valid_prediction_time`` (``max(0, baseline - corrected)``, larger is
+    better) as lower-is-better and ship a regression as a -100% "improvement".
+    """
+    exp_dir = _read_prior_artifact(run_dir, "experiment/")
+    if not (exp_dir and Path(exp_dir).is_dir()):
+        return config
+
+    declared = _detect_metric_direction(Path(exp_dir))
+
+    current = str(getattr(config.experiment, "metric_direction", "") or "").lower()
+    if not declared or declared == current:
+        return config
+
+    logger.warning(
+        "Metric direction corrected: config says %r but the generated experiment "
+        "declares %r for metric %r. Using %r — the code that computes the metric "
+        "is authoritative. Set experiment.metric_direction=%r in the config to "
+        "silence this.",
+        current, declared, config.experiment.metric_key, declared, declared,
+    )
+    return replace(
+        config, experiment=replace(config.experiment, metric_direction=declared)
+    )
+
+
+def resolve_metric_direction(config: RCConfig, exp_dir: Path | None = None) -> str:
+    """Return the effective metric direction for a stage.
+
+    Priority: an explicit ``config.experiment.metric_direction`` wins; otherwise
+    the static declaration in the generated code (``METRIC_DEF``/runtime
+    ``METRIC_DEF:`` line) is read back; otherwise fall back to ``"minimize"``.
+
+    This is the single source of truth for *pre-codegen* stages (9, 10) where an
+    experiment may not exist yet, and the ``or "maximize"``/``or "minimize"``
+    sprinkles scattered across stage code should be collapsed onto it. Stage code
+    after code generation normally reads the already-corrected
+    ``config.experiment.metric_direction`` (see :func:`correct_metric_direction`);
+    this is the fallback when that path did not run.
+    """
+    explicit = str(getattr(config.experiment, "metric_direction", "") or "").strip().lower()
+    if explicit in ("minimize", "maximize"):
+        return explicit
+    if exp_dir is not None:
+        detected = _detect_metric_direction(Path(exp_dir))
+        if detected:
+            return detected
+    return "minimize"
+
+
+def _detect_metric_direction(exp_dir: Path) -> str:
+    """Read the metric direction the generated code declares, or ``""``.
+
+    Prefers the static ``METRIC_DEF = {..., "direction": "..."}`` dict (readable
+    without running code), then the runtime ``METRIC_DEF: ... direction=higher/
+    lower`` print line. Empty when the experiment declares nothing usable.
+    """
+    for name in ("evaluator.py", "main.py"):
+        try:
+            # errors="replace": a model-generated file with one stray byte must
+            # not raise UnicodeDecodeError here.
+            text = (Path(exp_dir) / name).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            continue
+        m = _METRIC_DIRECTION_DICT_RE.search(text)
+        if m:
+            return m.group(1).lower()
+        m = _METRIC_DIRECTION_PRINT_RE.search(text)
+        if m:
+            return "maximize" if m.group(1).lower() == "higher" else "minimize"
+    return ""
 
 
 def _find_prior_file(run_dir: Path, filename: str) -> Path | None:
@@ -509,6 +700,221 @@ def _extract_yaml_block(text: str) -> str:
     return text.strip()
 
 
+_YAML_BLOCK_HEADER_RE = re.compile(r"^[|>][+-]?\d*\s*$")
+_YAML_KEY_SEP_RE = re.compile(r":(?:\s|$)")
+
+
+def _repair_yaml_line(line: str) -> str | None:
+    """Quote the scalar value on ``line`` so PyYAML stops rejecting it.
+
+    Models routinely emit values that open with a YAML indicator character —
+    ``||x - x*||_2`` (a norm), ``**bold**``, ``*.py``, ``> 0.5`` — or that
+    carry a bare ``:`` inside the value.  Wrapping the value in double quotes
+    makes it a plain string without changing what it says.
+
+    Returns None when there is nothing safe to rewrite, which tells the caller
+    to give up rather than risk corrupting the document.
+    """
+    stripped = line.lstrip()
+    if not stripped or stripped.startswith(("#", "---", "...")):
+        return None
+    indent = line[: len(line) - len(stripped)]
+
+    prefix = ""
+    inner = stripped
+    while inner.startswith("- "):
+        prefix += "- "
+        inner = inner[2:]
+    if not inner:
+        return None
+
+    if inner[0] in "{[":
+        # A flow collection (``- {lr: 0.01}``) is valid structure. Bailing out
+        # before the key split matters: the split would otherwise cut at the
+        # ``:`` *inside* the braces and quote the fragment, turning
+        # ``- {a: 1}`` into ``- {a: "1}"``. The ``value[0] in "{["`` guard
+        # further down cannot catch this — after the split the value is ``1}``.
+        return None
+
+    match = _YAML_KEY_SEP_RE.search(inner)
+    if match and inner[0] not in "'\"":
+        key = inner[: match.start() + 1]
+        value = inner[match.end():].strip()
+    else:
+        # A bare list item (``- ||x||``): the whole entry is the value.  A
+        # quoted scalar is left alone — any ``:`` inside it is part of the
+        # string, not a key separator.
+        if not prefix or inner[0] in "'\"":
+            return None
+        key = ""
+        value = inner
+
+    # Leave real block scalars (``key: |``) and flow collections
+    # (``[a, b]`` / ``{lr: 0.01}``) alone — those are valid structure.
+    if not value or _YAML_BLOCK_HEADER_RE.match(value) or value[0] in "{[":
+        return None
+
+    cleaned = value.strip("\"'").replace("\\", "\\\\").replace('"', '\\"')
+    if not cleaned:
+        return None
+    separator = f"{key} " if key else ""
+    return f'{indent}{prefix}{separator}"{cleaned}"'
+
+
+def _describe_yaml_failure(text: str) -> str:
+    """Return a one-line diagnosis of why ``text`` did not yield a plan.
+
+    ``_safe_load_yaml`` swallows the parser error so callers can fall back, but
+    that leaves the failure log unable to tell a stray colon in one scalar from
+    a truncated response — and the document is often 14 KB, so "first 200
+    chars" shows nothing about the actual defect. This re-parses on the failure
+    path only, and reports the parser's own position plus the offending line.
+
+    Also distinguishes the case where YAML parsed *fine* but produced a list or
+    a string, which the caller rejects for a different reason entirely.
+    """
+    if not text or not text.strip():
+        return "empty content"
+    try:
+        parsed = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None) or getattr(
+            exc, "context_mark", None
+        )
+        problem = getattr(exc, "problem", None) or str(exc).splitlines()[0]
+        if mark is None:
+            return str(problem)
+        lines = text.split("\n")
+        src = (
+            lines[mark.line].strip()
+            if 0 <= mark.line < len(lines)
+            else "<line out of range>"
+        )
+        return "%s at line %d col %d: %r" % (
+            problem, mark.line + 1, mark.column + 1, src[:160],
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}"
+    return (
+        f"valid YAML but top level is {type(parsed).__name__}, not a mapping"
+    )
+
+
+_YAML_NUMBERED_ITEM_RE = re.compile(r"^(\s*)(\d+[.)])(\s+)(\S.*)$")
+_YAML_EMPTY_VALUE_KEY_RE = re.compile(
+    r"^\s*(?:-\s+)?(?:[^\s:#][^:]*|\"[^\"]*\"|'[^']*'):\s*$"
+)
+_YAML_BLOCK_SCALAR_RE = re.compile(r":\s*[|>][+-]?\d*\s*$")
+
+
+def _normalize_markdown_lists(text: str) -> str:
+    """Turn markdown numbered lists back into YAML sequences.
+
+    Models routinely answer a key that wants a list with the prose form they
+    were trained on::
+
+        algorithm_steps:
+          1. Compute sample covariance matrix
+          2. Estimate optimal shrinkage intensity
+          3. Shrink toward identity: Sigma = d * I + (1-d) * S
+
+    YAML reads that as one plain multi-line scalar, so the ``:`` on the third
+    line raises "mapping values are not allowed here". ``_repair_yaml_line``
+    cannot help: quoting the value leaves the line a mapping inside a scalar
+    and the parser fails at the same spot, so the repair loop spends its budget
+    without progress. An observed Stage 9 response carried 20 such lines across
+    5 blocks — past ``max_repairs`` even if each one had been fixable.
+
+    Conversion is deliberately narrow. A line is rewritten only when it is
+    indented under a key that declared no value, or continues a run already
+    being rewritten, and never inside a ``|``/``>`` block scalar where a
+    numbered list is intended as literal text. The number is kept in the string
+    because the ordering it encodes is part of the content.
+    """
+    out: list[str] = []
+    block_indent: int | None = None  # inside a |/> scalar started at this indent
+    key_indent: int | None = None  # nearest key that declared an empty value
+    run_indent: int | None = None  # indent of the run currently being rewritten
+
+    for line in text.split("\n"):
+        indent = len(line) - len(line.lstrip())
+        if block_indent is not None:
+            if line.strip() and indent > block_indent:
+                out.append(line)
+                continue
+            block_indent = None
+        if _YAML_BLOCK_SCALAR_RE.search(line):
+            block_indent, key_indent, run_indent = indent, None, None
+            out.append(line)
+            continue
+
+        match = _YAML_NUMBERED_ITEM_RE.match(line)
+        if match and (
+            run_indent == indent
+            or (key_indent is not None and indent > key_indent)
+        ):
+            prefix, number, _, rest = match.groups()
+            body = f"{number} {rest}".replace("\\", "\\\\").replace('"', '\\"')
+            out.append(f'{prefix}- "{body}"')
+            run_indent = indent
+            continue
+
+        run_indent = None
+        if line.strip():
+            key_indent = (
+                indent if _YAML_EMPTY_VALUE_KEY_RE.match(line) else None
+            )
+        out.append(line)
+    return "\n".join(out)
+
+
+def _safe_load_yaml(text: str, max_repairs: int = 12) -> Any:
+    """Parse YAML, repairing only the lines the parser actually rejects.
+
+    ``yaml.safe_load`` is all-or-nothing: one bad scalar discards an otherwise
+    complete document.  For LLM output that means a well-formed experiment plan
+    can be thrown away over a single character, and the caller silently falls
+    back to a generic template.
+
+    Repairs are driven by the parser's own error position, so valid content is
+    never rewritten — whole-document rewriting is not safe here, because it
+    mistakes multi-line quoted scalars for unterminated quotes.  Returns None
+    when the document cannot be recovered.
+    """
+    if not text or not text.strip():
+        return None
+    try:
+        return yaml.safe_load(text)
+    except yaml.YAMLError:
+        pass
+
+    # Tabs are never legal YAML indentation, but models emit them anyway.
+    lines = [
+        re.sub(r"^\t+", lambda m: "  " * len(m.group()), ln)
+        for ln in text.split("\n")
+    ]
+    # Markdown numbered lists defeat the line-driven repair below, so fold them
+    # into sequences first. Failure path only: a document that already parsed
+    # returned above and is never touched.
+    lines = _normalize_markdown_lists("\n".join(lines)).split("\n")
+    repaired: set[int] = set()
+    for _ in range(max_repairs):
+        try:
+            return yaml.safe_load("\n".join(lines))
+        except yaml.YAMLError as exc:
+            mark = getattr(exc, "problem_mark", None) or getattr(
+                exc, "context_mark", None
+            )
+            if mark is None or mark.line >= len(lines) or mark.line in repaired:
+                return None
+            repaired.add(mark.line)
+            fixed = _repair_yaml_line(lines[mark.line])
+            if fixed is None or fixed == lines[mark.line]:
+                return None
+            lines[mark.line] = fixed
+    return None
+
+
 def _safe_json_loads(text: str, default: Any) -> Any:
     """Parse JSON from text, handling noisy ACP output.
 
@@ -580,7 +986,34 @@ def _safe_json_loads(text: str, default: Any) -> Any:
     return default
 
 
+def _is_python_info_string(info: str) -> bool:
+    """True if a fence info string denotes Python (or is unlabelled).
+
+    Accepts ``""``, ``python``, ``py``, ``python:main.py``, ``python filename:x.py``
+    and rejects ``bash``, ``json``, ``yaml``, ``text`` … so a shell/JSON block
+    elsewhere in the reply is not mistaken for the code.
+    """
+    info = info.strip()
+    if not info:
+        return True
+    # First token up to a separator is the language tag.
+    tag = re.split(r"[\s:=]", info, maxsplit=1)[0].lower()
+    if tag in ("python", "python3", "py", ""):
+        return True
+    # Unlabelled but path-carrying: ```:main.py or ``` filename:main.py
+    return tag.endswith(".py") or "filename" in info.lower()
+
+
 def _extract_code_block(content: str) -> str:
+    # Consume the whole info string on the opening fence (```python:foo.py,
+    # ```py title=x, ```python) so it never lands in the code body. Matching
+    # only ``` plus an optional `python` left a `:foo.py` remnant as the first
+    # line (a SyntaxError). Non-Python fences are skipped, not returned, so a
+    # leading ```bash / ```json block isn't mistaken for the code.
+    for match in re.finditer(r"```([^\n`]*)\n(.*?)\s*```", content, flags=re.DOTALL):
+        if _is_python_info_string(match.group(1)):
+            return match.group(2).strip()
+    # Fenced snippet with no newline before the code: ```code```
     match = re.search(r"```(?:python)?\s*(.*?)\s*```", content, flags=re.DOTALL)
     if match is not None:
         return match.group(1).strip()
@@ -613,6 +1046,7 @@ def _extract_multi_file_blocks(content: str) -> dict[str, str]:
         ```
 
     Also handles common LLM format variations:
+    - ````` ```python:main.py````` (colon directly after the language tag)
     - ````` ```python filename:main.py````` (space before filename)
     - ````` ``` filename:main.py````` (space after backticks)
     - ``filename:main.py`` on next line after backticks
@@ -625,6 +1059,15 @@ def _extract_multi_file_blocks(content: str) -> dict[str, str]:
     """
     # R13-2: Multiple patterns to handle LLM format variations
     patterns = [
+        # ```python:xxx.py or ```:xxx.py — no `filename:` keyword, the path
+        # follows the language tag directly. Models emit this often; when it
+        # went unrecognized every file collapsed into the single-block
+        # fallback below, which yielded one main.py holding another file's
+        # body with a stray `:xxx.py` first line.
+        re.compile(
+            r"```(?:python)?:(\S+\.\w+)[^\S\n]*\n(.*?)```",
+            flags=re.DOTALL,
+        ),
         # Original: ```filename:xxx.py or ```python filename:xxx.py
         re.compile(
             r"```(?:python\s+)?filename:(\S+)\s*\n(.*?)```",
@@ -642,7 +1085,7 @@ def _extract_multi_file_blocks(content: str) -> dict[str, str]:
         ),
         # Variation: ```python\n# filename: xxx.py (comment marker)
         re.compile(
-            r"```(?:python)?\s*\n#\s*(?:FILE|filename)\s*:\s*(\S+\.py)\s*\n(.*?)```",
+            r"```(?:python)?\s*\n#\s*(?:FILE|filename)\s*:\s*(\S+)\s*\n(.*?)```",
             flags=re.DOTALL,
         ),
     ]
@@ -655,21 +1098,47 @@ def _extract_multi_file_blocks(content: str) -> dict[str, str]:
 
     if matches:
         files: dict[str, str] = {}
+        unparsed_blocks: list[str] = []
         for fname, code in matches:
             fname = fname.strip()
             # Security: prevent path traversal
             if ".." in fname or fname.startswith("/"):
+                unparsed_blocks.append(f"[rejected: path traversal] {fname}")
                 continue
-            # Normalise to flat filenames (strip leading ./ or subdirs for safety)
-            fname = fname.replace("\\", "/").split("/")[-1]
-            if fname and fname.endswith(".py"):
+            # Keep relative subdirectory paths (strip leading ./) so nested
+            # files like algorithms/<algo>/<algo>.py and data/*.json survive.
+            fname = fname.replace("\\", "/")
+            fname = fname[2:] if fname.startswith("./") else fname
+            if fname:
                 files[fname] = code.strip()
+
+        # Log extraction statistics
+        data_files = [k for k in files if k.startswith("data/")]
+        algo_files = [k for k in files if k.startswith("algorithms/") and k.endswith(".py")]
+        other_files = len(files) - len(data_files) - len(algo_files)
+
+        logger.info(
+            "Extracted %d file(s): %d algorithm(s), %d data file(s), %d other",
+            len(files), len(algo_files), len(data_files), other_files
+        )
+
+        if unparsed_blocks:
+            logger.warning(
+                "Found %d code block(s) that were NOT saved: %s",
+                len(unparsed_blocks),
+                ", ".join(unparsed_blocks[:3])  # Show first 3
+            )
+
         if files:
-            # Ensure there is a main.py entry point
-            if "main.py" not in files:
-                # Pick the first file as main.py
-                first_key = next(iter(files))
-                files["main.py"] = files.pop(first_key)
+            # No entry-point promotion here, by design. Every filename in this
+            # branch was stated explicitly by the model, so renaming one to
+            # main.py discards information it gave us and fabricates an entry
+            # point, corrupting both files — real main.py is overwritten by a
+            # helper's body, and the helper never lands under its own name (so
+            # a repair aimed at it is lost). The forgery also satisfies every
+            # caller's `"main.py" in files` guard. A response with no main.py is
+            # returned as-is so callers reject it; promotion is only sound in
+            # the unnamed single-block fallback, where no filename is lost.
             return files
 
     # Fallback: single code block → main.py
@@ -752,6 +1221,74 @@ def _parse_metrics_from_stdout(stdout: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _retry_empty_reasoning_response(
+    llm: LLMClient,
+    resp: Any,
+    messages: list[dict[str, str]],
+    *,
+    system: str,
+    json_mode: bool,
+    max_tokens: int | None,
+    strip_thinking: bool,
+    reasoning: bool | None,
+) -> Any:
+    """Re-ask once when a reasoning model burned its whole budget thinking.
+
+    A reasoning model counts its hidden reasoning against ``max_tokens``. When
+    the prompt is long and the budget is tight it can hit the ceiling before
+    emitting a single visible token, and the provider returns HTTP 200 with an
+    empty body and ``finish_reason="length"`` — not an error, so nothing
+    upstream retries. The stage then falls back to a much weaker path: Stage 9
+    collapsed a 6767-token design prompt to a 122-token generic one, losing the
+    hypotheses, the literature and the real compute budget.
+
+    Retrying the *same* prompt with the reasoning pass disabled and double the
+    budget keeps the full context, which is the part that actually determines
+    plan quality. Returns None when this does not apply, so the caller keeps
+    the original response.
+    """
+    if (getattr(resp, "content", "") or "").strip():
+        return None
+    if str(getattr(resp, "finish_reason", "")).lower() != "length":
+        return None
+
+    _retry_max = (max_tokens or 4096) * 2
+    logger.warning(
+        "LLM returned an empty body with finish_reason=length "
+        "(completion_tokens=%s, max_tokens=%s) — the reasoning pass consumed "
+        "the budget. Re-asking the same prompt with reasoning off and "
+        "max_tokens=%d.",
+        getattr(resp, "completion_tokens", "?"),
+        max_tokens,
+        _retry_max,
+    )
+    try:
+        retry = llm.chat(
+            messages,
+            system=system,
+            json_mode=json_mode,
+            max_tokens=_retry_max,
+            strip_thinking=strip_thinking,
+            reasoning=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Best-effort salvage: the caller still has the (empty) original and
+        # its own fallbacks. Turning this into a raise would make a recoverable
+        # stage fail outright.
+        logger.warning("Empty-response retry failed: %s", exc)
+        return None
+    if not (getattr(retry, "content", "") or "").strip():
+        logger.warning(
+            "Empty-response retry also returned nothing (finish_reason=%s). "
+            "Set llm.reasoning_off_params for this provider — without it the "
+            "retry only raises the budget.",
+            getattr(retry, "finish_reason", "?"),
+        )
+        return None
+    logger.info("Empty-response retry recovered %d chars.", len(retry.content))
+    return retry
+
+
 def _chat_with_prompt(
     llm: LLMClient,
     system: str,
@@ -761,6 +1298,7 @@ def _chat_with_prompt(
     max_tokens: int | None = None,
     retries: int = 0,
     strip_thinking: bool = True,
+    reasoning: bool | None = None,
 ) -> Any:
     """Send a chat request with optional retry on timeout/transient errors.
 
@@ -773,6 +1311,9 @@ def _chat_with_prompt(
         If True (default for pipeline usage), strip ``<think>`` tags from
         the LLM response.  This prevents chain-of-thought leakage from
         breaking YAML / JSON / LaTeX parsers downstream.
+    reasoning:
+        ``False`` asks the provider to skip its reasoning pass. Only worth
+        setting for fixed-schema output; see ``LlmConfig.reasoning_off_params``.
     """
     import time
 
@@ -781,13 +1322,25 @@ def _chat_with_prompt(
     _effective_json_mode = json_mode
     for attempt in range(1 + retries):
         try:
-            if _effective_json_mode and max_tokens is not None:
-                return llm.chat(messages, system=system, json_mode=True, max_tokens=max_tokens, strip_thinking=strip_thinking)
-            if _effective_json_mode:
-                return llm.chat(messages, system=system, json_mode=True, strip_thinking=strip_thinking)
-            if max_tokens is not None:
-                return llm.chat(messages, system=system, max_tokens=max_tokens, strip_thinking=strip_thinking)
-            return llm.chat(messages, system=system, strip_thinking=strip_thinking)
+            resp = llm.chat(
+                messages,
+                system=system,
+                json_mode=_effective_json_mode,
+                max_tokens=max_tokens,
+                strip_thinking=strip_thinking,
+                reasoning=reasoning,
+            )
+            _salvaged = _retry_empty_reasoning_response(
+                llm,
+                resp,
+                messages,
+                system=system,
+                json_mode=_effective_json_mode,
+                max_tokens=max_tokens,
+                strip_thinking=strip_thinking,
+                reasoning=reasoning,
+            )
+            return _salvaged if _salvaged is not None else resp
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             # Auto-disable json_mode on HTTP 400 — likely provider incompatibility
@@ -1043,6 +1596,155 @@ def _collect_experiment_results(
     if structured_results is not None:
         collected["structured_results"] = structured_results
     return collected
+
+
+def _read_llm4ad_provenance(run_dir: Path) -> dict[str, Any]:
+    """Stage 14's ``algorithm_provenance.json``, or ``{}`` when there is none.
+
+    Absent for a run whose boost was off — which is also how every caller
+    distinguishes "no LLM4AD in this run" from "LLM4AD ran and changed nothing"
+    (the file exists, ``n_algorithms_replaced`` is 0).
+    """
+    path = run_dir / "stage-14" / "algorithm_provenance.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = _safe_json_loads(path.read_text(encoding="utf-8"), {})
+    except OSError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _llm4ad_adopted_final(run_dir: Path) -> bool:
+    """True when the run's reported metrics come from a delivered package.
+
+    Stage 14 adopts the chosen package's own numbers as the run's results when
+    it can read them; the producer records that in the provenance. Callers use
+    this to avoid re-deriving results from the earlier sandboxes, which would
+    contradict the reported ones.
+    """
+    prov = _read_llm4ad_provenance(run_dir)
+    return bool(prov.get("final_metrics"))
+
+
+def _read_llm4ad_evidence(run_dir: Path) -> str:
+    """Describe which algorithms LLM4AD improved, for the paper's prompts.
+
+    Reads ``algorithm_provenance.json`` (written by Stage 14). Returns "" when
+    the boost was off, when nothing was replaced, or when the file is missing —
+    so a run without LLM4AD gets a prompt byte-for-byte identical to before.
+
+    Only *replacements* are reported. An algorithm the search could not improve
+    is not evidence of anything and must not read as a contribution: the
+    provenance records it with ``source == "refine"`` and it is skipped here.
+    """
+    data = _read_llm4ad_provenance(run_dir)
+    if not data:
+        return ""
+    algos = data.get("algorithms")
+    if not isinstance(algos, dict):
+        return ""
+    adopted = {
+        name: rec for name, rec in algos.items()
+        if isinstance(rec, dict) and rec.get("source") == "llm4ad" and rec.get("replaced")
+    }
+    if not adopted:
+        return ""
+
+    direction = str(data.get("metric_direction", "") or "")
+    lines = [
+        "",
+        "### Algorithm Discovery (LLM4AD)",
+        "",
+        "An automated algorithm-discovery tool searched for better implementations",
+        "of the proposed method(s). Each entry compares the implementation the",
+        "refinement pass left in place against the one the search produced, scored",
+        "by this experiment's own evaluator on the same instances:",
+        "",
+    ]
+    for name, rec in sorted(adopted.items()):
+        refined = rec.get("refined")
+        llm4ad = rec.get("llm4ad")
+        delta = rec.get("delta_pct")
+        if not isinstance(refined, (int, float)) or not isinstance(llm4ad, (int, float)):
+            continue
+        change = f"{delta:+.2f}%" if isinstance(delta, (int, float)) else "n/a"
+        lines.append(f"- **{name}**: {refined:.6g} → {llm4ad:.6g} ({change})")
+        n_cmp = rec.get("n_instances_compared")
+        if isinstance(n_cmp, int):
+            lines.append(f"  - scored on {n_cmp} instance(s)")
+    if len(lines) <= 6:
+        return ""
+    lines += [
+        "",
+        "The adopted implementation is reported for every metric below "
+        f"(the search is {'maximizing' if direction == 'maximize' else 'minimizing'} "
+        "the primary metric). Methods not listed were left as the refinement pass "
+        "produced them. Quote these numbers exactly; do not extrapolate.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _read_llm4ad_algorithm_details(run_dir: Path) -> str:
+    """What the discovered algorithms *are* — name, motivation, edit size.
+
+    LLM4AD writes a ``metadata.json`` beside each winning individual. It holds
+    the only description of the discovered method that exists anywhere in the
+    run, so it is what lets the paper say more than "a number went up".
+    Returns "" when there is nothing to report.
+    """
+    algos_root = run_dir / "stage-13" / "task_packages"
+    if not algos_root.is_dir():
+        return ""
+    data = _read_llm4ad_provenance(run_dir)
+    if not data:
+        return ""
+    # Same filter as _read_llm4ad_evidence: an algorithm the search produced but
+    # that did not beat the refined implementation is not part of the reported
+    # system, so describing it would attribute an unused method to this paper.
+    adopted = {
+        name for name, rec in (data.get("algorithms") or {}).items()
+        if isinstance(rec, dict)
+        and rec.get("source") == "llm4ad"
+        and rec.get("replaced")
+    }
+    if not adopted:
+        return ""
+
+    lines: list[str] = []
+    for algo in sorted(adopted):
+        # The run directory name carries a random token, so locate the winning
+        # individual by glob rather than by reconstructing the path.
+        for meta_path in sorted(
+            algos_root.glob(f"{algo}/runs/*/*/best/metadata.json")
+        ):
+            meta = _safe_json_loads(meta_path.read_text(encoding="utf-8"), {})
+            if not isinstance(meta, dict):
+                continue
+            if meta.get("name"):
+                lines.append(f"- **{algo}** → *{meta['name']}*")
+            if meta.get("description"):
+                lines.append(f"  - what changed: {str(meta['description'])[:500]}")
+            gen = meta.get("generation")
+            added = meta.get("lines_added")
+            removed = meta.get("lines_removed")
+            if isinstance(gen, int):
+                lines.append(
+                    f"  - found at generation {gen}"
+                    + (f", +{added}/-{removed} lines" if isinstance(added, int) else "")
+                )
+            break
+    if not lines:
+        return ""
+    return (
+        "\n### Discovered Algorithm Descriptions\n\n"
+        + "\n".join(lines)
+        + "\n\nDescribe WHAT was discovered (the mechanism that changed), not just "
+          "that a number improved.\n"
+    )
 
 
 def _build_context_preamble(
@@ -1745,6 +2447,7 @@ def _synthesize_perspectives(
     resp = llm.chat(
         [{"role": "user", "content": sp.user}],
         system=sp.system,
+        max_tokens=sp.max_tokens,
     )
     return resp.content
 

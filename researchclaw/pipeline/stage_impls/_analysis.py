@@ -31,6 +31,21 @@ from researchclaw.prompts import PromptManager
 logger = logging.getLogger(__name__)
 
 
+def _llm4ad_boost_enabled(config: RCConfig) -> bool:
+    """True when this run evolves its algorithms with LLM4AD.
+
+    Defaults to False on any attribute trouble: the non-LLM4AD path is the
+    long-standing behaviour, and silently entering the LLM4AD path on a config
+    that never asked for it would change what Stage 14 reports.
+    """
+    try:
+        exp = getattr(config, "experiment", None)
+        boost = getattr(exp, "llm4ad_boost", None) if exp is not None else None
+        return bool(getattr(boost, "enabled", False)) if boost is not None else False
+    except Exception:  # noqa: BLE001 — a config probe must never be fatal
+        return False
+
+
 def _execute_result_analysis(
     stage_dir: Path,
     run_dir: Path,
@@ -54,7 +69,22 @@ def _execute_result_analysis(
     # --- R13-1: Merge Stage 13 (ITERATIVE_REFINE) results if available ---
     # Stage 13 stores richer per-condition metrics in refinement_log.json
     # that _collect_experiment_results() misses (it only scans runs/ dirs).
+    #
+    # Under llm4ad_boost the refinement is not the reported system: it is the
+    # comparison *baseline* Stage 13 snapshots to legacy_refine_baseline/ before
+    # the evolution runs, and the delivered project is experiment_final/ instead
+    # (see the LLM4AD block below). Folding the refinement's numbers in here
+    # would both overwrite the delivered project's own figures and let a
+    # refinement that merely happened to score better become the paper's result.
+    # Skip it in that mode and let the LLM4AD block be the only assignment.
+    _llm4ad_mode = _llm4ad_boost_enabled(config)
     _refine_log_text = _read_prior_artifact(run_dir, "refinement_log.json")
+    if _refine_log_text and _llm4ad_mode:
+        logger.info(
+            "Stage 14: llm4ad_boost is on — the refinement is the comparison "
+            "baseline, not the deliverable; not merging its metrics.",
+        )
+        _refine_log_text = ""
     if _refine_log_text:
         try:
             _refine_data = json.loads(_refine_log_text)
@@ -95,7 +125,8 @@ def _execute_result_analysis(
                 if not _refine_is_better and _refine_metrics:
                     # Compare primary_metric values to decide
                     _mkey = config.experiment.metric_key or "primary_metric"
-                    _mdir = config.experiment.metric_direction or "maximize"
+                    from researchclaw.pipeline._helpers import resolve_metric_direction
+                    _mdir = resolve_metric_direction(config)
                     _existing_pm: float | None = None
                     _refine_pm: float | None = None
                     # BUG-214: Use exact match first, then substring fallback
@@ -229,6 +260,100 @@ def _execute_result_analysis(
         except (json.JSONDecodeError, OSError):
             pass
 
+    # WS-6: LLM4AD attribution. Stage 13 already made this decision: it evolved
+    # each algorithm from the clean stage-10 code, compared it against that
+    # baseline under the experiment's own evaluator, and overlaid only the
+    # winners into experiment_final/. So Stage 14 does not re-decide — it reads
+    # Stage 13's comparison for the per-algorithm attribution and runs the
+    # delivered project's own main.py once for the numbers.
+    #
+    # Re-deriving the decision here is what went wrong before: this block used to
+    # rebuild four packages from legacy_refine_baseline/, whose objectives.py the
+    # refine loop had rewritten. Code evolved against the stage-10 API then could
+    # not be imported into the refined project (make_objective had become
+    # get_objective), every evolved algorithm was recorded as scoring_failed, and
+    # the re-run's bad numbers overwrote the decision Stage 13 had got right.
+    #
+    # The metrics are assigned, never merged, and are taken from
+    # experiment_final/main.py even when it fails — a failure is reported as a
+    # failure. `_collect_experiment_results` picks the best run by primary metric
+    # across every stage's runs/, which with Stage 12 and Stage 14 both present
+    # would select whichever happened to score higher; the delivered project's
+    # numbers are the ones to report regardless of how they compare.
+    _l4b: dict[str, Any] | None = None
+    _l4b_attribution: dict[str, Any] | None = None
+    try:
+        from researchclaw.pipeline.llm4ad_utils.package_scoring import (
+            final_experiment_for_config,
+        )
+
+        _l4b = final_experiment_for_config(run_dir, stage_dir, config)
+    except Exception as _l4b_exc:  # noqa: BLE001 — additive analysis, never fatal
+        logger.warning("Stage 14: llm4ad attribution unavailable: %s", _l4b_exc)
+    if _l4b:
+        _l4b_metrics = _l4b.get("metrics") or {}
+        if _l4b_metrics:
+            exp_data["best_run"] = {
+                "run_id": "llm4ad-experiment-final",
+                "task_id": "experiment_final",
+                "status": "completed",
+                "metrics": _l4b_metrics,
+                "timed_out": False,
+            }
+            exp_data["runs"] = [exp_data["best_run"]]
+            # Same min/max/mean/count reduction _collect_experiment_results
+            # applies, over the delivered project's values only — the earlier
+            # summary also covers Stage 12's stale run and would blend the two.
+            exp_data["metrics_summary"] = {
+                _k: {
+                    "min": round(float(_v), 6),
+                    "max": round(float(_v), 6),
+                    "mean": round(float(_v), 6),
+                    "count": 1,
+                }
+                for _k, _v in _l4b_metrics.items()
+                if isinstance(_v, (int, float))
+            }
+            logger.info(
+                "Stage 14: adopting %d metric(s) from the delivered project (%s)",
+                len(_l4b_metrics), _l4b["package_dir"],
+            )
+        else:
+            # No metrics: the delivered project did not run, and this stage is
+            # not going to paper over that with Stage 12's or the refinement's
+            # numbers — that is how a paper reports a system nobody shipped.
+            logger.warning(
+                "Stage 14: the delivered project produced no metrics (%s); "
+                "leaving the collected numbers in place and recording the "
+                "failure in the attribution.", _l4b["results_status"],
+            )
+        # Held until summary_payload exists — it is built far below, and
+        # assigning here would be a NameError.
+        _l4b_attribution = {
+            # "used" is whether any algorithm shipped in its evolved form, which
+            # is the promoted count from Stage 13's comparison — read directly,
+            # not inferred from a re-scored package that may not have been able
+            # to load the evolved code at all.
+            "used": _l4b["n_promoted"] > 0,
+            "n_algorithms_replaced": _l4b["n_promoted"],
+            "n_algorithms": _l4b["n_algorithms"],
+            "metric_key": _l4b.get("metric_key", ""),
+            "metric_direction": _l4b.get("metric_direction", ""),
+            "decision_rule": _l4b.get("decision_rule", ""),
+            "final_package": "stage-13/experiment_final",
+            "final_results_status": _l4b.get("results_status", ""),
+            # Per-algorithm {baseline, evolved, delta_pct, promoted, failed,
+            # reason} exactly as Stage 13 wrote it — what the paper's method
+            # section and any write-up draw from.
+            "algorithms": _l4b.get("algorithms") or {},
+        }
+        logger.info(
+            "Stage 14: llm4ad attribution recorded — %d/%d algorithm(s) carry an "
+            "evolved implementation; delivered-project run status %s",
+            _l4b["n_promoted"],
+            _l4b["n_algorithms"],
+            _l4b["results_status"],
+        )
     # --- R19-3: Build structured condition_summaries from metrics ---
     _condition_summaries: dict[str, dict[str, Any]] = {}
     _ms = exp_data.get("metrics_summary", {})
@@ -512,6 +637,8 @@ def _execute_result_analysis(
     }
     if _seed_insufficiency_warnings:
         summary_payload["seed_insufficiency_warnings"] = _seed_insufficiency_warnings
+    if _l4b_attribution:
+        summary_payload["llm4ad_attribution"] = _l4b_attribution
     # R13-1: Detect zero-variance across conditions (all conditions identical primary metric)
     if _condition_summaries and len(_condition_summaries) >= 2:
         _primary_vals = []
@@ -738,6 +865,7 @@ Generated: {_utcnow_iso()}
                 run_dir,
                 _charts_dir,
                 metric_key=config.experiment.metric_key,
+                metric_direction=config.experiment.metric_direction,
             )
             if _early_charts:
                 for _cp in _early_charts:

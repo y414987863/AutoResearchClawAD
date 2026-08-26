@@ -140,7 +140,8 @@ class _RecordingLLM:
         self.calls = 0
 
     def chat(self, messages, *, system=None, json_mode=False, max_tokens=None,
-             strip_thinking=False, temperature=None, model=None):
+             strip_thinking=False, temperature=None, model=None,
+             reasoning=None):
         self.calls += 1
 
         class _Resp:

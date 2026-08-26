@@ -17,6 +17,7 @@ from researchclaw.config import RCConfig
 from researchclaw.evolution import EvolutionStore, extract_lessons
 from researchclaw.knowledge.base import write_stage_to_kb
 from researchclaw.pipeline.executor import StageResult, execute_stage
+from researchclaw.pipeline._helpers import correct_metric_direction
 from researchclaw.pipeline.stages import (
     DECISION_ROLLBACK,
     MAX_DECISION_PIVOTS,
@@ -541,6 +542,13 @@ def execute_pipeline(
                     break
             except Exception:
                 pass
+
+        # Once code generation has produced an experiment, adopt the metric
+        # direction it declares. Doing it here — the pipeline's only stage call
+        # site — means every downstream comparison (promote, refine, charts,
+        # paper tables) reads the corrected value from config as usual, instead
+        # of trusting a template default that may contradict the metric.
+        config = correct_metric_direction(run_dir, config)
 
         # BUG-218: Ensure the best stage-14 experiment data is promoted
         # BEFORE paper writing begins.  Without this, the recursive REFINE
@@ -1398,8 +1406,13 @@ def _promote_best_stage14(run_dir: Path, config: RCConfig) -> None:
     """
     import shutil
 
+    from researchclaw.pipeline._helpers import resolve_metric_direction
     metric_key = config.experiment.metric_key or "primary_metric"
-    metric_dir = config.experiment.metric_direction or "maximize"
+    # Single source of truth: config override, else the generated code's
+    # METRIC_DEF declaration, else minimize. Never default "maximize" here —
+    # with an empty config that inverted the comparison and promoted a worse
+    # higher value as "best" (test_legitimate_minimize_not_skipped).
+    metric_dir = resolve_metric_direction(config)
 
     candidates: list[tuple[float, Path]] = []
     for d in sorted(run_dir.glob("stage-14*")):

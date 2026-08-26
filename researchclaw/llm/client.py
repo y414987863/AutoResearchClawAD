@@ -50,6 +50,19 @@ def _safe_int(value: object, default: int) -> int:
         return default
 
 
+def _model_matches(model: str, prefixes: frozenset[str]) -> bool:
+    """True when *model* names one of *prefixes*, ignoring vendor and case.
+
+    Routers expose the same model under several spellings — ``glm-5.2``,
+    ``GLM-5.2``, ``zai-org/GLM-5.2`` all reach one endpoint. A bare
+    ``startswith`` matched only the first, so the same model silently got two
+    different request shapes (``max_tokens`` vs ``max_completion_tokens``)
+    depending on which alias the config happened to use.
+    """
+    name = (model or "").rsplit("/", 1)[-1].lower()
+    return any(name.startswith(prefix) for prefix in prefixes)
+
+
 # Models that require max_completion_tokens instead of max_tokens
 _NEW_PARAM_MODELS = frozenset(
     {
@@ -121,6 +134,11 @@ class LLMConfig:
     log_traces: bool = False
     trace_path: str = ""
     trace_max_chars: int = 200_000
+    # Provider-specific request-body fields merged into every request.
+    extra_body_params: dict[str, Any] = field(default_factory=dict)
+    # Merged only when a caller passes ``reasoning=False`` — see
+    # ``LlmConfig.reasoning_off_params``.
+    reasoning_off_params: dict[str, Any] = field(default_factory=dict)
 
 
 class LLMClient:
@@ -150,7 +168,7 @@ class LLMClient:
 
     @staticmethod
     def _supports_temperature(model: str) -> bool:
-        return not any(model.startswith(prefix) for prefix in _NO_TEMPERATURE_MODELS)
+        return not _model_matches(model, _NO_TEMPERATURE_MODELS)
 
     @classmethod
     def from_rc_config(cls, rc_config: Any, *, run_dir: Path | None = None) -> LLMClient:
@@ -207,6 +225,12 @@ class LLMClient:
             log_traces=_log_traces,
             trace_path=_trace_path,
             trace_max_chars=getattr(rc_config.llm, "trace_max_chars", 200_000),
+            extra_body_params=dict(
+                getattr(rc_config.llm, "extra_body_params", None) or {}
+            ),
+            reasoning_off_params=dict(
+                getattr(rc_config.llm, "reasoning_off_params", None) or {}
+            ),
         )
         client = cls(config)
 
@@ -272,6 +296,10 @@ class LLMClient:
             log_traces=getattr(llm, "log_traces", False),
             trace_path=getattr(llm, "trace_path", "") or "",
             trace_max_chars=getattr(llm, "trace_max_chars", 200_000),
+            extra_body_params=dict(getattr(llm, "extra_body_params", None) or {}),
+            reasoning_off_params=dict(
+                getattr(llm, "reasoning_off_params", None) or {}
+            ),
         )
         client = cls(config)
 
@@ -323,6 +351,7 @@ class LLMClient:
         json_mode: bool = False,
         system: str | None = None,
         strip_thinking: bool = True,
+        reasoning: bool | None = None,
     ) -> LLMResponse:
         """Send a chat completion request with retry and fallback.
 
@@ -333,6 +362,11 @@ class LLMClient:
             temperature: Override temperature.
             json_mode: Request JSON response format.
             system: Prepend a system message.
+            reasoning: ``False`` asks the provider to skip its reasoning pass
+                by merging ``config.reasoning_off_params`` into the request.
+                ``None`` (default) leaves the provider's own default alone.
+                Worth setting only for fixed-schema output — see
+                ``LlmConfig.reasoning_off_params``.
             strip_thinking: Strip <think>…</think> and other reasoning
                 artifacts from the response content. Defaults to True:
                 reasoning traces are never wanted in a paper draft, in
@@ -358,7 +392,9 @@ class LLMClient:
 
         for m in models:
             try:
-                resp = self._call_with_retry(m, messages, max_tok, temp, json_mode)
+                resp = self._call_with_retry(
+                    m, messages, max_tok, temp, json_mode, reasoning
+                )
                 if strip_thinking:
                     from researchclaw.utils.thinking_tags import strip_thinking_tags
 
@@ -400,9 +436,7 @@ class LLMClient:
         Distinguishes: 401 (bad key), 403 (model forbidden),
                        404 (bad endpoint), 429 (rate limited), timeout.
         """
-        is_reasoning = any(
-            self.config.primary_model.startswith(p) for p in _NEW_PARAM_MODELS
-        )
+        is_reasoning = _model_matches(self.config.primary_model, _NEW_PARAM_MODELS)
         min_tokens = 64 if is_reasoning else 1
         try:
             _ = self.chat(
@@ -443,6 +477,7 @@ class LLMClient:
         max_tokens: int,
         temperature: float,
         json_mode: bool,
+        reasoning: bool | None = None,
     ) -> LLMResponse:
         """Call with exponential backoff retry."""
         last_exc: Exception | None = None
@@ -450,7 +485,7 @@ class LLMClient:
             is_last_attempt = attempt >= self.config.max_retries - 1
             try:
                 return self._raw_call(
-                    model, messages, max_tokens, temperature, json_mode
+                    model, messages, max_tokens, temperature, json_mode, reasoning
                 )
             except urllib.error.HTTPError as e:
                 status = e.code
@@ -553,6 +588,7 @@ class LLMClient:
         max_tokens: int,
         temperature: float,
         json_mode: bool,
+        reasoning: bool | None = None,
     ) -> LLMResponse:
         """Make a single API call."""
 
@@ -584,11 +620,20 @@ class LLMClient:
                     body["temperature"] = _temp
 
                 # Use correct token parameter based on model
-                if any(model.startswith(prefix) for prefix in _NEW_PARAM_MODELS):
+                if _model_matches(model, _NEW_PARAM_MODELS):
                     reasoning_min = 32768
                     body["max_completion_tokens"] = max(max_tokens, reasoning_min)
                 else:
                     body["max_tokens"] = max_tokens
+
+            # Provider-specific passthrough, applied after the token and
+            # temperature block so it can override those. ``reasoning_off_params``
+            # only for callers that asked to skip reasoning for this call.
+            # Note: the Anthropic-adapter branch above returns before reaching
+            # here, so neither dict applies under ``provider: anthropic``.
+            body.update(self.config.extra_body_params)
+            if reasoning is False:
+                body.update(self.config.reasoning_off_params)
 
             if json_mode:
                 # Many OpenAI-compatible providers don't support the
@@ -848,5 +893,7 @@ def create_client_from_yaml(yaml_path: str | None = None) -> LLMClient:
             log_traces=bool(llm_section.get("log_traces", False)),
             trace_path=str(llm_section.get("trace_path", "") or ""),
             trace_max_chars=_safe_int(llm_section.get("trace_max_chars", 200_000)),
+            extra_body_params=dict(llm_section.get("extra_body_params") or {}),
+            reasoning_off_params=dict(llm_section.get("reasoning_off_params") or {}),
         )
     )

@@ -526,6 +526,7 @@ class TestMiniMaxChatFallback:
             max_tokens: int,
             temperature: float,
             json_mode: bool,
+            reasoning: bool | None = None,
         ) -> LLMResponse:
             calls.append(model)
             if model == "MiniMax-M3":

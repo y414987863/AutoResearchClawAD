@@ -38,6 +38,7 @@ class _LLMClientLike(Protocol):  # pragma: no cover
         max_tokens: int | None = None,
         temperature: float | None = None,
         json_mode: bool = False,
+        reasoning: bool | None = None,
     ) -> Any: ...
 
 

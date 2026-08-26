@@ -109,13 +109,17 @@ class ACPClient:
         json_mode: bool = False,
         system: str | None = None,
         strip_thinking: bool = True,
+        reasoning: bool | None = None,
     ) -> LLMResponse:
         """Send a prompt and return the agent's response.
 
         Parameters mirror ``LLMClient.chat()`` for drop-in compatibility.
-        ``model``, ``max_tokens``, ``temperature``, and ``json_mode`` are
-        accepted but not forwarded — the agent manages its own model and
-        parameters.
+        ``model``, ``max_tokens``, ``temperature``, ``json_mode`` and
+        ``reasoning`` are accepted but not forwarded — the agent manages its
+        own model and parameters. ``reasoning`` in particular is a wire-level
+        request-body knob with no ACP equivalent; accepting and dropping it
+        keeps every ``_chat_with_prompt`` caller working under
+        ``provider: acp``, which is the whole point of the drop-in contract.
 
         ``strip_thinking`` defaults to True: ACP agents (opencode, Claude
         Code) interleave ``[thinking]`` blocks and acpx metadata with the

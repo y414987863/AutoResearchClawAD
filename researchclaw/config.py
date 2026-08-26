@@ -232,6 +232,18 @@ class LlmConfig:
     log_traces: bool = False
     trace_path: str = ""
     trace_max_chars: int = 200_000
+    # Provider-specific request-body fields merged into *every* chat call, e.g.
+    # ``{"reasoning_effort": "none"}``. OpenAI-compatible providers each spell
+    # their knobs differently and new ones appear faster than we can model
+    # them, so this stays an untyped passthrough.
+    extra_body_params: dict[str, Any] = field(default_factory=dict)
+    # Same shape, but merged only for stages whose prompt declares
+    # ``reasoning: False``. Those stages emit a fixed schema (YAML/JSON) where
+    # a long reasoning pass buys nothing and can consume the whole token
+    # budget before a single output token is emitted — the observed failure was
+    # an empty response with ``finish_reason=length``. Left empty by default:
+    # the right spelling is provider-specific, so opting in is explicit.
+    reasoning_off_params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -495,6 +507,70 @@ class OpenCodeConfig:
     timeout_sec: int = 600  # Max seconds for opencode run
     max_retries: int = 1
     workspace_cleanup: bool = True
+    debug: bool = False  # Enable verbose logging (--print-logs --log-level DEBUG)
+    # When True, an OpenCode (Beast Mode) run that FAILS fails the whole stage
+    # instead of silently degrading to the CodeAgent/Legacy fallback. Use this
+    # when OpenCode is the intended sole code generator and a half-finished
+    # fallback artifact is worse than a hard error.
+    require_success: bool = False
+
+
+@dataclass(frozen=True)
+class Llm4adEvolutionConfig:
+    """LLM4AD evolution hyperparameters (drives the llm4ad run config)."""
+
+    method: str = "island_ga"
+    max_generations: int = 2
+    elite_ratio: float = 0.2
+    mutation_rate: float = 0.6
+    crossover_rate: float = 0.3
+    island: dict[str, Any] = field(default_factory=dict)
+    # Which algorithms to evolve. Empty (default) evolves everything in
+    # algorithms/. A dict selects a subset: {"categories": ["proposed"]},
+    # {"names": ["cma_es_default"]}, or both (union). Categories resolve against
+    # the per-run algorithms_classification.json stage-10 writes; names match
+    # algorithm directory names directly. Kept free-form so the same field needs
+    # no schema change when a topic labels methods differently.
+    evolve_scope: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Llm4adResourcesConfig:
+    """Resource budget for running LLM4AD evolution on task packages."""
+
+    time_budget_sec: int = 1800
+    eval_timeout_sec: int = 120
+    parallel_workers: int = 4
+    # Per-package wall-clock budget for ONE ``llm4ad run``. When > 0 it is used
+    # directly as the subprocess timeout, so a long evolution is not cut short by
+    # dividing time_budget_sec across N packages (which left every package
+    # killed mid-generation). When 0, falls back to time_budget_sec // n_pkgs.
+    per_package_timeout_sec: int = 0
+
+
+@dataclass(frozen=True)
+class Llm4adBoostConfig:
+    """LLM4AD task-package boost for stage-10 generated experiment code.
+
+    When enabled, stage-10 additionally structures the generated code as
+    LLM4AD task packages (per-algorithm directory + EVOLVE markers + static
+    instance data), so downstream builds one evolvable package per algorithm.
+    """
+
+    enabled: bool = False
+    fail_silently: bool = True  # on failure, warn and keep Stage 13 best
+    evolution: Llm4adEvolutionConfig = field(default_factory=Llm4adEvolutionConfig)
+    resources: Llm4adResourcesConfig = field(default_factory=Llm4adResourcesConfig)
+    #: Run llm4ad's evolution inside each task package (``<package>/runs``)
+    #: instead of a temp directory, so the worktrees, checkpoints, ``best/`` and
+    #: the live ``logs/llm4ad.log`` are all inspectable in the artifact tree
+    #: while the run is still going.
+    #:
+    #: Off by default because llm4ad cuts a git worktree per candidate and the
+    #: nested path can pass Windows' 260-character limit, where every worktree
+    #: then dies with ``fatal: '$GIT_DIR' too big``. Linux and macOS have no
+    #: such limit, so production deployments there can enable it safely.
+    run_evolution_in_package: bool = False
 
 
 @dataclass(frozen=True)
@@ -591,8 +667,13 @@ class ExperimentConfig:
     max_iterations: int = 10
     max_refine_duration_sec: int = 0  # 0 = auto (3× time_budget_sec)
     metric_key: str = "primary_metric"
-    metric_direction: str = "minimize"
+    # Empty = let the pipeline resolve the direction from the generated code's
+    # METRIC_DEF declaration (see _helpers.correct_metric_direction, applied to
+    # config before every stage). A non-empty value is an explicit override and
+    # takes precedence over the code's declaration.
+    metric_direction: str = ""
     keep_threshold: float = 0.0
+    skip_alignment_check: bool = False  # Skip Stage 10 topic-experiment alignment validation
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     docker: DockerSandboxConfig = field(default_factory=DockerSandboxConfig)
     agentic: AgenticConfig = field(default_factory=AgenticConfig)
@@ -603,6 +684,7 @@ class ExperimentConfig:
     colab_drive: ColabDriveConfig = field(default_factory=ColabDriveConfig)
     code_agent: CodeAgentConfig = field(default_factory=CodeAgentConfig)
     opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
+    llm4ad_boost: Llm4adBoostConfig = field(default_factory=Llm4adBoostConfig)
     benchmark_agent: BenchmarkAgentConfig = field(default_factory=BenchmarkAgentConfig)
     figure_agent: FigureAgentConfig = field(default_factory=FigureAgentConfig)
     repair: ExperimentRepairConfig = field(default_factory=ExperimentRepairConfig)
@@ -1215,6 +1297,8 @@ def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
         log_traces=bool(data.get("log_traces", False)),
         trace_path=str(data.get("trace_path", "") or ""),
         trace_max_chars=_safe_int(data.get("trace_max_chars"), 200_000),
+        extra_body_params=dict(data.get("extra_body_params") or {}),
+        reasoning_off_params=dict(data.get("reasoning_off_params") or {}),
     )
 
 
@@ -1354,7 +1438,7 @@ def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
         max_iterations=_safe_int(data.get("max_iterations"), 10),
         max_refine_duration_sec=_safe_int(data.get("max_refine_duration_sec"), 0),
         metric_key=data.get("metric_key", "primary_metric"),
-        metric_direction=data.get("metric_direction", "minimize"),
+        metric_direction=data.get("metric_direction", ""),
         keep_threshold=_safe_float(data.get("keep_threshold"), 0.0),
         sandbox=SandboxConfig(
             python_path=sandbox_data.get("python_path", DEFAULT_PYTHON_PATH),
@@ -1414,6 +1498,7 @@ def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
         stat_agent=_parse_stat_agent_config(data.get("stat_agent") or {}),
         code_agent=_parse_code_agent_config(data.get("code_agent") or {}),
         opencode=_parse_opencode_config(data.get("opencode") or {}),
+        llm4ad_boost=_parse_llm4ad_boost_config(data.get("llm4ad_boost") or {}),
         benchmark_agent=_parse_benchmark_agent_config(
             data.get("benchmark_agent") or {}
         ),
@@ -1522,6 +1607,125 @@ def _parse_opencode_config(data: dict[str, Any]) -> OpenCodeConfig:
         timeout_sec=_safe_int(data.get("timeout_sec"), 600),
         max_retries=_safe_int(data.get("max_retries"), 1),
         workspace_cleanup=bool(data.get("workspace_cleanup", True)),
+        require_success=bool(data.get("require_success", False)),
+    )
+
+
+def _parse_evolve_scope(data: Any) -> dict[str, Any]:
+    """Validate ``llm4ad_boost.evolution.evolve_scope``.
+
+    The scope decides whether evolution touches the baselines, so a value that is
+    silently dropped is the dangerous outcome: evolution then runs over *every*
+    algorithm, the evolved baseline replaces the fixed one in the comparison, and
+    the paper's main result is quietly invalid. A key that is misspelled
+    (``nams``) or a ``names`` list given as a bare string would have loaded as
+    "no scope" without a word. Both are rejected here instead — at config load,
+    where the config author can still see the message.
+
+    ``categories`` values are canonicalised to the three roles the classifier
+    emits; ``names`` values must be strings (algorithm directory names contain no
+    dynamic component, but the run that generates them does, so they are checked
+    for type and shape, never against a known list).
+    """
+    if data is None or data == {}:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"experiment.llm4ad_boost.evolution.evolve_scope must be a mapping "
+            f"with 'categories' and/or 'names', got {type(data).__name__}"
+        )
+    unknown = sorted(set(data) - {"categories", "names"})
+    if unknown:
+        raise ValueError(
+            "experiment.llm4ad_boost.evolution.evolve_scope has unknown key(s) "
+            f"{unknown}; supported keys are 'categories' (roles: proposed, "
+            "baseline, ablation) and 'names' (algorithm directory names)"
+        )
+    from researchclaw.pipeline.llm4ad_utils.classification import normalize_category
+
+    scope: dict[str, Any] = {}
+    for key in ("categories", "names"):
+        if key not in data:
+            continue
+        raw = data[key]
+        if isinstance(raw, str):
+            raise ValueError(
+                f"experiment.llm4ad_boost.evolution.evolve_scope.{key} must be a "
+                f"list, got the bare string {raw!r} — write it as [{raw!r}]"
+            )
+        if not isinstance(raw, (list, tuple)):
+            raise ValueError(
+                f"experiment.llm4ad_boost.evolution.evolve_scope.{key} must be a "
+                f"list, got {type(raw).__name__}"
+            )
+        if key == "categories":
+            values: list[str] = []
+            for item in raw:
+                cat = normalize_category(item)
+                if cat is None:
+                    raise ValueError(
+                        f"evolve_scope.categories entry {item!r} is not a known "
+                        "role; use 'proposed', 'baseline' or 'ablation'"
+                    )
+                if cat not in values:
+                    values.append(cat)
+            if not values:
+                raise ValueError(
+                    "evolve_scope.categories is empty — omit evolve_scope "
+                    "entirely to evolve every algorithm"
+                )
+            scope["categories"] = values
+        else:
+            values = [str(item).strip() for item in raw if str(item).strip()]
+            if not values:
+                raise ValueError(
+                    "evolve_scope.names is empty — omit evolve_scope entirely to "
+                    "evolve every algorithm"
+                )
+            scope["names"] = values
+    if not scope:
+        raise ValueError(
+            "evolve_scope must set 'categories' and/or 'names'; to evolve every "
+            "algorithm omit evolve_scope entirely"
+        )
+    return scope
+
+
+def _parse_llm4ad_evolution_config(data: dict[str, Any]) -> Llm4adEvolutionConfig:
+    if not data:
+        return Llm4adEvolutionConfig()
+    island = data.get("island") or {}
+    return Llm4adEvolutionConfig(
+        method=str(data.get("method", "island_ga")),
+        max_generations=_safe_int(data.get("max_generations"), 2),
+        elite_ratio=_safe_float(data.get("elite_ratio"), 0.2),
+        mutation_rate=_safe_float(data.get("mutation_rate"), 0.6),
+        crossover_rate=_safe_float(data.get("crossover_rate"), 0.3),
+        island=dict(island) if isinstance(island, dict) else {},
+        evolve_scope=_parse_evolve_scope(data.get("evolve_scope")),
+    )
+
+
+def _parse_llm4ad_resources_config(data: dict[str, Any]) -> Llm4adResourcesConfig:
+    if not data:
+        return Llm4adResourcesConfig()
+    return Llm4adResourcesConfig(
+        time_budget_sec=_safe_int(data.get("time_budget_sec"), 1800),
+        eval_timeout_sec=_safe_int(data.get("eval_timeout_sec"), 120),
+        parallel_workers=_safe_int(data.get("parallel_workers"), 4),
+        per_package_timeout_sec=_safe_int(data.get("per_package_timeout_sec"), 0),
+    )
+
+
+def _parse_llm4ad_boost_config(data: dict[str, Any]) -> Llm4adBoostConfig:
+    if not data:
+        return Llm4adBoostConfig()
+    return Llm4adBoostConfig(
+        enabled=bool(data.get("enabled", False)),
+        fail_silently=bool(data.get("fail_silently", True)),
+        evolution=_parse_llm4ad_evolution_config(data.get("evolution") or {}),
+        resources=_parse_llm4ad_resources_config(data.get("resources") or {}),
+        run_evolution_in_package=bool(data.get("run_evolution_in_package", False)),
     )
 
 

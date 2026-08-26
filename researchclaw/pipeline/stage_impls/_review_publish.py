@@ -121,6 +121,20 @@ def _collect_experiment_evidence(run_dir: Path) -> str:
             f"If the paper claims a different number of trials, this is a CRITICAL discrepancy."
         )
 
+    # 5. LLM4AD algorithm-discovery evidence. A reviewer must be able to audit
+    #    the claim that an algorithm was *discovered* rather than tuned, and the
+    #    comparison carries the numbers and the instance count behind it. Both
+    #    helpers return "" when no algorithm was adopted, so a run without the
+    #    boost produces the same evidence string as before this change.
+    from researchclaw.pipeline._helpers import (
+        _read_llm4ad_algorithm_details,
+        _read_llm4ad_evidence,
+    )
+
+    _l4b_block = _read_llm4ad_evidence(run_dir) + _read_llm4ad_algorithm_details(run_dir)
+    if _l4b_block:
+        evidence_parts.append(_l4b_block)
+
     if not evidence_parts:
         return ""
 
@@ -218,6 +232,7 @@ def _execute_peer_review(
             _review_user,
             json_mode=sp.json_mode,
             max_tokens=sp.max_tokens,
+            reasoning=sp.reasoning,
         )
         reviews = resp.content
     else:
@@ -544,6 +559,7 @@ def _execute_quality_gate(
             sp.user,
             json_mode=sp.json_mode,
             max_tokens=sp.max_tokens,
+            reasoning=sp.reasoning,
         )
         parsed = _safe_json_loads(resp.content, {})
         if isinstance(parsed, dict):
@@ -739,6 +755,7 @@ def _execute_knowledge_archive(
             sp.user,
             json_mode=sp.json_mode,
             max_tokens=sp.max_tokens,
+            reasoning=sp.reasoning,
         )
         archive = resp.content
     else:
@@ -1530,6 +1547,7 @@ def _execute_export_publish(
             _export_user,
             json_mode=sp.json_mode,
             max_tokens=sp.max_tokens,
+            reasoning=sp.reasoning,
         )
         final_paper = resp.content
         # Content guard: reject LLM output that truncates the paper
@@ -2109,6 +2127,21 @@ def _execute_export_publish(
             "Stage 22: Exported references.bib with %d entries",
             len(valid_keys) if valid_keys else 0,
         )
+    else:
+        # No bibliography reached this stage, so the paper cites nothing this
+        # pipeline can resolve. Say so loudly and still write the (empty) file:
+        # downstream consumers read ``stage-22/references.bib`` directly, and
+        # its absence is indistinguishable from a bug — the deliverable step
+        # then copies a placeholder still, and Stage 23 reports "nothing to
+        # verify", which reads as success rather than as a missing input.
+        # A run that skipped the literature stages lands here.
+        logger.warning(
+            "Stage 22: no references.bib reached this stage — the paper will "
+            "carry no resolvable citations. This happens when the literature "
+            "stages were skipped (e.g. a run started at code generation).",
+        )
+        (stage_dir / "references.bib").write_text("", encoding="utf-8")
+        artifacts.append("references.bib")
 
     # Conference template: generate .tex file
     try:
@@ -2468,10 +2501,30 @@ def _execute_export_publish(
         code_dir.mkdir(parents=True, exist_ok=True)
         all_code_combined = ""
         code_file_names: list[str] = []
-        for src in sorted(Path(exp_final_dir_path).glob("*.py")):
-            (code_dir / src.name).write_bytes(src.read_bytes())
-            all_code_combined += src.read_text(encoding="utf-8") + "\n"
-            code_file_names.append(src.name)
+        # Recurse so llm4ad-mode nested modules (algorithms/<algo>/<algo>.py)
+        # are packaged too — a flat glob dropped them, leaving a code package
+        # whose main.py imported a missing algorithm. Keep each file's path
+        # relative to the experiment root so same-named files in different
+        # subdirs don't collide.
+        #
+        # Data files ship as well: the README tells the reader to run
+        # `python main.py`, and instance files under data/ are generated once
+        # and then read-only, so a .py-only package cannot run at all.
+        exp_root = Path(exp_final_dir_path)
+        for src in sorted(exp_root.rglob("*")):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(exp_root)
+            if any(p == "__pycache__" or p.startswith(".") for p in rel.parts):
+                continue
+            dst = code_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(src.read_bytes())
+            # Only Python feeds the dependency scan below — it parses the files
+            # as one concatenated module, so JSON/Markdown would break it.
+            if src.suffix == ".py":
+                all_code_combined += src.read_text(encoding="utf-8") + "\n"
+            code_file_names.append(rel.as_posix())
 
         # Detect dependencies from all files
         detected: set[str] = set()
@@ -2740,6 +2793,14 @@ def _execute_citation_verify(
     paper_text = _read_prior_artifact(run_dir, "paper_final.md") or ""
 
     if not bib_text.strip():
+        # Nothing to verify is a *missing input*, not a clean bill of health: an
+        # integrity score of 1.0 over zero references is vacuously true, and
+        # reading it as success is how a citation-free paper ships unnoticed.
+        logger.warning(
+            "Stage 23: no bibliography to verify — the paper's citations were "
+            "never resolved. integrity_score is reported as null rather than "
+            "1.0 so this is not mistaken for a passed check.",
+        )
         report_data = {
             "summary": {
                 "total": 0,
@@ -2747,7 +2808,8 @@ def _execute_citation_verify(
                 "suspicious": 0,
                 "hallucinated": 0,
                 "skipped": 0,
-                "integrity_score": 1.0,
+                # null, not 1.0 — zero references cannot have an integrity score
+                "integrity_score": None,
             },
             "results": [],
             "note": "No references.bib found — nothing to verify.",

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
 import re
+import tempfile
 import time as _time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +43,44 @@ from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
 
+# Wall-clock ceiling for a single LLM4AD scoring subprocess (one algorithm
+# scored across all instances). 600s was too tight for O(N^3) non-parametric
+# candidates (a slow one was classed "failed" rather than "slow"); 1800s
+# covers a full sweep.
+_SCORING_TIMEOUT_SEC = 1800
+
+# Per-file ceiling when a project file is rendered into a refinement prompt.
+# Reduced from 60KB to 20KB to prevent prompt bloat with many algorithm files.
+# With 10+ algorithms, the old limit created 600KB+ prompts that timed out.
+_CONTEXT_FILE_MAX_CHARS = 20_000
+
+
+def _smart_truncate(code: str, max_chars: int) -> str:
+    """Smart truncation: preserve head (imports, classes) + tail (main, helpers).
+
+    Simple [:max_chars] truncation loses the end of the file, which often
+    contains the main() function and critical helper code. Instead, keep
+    the first 65% (imports, class definitions) and last 35% (main logic),
+    discarding the middle. This ensures both structure and entry points
+    remain visible to the LLM during repair/refinement.
+    """
+    if len(code) <= max_chars:
+        return code
+
+    head_size = int(max_chars * 0.65)  # 13KB for imports & class defs
+    tail_size = max_chars - head_size   # 7KB for main & helpers
+
+    head = code[:head_size]
+    tail = code[-tail_size:]
+    middle_size = len(code) - head_size - tail_size
+    middle_lines = code[head_size:-tail_size].count('\n')
+
+    return (
+        head
+        + f"\n\n# ... [truncated {middle_size} chars (~{middle_lines} lines)] ...\n\n"
+        + tail
+    )
+
 
 def _execute_resource_planning(
     stage_dir: Path,
@@ -63,6 +104,7 @@ def _execute_resource_planning(
             sp.user,
             json_mode=sp.json_mode,
             max_tokens=sp.max_tokens,
+            reasoning=sp.reasoning,
         )
         parsed = _safe_json_loads(resp.content, {})
         if (
@@ -573,6 +615,931 @@ def _execute_experiment_run(
     )
 
 
+def _generate_llm4ad_task_packages(
+    stage_dir: Path,
+    run_dir: Path,
+    config: Any,
+    exp_dir_text: str | None,
+    log: dict,
+) -> tuple[str, ...]:
+    """Generate LLM4AD task packages from the stage-10/12 experiment directory.
+
+    Deterministic template generation (no LLM, no evolution). Returns extra
+    artifact names to append to the StageResult; log is mutated in place.
+    Non-fatal: any failure logs a warning and returns nothing.
+    """
+    _l4b = getattr(getattr(config, "experiment", None), "llm4ad_boost", None)
+    if _l4b is None or not getattr(_l4b, "enabled", False):
+        return ()
+
+    try:
+        from researchclaw.pipeline.llm4ad_task_packages import (
+            generate_task_packages,
+        )
+    except Exception as _l4b_imp:  # pragma: no cover - defensive
+        logger.warning(
+            "Stage 13: llm4ad task-package generator unavailable: %s",
+            _l4b_imp,
+        )
+        return ()
+
+    # Inject the live LLM connection settings into each package's config.yaml.
+    _llm = getattr(config, "llm", None)
+    _llm_config: dict = {}
+    if _llm is not None:
+        try:
+            _llm_config = {
+                "base_url": getattr(_llm, "base_url", "") or "",
+                "api_key": getattr(_llm, "api_key", "") or "",
+                "model": getattr(_llm, "primary_model", "") or "",
+                "provider": getattr(_llm, "provider", "") or "",
+                "timeout": getattr(_llm, "timeout_sec", None),
+            }
+            # api_key may live in an env var and be empty on the config object.
+            if not _llm_config.get("api_key"):
+                _env = getattr(_llm, "api_key_env", "") or ""
+                if _env:
+                    import os as _os
+                    _llm_config["api_key"] = _os.environ.get(_env, "") or ""
+        except Exception as _l4b_cfg:
+            logger.warning(
+                "Stage 13: could not read LLM config for task package: %s",
+                _l4b_cfg,
+            )
+            _llm_config = {}
+
+    # Evolution must start from the CLEAN stage-10 experiment/, never the
+    # refined experiment_final/ that ``exp_dir_text`` points at on PIVOT
+    # rollback (BUG-58) — that copy may carry LLM-modified data/metrics.
+    # Fall back to exp_dir_text only when no clean directory exists.
+    _tp_exp = _read_prior_artifact(run_dir, "experiment/") or exp_dir_text
+    if not _tp_exp or not Path(_tp_exp).is_dir():
+        logger.warning(
+            "Stage 13: no experiment directory found for LLM4AD task "
+            "package generation (%s); skipping", _tp_exp,
+        )
+        return ()
+
+    _l4b_runs_dir: Path | None = None
+    try:
+        _tp_out = stage_dir / "task_packages"
+        _evo_cfg = _l4b_dataclass_to_dict(getattr(_l4b, "evolution", None))
+        _res_cfg = _l4b_dataclass_to_dict(getattr(_l4b, "resources", None))
+        # Live topic from config.arc.yaml becomes the LLM4AD `background` the
+        # sampler feeds to the LLM; the explicit metric_direction overrides the
+        # name-based inference so evolution optimises the right way.
+        _topic = getattr(getattr(config, "research", None), "topic", "") or ""
+        # Single source of truth for metric direction: config override, else the
+        # generated code's METRIC_DEF declaration (correct_metric_direction has
+        # already populated config by stage 13, so this normally returns the
+        # config value; resolve_metric_direction only kicks in when it is empty).
+        from researchclaw.pipeline._helpers import resolve_metric_direction
+        _direction = resolve_metric_direction(config, Path(_tp_exp))
+
+        # Fitness sanity gate (pre-evolution). Score the clean baselines through
+        # the very same subprocess promotion uses, BEFORE any LLM budget is
+        # spent, and refuse to start evolution when the primary metric is
+        # degenerate: constant across algorithms (ml23), wall-clock/gameable
+        # (ml03), or non-finite everywhere (TSP instance-contract break). Each
+        # of those previously looked like "evolution ran and improved nothing"
+        # — a modelling failure — when the real defect was the metric itself.
+        # The gate is applied to exactly the algorithms evolution will touch
+        # (post-scope, matching generate_task_packages), so a category-scoped
+        # run checks only its proposed set.
+        #
+        # Soft-fail: a violation logs the precise reason and skips evolution
+        # rather than raising. The point of the gate is to avoid burning LLM
+        # budget on a metric evolution cannot move — that is achieved by not
+        # running evolution, not by failing the whole stage (which the outer
+        # handler would otherwise swallow anyway).
+        try:
+            from researchclaw.pipeline.llm4ad_task_packages import (
+                _discover_algorithms,
+                _filter_algorithms_by_scope,
+            )
+            from researchclaw.pipeline.llm4ad_utils.fitness_gate import (
+                fitness_sanity_gate,
+            )
+
+            _scoped = _filter_algorithms_by_scope(
+                _discover_algorithms(Path(_tp_exp)),
+                Path(_tp_exp),
+                _evo_cfg.get("evolve_scope") if _evo_cfg else None,
+            )
+            if _scoped:
+                _gate_violations = fitness_sanity_gate(
+                    Path(_tp_exp),
+                    _scoped,
+                )
+                if _gate_violations:
+                    logger.warning(
+                        "Stage 13: LLM4AD fitness sanity gate rejected evolution: %s. "
+                        "Skipping LLM4AD evolution for this experiment rather than "
+                        "burning LLM budget on a metric that cannot be moved. To override, "
+                        "fix the primary metric (or its evaluator) so it differs across "
+                        "algorithms and is finite/deterministic.",
+                        " | ".join(_gate_violations),
+                    )
+                    log["task_packages_error"] = (
+                        f"fitness gate: {_gate_violations[0]}"
+                    )
+                    return ()
+                logger.info(
+                    "Stage 13: fitness sanity gate passed for %d "
+                    "algorithm(s) under %s", len(_scoped), _tp_exp,
+                )
+        except Exception as _l4b_gate:
+            # The gate is advisory, not a gatekeeper: if scoring itself breaks
+            # (import error, malformed evaluator, subprocess crash) that must
+            # not silently abort LLM4AD. Log with traceback and continue —
+            # the outer handler still records the failure for the log.
+            logger.warning(
+                "Stage 13: LLM4AD fitness sanity gate could not run: %s",
+                _l4b_gate, exc_info=True,
+            )
+
+        # Fresh per-call token: run_dir.name is stable across repeated runs, so
+        # a module-level token would reuse the same temp workspace on every re-
+        # entry (including a same-process re-entry after a rollback), making
+        # _resolve_run_best read a stale best. Generating it here ties gen +
+        # collect to the same new token per package-generation call.
+        _l4b_token = uuid.uuid4().hex[:8]
+        # Where llm4ad writes its per-candidate worktrees.
+        #
+        # Default: a temp dir. It is kept in a variable so the finally block
+        # below can delete it — llm4ad cuts a git worktree per candidate and
+        # nothing else removes them, so a long-lived machine would otherwise
+        # accumulate one full checkout per individual per generation per run.
+        #
+        # Opt-in: keep everything inside the package (`<package>/runs`) so the
+        # worktrees, checkpoints, `best/` and the live `logs/llm4ad.log` are
+        # inspectable in the artifact tree while the run is in progress. The
+        # reason this is not the default is the Windows 260-character path
+        # limit — a nested worktree path can trip it, and llm4ad then fails
+        # every candidate with `fatal: '$GIT_DIR' too big`. Linux/macOS have no
+        # equivalent limit, so production on those platforms can enable it.
+        _in_package_runs = bool(
+            getattr(_l4b, "run_evolution_in_package", False)
+        )
+        _l4b_runs_dir: Path | None = None
+        if not _in_package_runs:
+            _l4b_runs_dir = (
+                Path(tempfile.gettempdir()) / "rc_llm4ad" / run_dir.name
+                / f"run_{_l4b_token}"
+            )
+        else:
+            logger.info(
+                "Stage 13: run_evolution_in_package=true — llm4ad worktrees "
+                "stay under %s (inspectable, not cleaned up). This needs a "
+                "filesystem without Windows' 260-character path limit.",
+                _tp_out,
+            )
+        _manifests = generate_task_packages(
+            Path(_tp_exp), _tp_out, _llm_config, _evo_cfg, _res_cfg,
+            background=_topic, metric_direction=_direction,
+            # Evolution scope (categories/names) from config; empty evolves all
+            # algorithms. Category membership is resolved against the per-run
+            # algorithms_classification.json stage-10 wrote.
+            evolve_scope=_evo_cfg.get("evolve_scope") if _evo_cfg else None,
+            # None => llm4ad writes under each package's own ./runs; a path =>
+            # worktrees live there instead, scoped to this invocation.
+            runs_base_dir=_l4b_runs_dir,
+            run_id=_l4b_token,
+        )
+        logger.info(
+            "Stage 13: generated %d LLM4AD task package(s) under %s",
+            len(_manifests), _tp_out,
+        )
+        if not _manifests:
+            # Zero packages is the quiet failure mode: evolve_scope matched
+            # nothing (or every algorithm was unclassifiable), so evolution is
+            # skipped and the run looks like one that simply had nothing to
+            # evolve. Warn loudly — the llm4ad results will be empty and the
+            # cause is a configuration/classification mismatch, not a
+            # modelling failure.
+            logger.warning(
+                "Stage 13: LLM4AD generated 0 task packages — nothing will be "
+                "evolved. Check evolve_scope against "
+                "experiment/algorithms_classification.json, and that "
+                "experiment/algorithms/ holds evolvable modules.",
+            )
+            log["task_packages_error"] = (
+                "0 packages generated (evolve_scope matched no algorithm)"
+            )
+        log["task_packages"] = {
+            "dir": str(_tp_out),
+            "count": len(_manifests),
+            "packages": [
+                {
+                    "algo": m.algo,
+                    "path": m.path,
+                    "primary_metric": m.primary_metric,
+                    "metric_direction": m.metric_direction,
+                    "n_instances": m.n_instances,
+                }
+                for m in _manifests
+            ],
+        }
+
+        # --- Run LLM4AD evolution on the generated packages (optional) ---
+        artifact_extra = _run_llm4ad_evolution(stage_dir, _tp_out, config, log)
+        return ("task_packages/",) + artifact_extra
+    except Exception as _l4b_exc:
+        # exc_info matters here: this handler previously swallowed a plain
+        # NameError in the evolution path and reported it as a business
+        # failure, so the bug survived every run without a traceback.
+        logger.warning(
+            "Stage 13: LLM4AD task-package generation failed: %s",
+            _l4b_exc,
+            exc_info=True,
+        )
+        log["task_packages_error"] = f"{type(_l4b_exc).__name__}: {_l4b_exc}"
+        if not bool(getattr(_l4b, "fail_silently", True)):
+            raise
+        return ()
+    finally:
+        # llm4ad's results are copied back into task_packages/ by
+        # _run_llm4ad_evolution; the worktrees themselves are scratch. Deleting
+        # them here (rather than never) keeps %TEMP%/rc_llm4ad from growing by a
+        # full git checkout per candidate on every run. _rmtree_force, not
+        # shutil.rmtree: .git/objects is read-only, which ignore_errors would
+        # swallow into a half-deleted tree.
+        if _l4b_runs_dir is not None and _l4b_runs_dir.exists():
+            try:
+                from researchclaw.pipeline.executor import _rmtree_force
+
+                _rmtree_force(_l4b_runs_dir)
+                # Drop the per-run parent too, but only once it is empty: a
+                # concurrent stage-13 re-entry may still own a sibling run_*.
+                with contextlib.suppress(OSError):
+                    _l4b_runs_dir.parent.rmdir()
+            except Exception as _l4b_clean:  # noqa: BLE001 - cleanup is best-effort
+                logger.debug(
+                    "Stage 13: could not clean llm4ad worktree dir %s: %s",
+                    _l4b_runs_dir, _l4b_clean,
+                )
+
+
+def _l4b_dataclass_to_dict(obj: Any) -> dict:
+    """Shallow-convert a frozen llm4ad_boost sub-config to a plain dict."""
+    if obj is None:
+        return {}
+    try:
+        from dataclasses import asdict, is_dataclass
+
+        if is_dataclass(obj):
+            return asdict(obj)
+    except Exception:  # noqa: BLE001 - defensive, config shape is user-supplied
+        pass
+    return {
+        k: getattr(obj, k)
+        for k in dir(obj)
+        if not k.startswith("_") and not callable(getattr(obj, k, None))
+    }
+
+
+def _resolve_llm4ad_cmd(config: Any) -> str:
+    """Resolve the ``llm4ad`` executable.
+
+    Prefers an on-PATH ``llm4ad``; on Windows, falls back to the venv's
+    Scripts/llm4ad.exe if present. Returns the command name otherwise so the
+    Runner reports a clean 'not found' error.
+    """
+    import shutil as _sh
+
+    found = _sh.which("llm4ad")
+    if found:
+        return found
+    # Windows venv layout: <venv>/Scripts/llm4ad.exe (or equivalent on PATH).
+    _py = getattr(getattr(config, "experiment", None), "sandbox", None)
+    _py_path = getattr(_py, "python_path", "") or ""
+    if _py_path:
+        exe = Path(_py_path).resolve().parent / ("llm4ad.exe" if Path(_py_path).suffix == ".exe" else "llm4ad")
+        if exe.exists():
+            return str(exe)
+        # python_path may be a forward-slash or bare name; try the venv root.
+        venv = Path(_py_path).resolve().parent
+        for cand in (venv / "llm4ad.exe", venv / "llm4ad"):
+            if cand.exists():
+                return str(cand)
+    return "llm4ad"
+
+
+def _run_llm4ad_evolution(
+    stage_dir: Path, packages_dir: Path, config: Any, log: dict
+) -> tuple[str, ...]:
+    """Run llm4ad evolution on task packages; degrade gracefully on failure.
+
+    Returns extra artifact names ('' or ('evolution_results/',)). Mutates log.
+    Honors ``config.experiment.llm4ad_boost.fail_silently`` and ``resources``.
+    """
+    import shutil
+
+    _l4b = getattr(getattr(config, "experiment", None), "llm4ad_boost", None)
+    if _l4b is None or not getattr(_l4b, "enabled", False):
+        return ()
+    if not packages_dir.is_dir() or not any(packages_dir.glob("*/config.yaml")):
+        logger.info("Stage 13: no task packages to evolve; skipping LLM4AD evolution")
+        return ()
+
+    try:
+        from researchclaw.pipeline.llm4ad_task_packages import (
+            run_evolution_on_packages,
+        )
+    except Exception as _eval_imp:  # pragma: no cover - defensive
+        logger.warning("Stage 13: llm4ad evolution runner unavailable: %s", _eval_imp)
+        return ()
+
+    cmd = _resolve_llm4ad_cmd(config)
+    _res = getattr(_l4b, "resources", None)
+    total_budget = int(getattr(_res, "time_budget_sec", 1800) or 1800)
+    fail_silently = bool(getattr(_l4b, "fail_silently", True))
+
+    # Per-package wall-clock budget. When ``per_package_timeout_sec`` is set
+    # (> 0) it wins — the real failure mode last run was NOT a small budget but
+    # every package being killed mid-generation because total_budget was divided
+    # across N packages (1800//6 = 300s, less than one generation). A long
+    # evolution deserves its own ceiling per package; otherwise fall back to the
+    # old total-budget division so prior configs keep working unchanged.
+    _n_pkgs = max(1, len(list(packages_dir.glob("*/config.yaml"))))
+    _per_pkg = int(getattr(_res, "per_package_timeout_sec", 0) or 0)
+    if _per_pkg > 0:
+        timeout = max(60, _per_pkg)
+    else:
+        timeout = max(60, total_budget // _n_pkgs)
+
+    # Provider env vars: pass through (base_url/api_key already in config.yaml,
+    # but keep ambient keys available to the subprocess).
+    env: dict[str, Any] = {}
+    _llm = getattr(config, "llm", None)
+    if _llm is not None and getattr(_llm, "api_key", ""):
+        env["OPENAI_API_KEY"] = getattr(_llm, "api_key", "")
+    if _llm is not None and getattr(_llm, "api_key_env", "") and getattr(_llm, "api_key_env", "") not in env:
+        import os as _os
+        _k = getattr(_llm, "api_key_env", "")
+        if _os.environ.get(_k):
+            env[_k] = _os.environ[_k]
+
+    logger.info(
+        "Stage 13: running LLM4AD evolution on %d package(s) under %s "
+        "(cmd=%s, per-package timeout=%ds%s)",
+        _n_pkgs, packages_dir, cmd, timeout,
+        f" of {total_budget}s total" if _per_pkg <= 0 else "",
+    )
+    try:
+        results = run_evolution_on_packages(
+            packages_dir, llm4ad_cmd=cmd, timeout_sec=timeout, env=env or None
+        )
+    except Exception as _eval_exc:
+        logger.warning(
+            "Stage 13: LLM4AD evolution failed: %s", _eval_exc, exc_info=True
+        )
+        log["evolution_error"] = f"{type(_eval_exc).__name__}: {_eval_exc}"
+        if not fail_silently:
+            raise
+        return ()
+
+    ok = [r for r in results if r.success]
+    # LLM4AD's MetricType.MINIMIZE negates the metric in compute_score, so the
+    # logged best_score is sign-flipped vs the raw objective. Surface both + the
+    # configured direction: a best_score far ABOVE the baseline (or 0.0 from a
+    # failed run) means evolution optimised the WRONG way. Print the raw metric
+    # so we can sanity-check the sign ourselves.
+    _direction_cfg = str(
+        getattr(getattr(config, "experiment", None), "metric_direction", "") or ""
+    ).strip().upper()
+    for r in ok:
+        if r.best_score is None:
+            continue
+        # Log whatever metrics the evaluator reported rather than looking up one
+        # hard-coded key: the metric name is the generated experiment's choice
+        # (`tour_length`, `accuracy`, …), so naming one here printed "n/a" for
+        # every task that is not continuous box-constrained optimisation.
+        _raw = ", ".join(
+            f"{k}={v:.6g}" for k, v in sorted((r.best_metrics or {}).items())
+        )
+        logger.info(
+            "Stage 13: %s best_score=%.6g (metrics: %s; configured direction=%s) — "
+            "MINIMIZE negates the metric, so best_score <= 0 is expected there",
+            r.algo, r.best_score,
+            _raw or "none reported",
+            _direction_cfg or "inferred",
+        )
+    log["evolution"] = {
+        "cmd": cmd,
+        "timeout_sec": timeout,
+        "total_budget_sec": total_budget,
+        "metric_direction": _direction_cfg,
+        "total": len(results),
+        "succeeded": len(ok),
+        "failed": len(results) - len(ok),
+        "results": [
+            {
+                "algo": r.algo,
+                "success": r.success,
+                "best_score": r.best_score,
+                "best_metrics": r.best_metrics,
+                "best_code_dir": r.best_code_dir,
+                "run_id": r.run_id,
+                "error_message": r.error_message,
+            }
+            for r in results
+        ],
+    }
+    # A completely-failed evolution must not be silent. Returning () means no
+    # evolution_results/ → no promotion → no llm4ad_comparison.json, and
+    # experiment_final/ keeps the legacy refinement output. That is the correct
+    # DEGRADATION, but it is indistinguishable from "evolution found nothing
+    # better" (stage still reports done). Record the reason under its own log
+    # key and let fail_silently decide whether it is fatal.
+    def _fail_evolution(reason: str, detail: str) -> tuple[str, ...]:
+        log["evolution_failed_completely"] = {"reason": reason, "detail": detail}
+        logger.warning("Stage 13: %s — %s", reason, detail)
+        if not fail_silently:
+            raise RuntimeError(f"Stage 13 LLM4AD evolution: {reason} — {detail}")
+        return ()
+
+    if not ok:
+        return _fail_evolution(
+            f"LLM4AD evolution produced no successes ({len(results)} packages attempted)",
+            next((r.error_message for r in results if r.error_message), "n/a"),
+        )
+
+    # Require a FINITE best score, not merely a non-None one. llm4ad exits 0 and
+    # reports done on a run where every candidate failed to evaluate, leaving
+    # global_best_score=-inf and an empty best/ — which _resolve_run_best falls
+    # back to a worktree for, yielding success=True with no score. A -inf/NaN
+    # best is not weaker evidence, it is evidence nothing was scored.
+    import math as _math
+
+    _scored = [
+        r for r in ok
+        if r.best_score is not None and _math.isfinite(r.best_score)
+    ]
+    if not _scored:
+        _nonfinite = [
+            r.algo for r in ok
+            if r.best_score is not None and not _math.isfinite(r.best_score)
+        ]
+        return _fail_evolution(
+            "LLM4AD evolution recovered no finite best_score",
+            (
+                f"non-finite best_score for {', '.join(_nonfinite)} — every "
+                "candidate failed to evaluate (check the task package's imports "
+                "and the llm4ad log)"
+            )
+            if _nonfinite
+            else (
+                f"no best/metadata.json for {', '.join(r.algo for r in ok)} — "
+                "the run produced no quantitative result to report downstream"
+            ),
+        )
+    for r in _scored:
+        logger.info(
+            "Stage 13: LLM4AD best score for %s: %.6g (run_id=%s)",
+            r.algo, r.best_score, r.run_id,
+        )
+
+    # Materialise best evolved code to a stable evolution_results/ dir.
+    evo_out = stage_dir / "evolution_results"
+    evo_out.mkdir(parents=True, exist_ok=True)
+    # Copy the winning individual's CODE only: the source worktree may sit under
+    # a runs/ tree carrying .git and run history, none of which belongs in the
+    # deliverable — and neither does __pycache__.
+    _tree_ignore = shutil.ignore_patterns(".git", "runs", "best", "__pycache__", "*.pyc")
+    for r in results:
+        if not r.success or not r.best_code_dir:
+            continue
+        src = Path(r.best_code_dir)
+        if not src.is_dir():
+            continue
+        dst = evo_out / r.algo
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst, ignore=_tree_ignore)
+    log["evolution"]["results_dir"] = str(evo_out)
+    logger.info(
+        "Stage 13: LLM4AD evolution succeeded for %d/package(s); results under %s",
+        len(ok), evo_out,
+    )
+    return ("evolution_results/",)
+
+
+def _failed_census(attempted_algos: dict[str, str] | None) -> dict[str, Any]:
+    """Map each attempted algorithm to a ``failed:true`` comparison entry.
+
+    Pure mapping over ``attempted_algos`` — no filesystem or comparison-state
+    lookups. Which algorithms belong in the set (all of ``attempted_algos`` plus
+    anything in ``evolution_results/`` that the main promotion loop did not
+    already account for) is the caller's job, because only the caller knows what
+    got processed into ``comparison``. Kept separate so the mapping itself stays
+    unit-testable and the "missing base dir" early return reuses it as-is.
+    """
+    census: dict[str, Any] = {}
+    for algo_name, err in sorted((attempted_algos or {}).items()):
+        census[algo_name] = {
+            "baseline": None, "evolved": None, "delta_pct": None,
+            "promoted": False, "failed": True,
+            "reason": (
+                err.strip()
+                or "no evolution result — package timed out or llm4ad run failed"
+            ),
+        }
+        logger.warning(
+            "Stage 13: %s absent from evolution_results/ (%s); recorded as failed "
+            "in the comparison rather than dropped",
+            algo_name, err.strip() or "no evolution result",
+        )
+    return census
+
+
+def _promote_llm4ad_to_experiment_final(
+    base_exp_dir: Path,
+    evolution_dir: Path,
+    final_dir: Path,
+    *,
+    metric_direction: str = "minimize",
+    attempted_algos: dict[str, str] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Overlay only genuinely-improved evolved modules onto a clean project.
+
+    Each ``evolution_results/<algo>/`` is a copy of the winning individual's git
+    worktree — which, because ``version_control.local_path`` is
+    ``algorithms/<algo>``, holds just the evolved ``<algo>.py``. Downstream stages
+    consume ``experiment_final/`` as a top-level project (``main.py`` +
+    ``algorithms/<algo>/<algo>.py`` + ``data/*.json``), so we rebuild ``final_dir``
+    from ``base_exp_dir`` (the clean stage-10 code) and overlay ONLY the evolved
+    modules that actually beat their clean baseline under the experiment's own
+    evaluator protocol.  A module that fails to run, has no finite primary
+    metric, or is equal/worse than the baseline is left as the clean code, so
+    LLM4AD can only ever improve ``experiment_final/`` — never degrade it.
+
+    ``metric_direction`` ("minimize"/"maximize") decides which score is better.
+
+    ``attempted_algos`` maps every algorithm the run *attempted* to evolve to a
+    per-package error message (or ``""`` when it ran to completion).  Without it
+    this function used to iterate only what ``evolution_results/`` happened to
+    contain, so an algorithm whose evolution failed (package timeout, llm4ad
+    crash, smoke-check rejection) vanished from the comparison entirely — the
+    ml25 run "compared" 3 of 5 algorithms and wrote no ``failed: true`` for esn
+    or gp, so a reviewer read the short list as "evolution skipped those".  The
+    set is the union of ``attempted_algos`` keys and ``evolution_dir`` contents;
+    any algorithm present in the tried set but absent from ``evolution_dir`` is
+    recorded as ``failed: true`` with its error message, so the comparison is a
+    complete census of the run rather than just its successes.
+
+    Returns ``(n_promoted, comparison)`` where ``comparison`` is a dict of
+    ``{algo: {baseline, evolved, delta_pct, promoted, failed, reason}}`` for
+    every attempted algorithm.
+    """
+    import shutil as _sh_promote
+    import subprocess as _sp
+    import sys as _sys
+
+    _dir = metric_direction.strip().lower()
+    maximize = _dir == "maximize"
+    if _dir not in ("minimize", "maximize"):
+        logger.warning(
+            "Stage 13: unknown metric_direction=%r, assuming minimize", metric_direction,
+        )
+
+    if not base_exp_dir.is_dir():
+        logger.warning(
+            "Stage 13: cannot promote llm4ad results — base experiment dir "
+            "missing: %s", base_exp_dir,
+        )
+        # Still emit the failed-algorithm census: an experiment whose clean code
+        # vanished is exactly a run where nothing can promote, and dropping the
+        # attempted set here would repeat the "evolution skipped those" reading.
+        return 0, _failed_census(attempted_algos)
+
+    # Rebuild final_dir from the clean base (remove errant leftover, if any).
+    if final_dir.exists():
+        _sh_promote.rmtree(final_dir, ignore_errors=True)
+    _sh_promote.copytree(base_exp_dir, final_dir, symlinks=False)
+
+    _runner = Path(__file__).resolve().parent.parent / "llm4ad_utils" / "comparison_runner.py"
+
+    # Enumerating instances has one implementation, shared with the task
+    # packager: every file directly under data/, whatever its extension.
+    from researchclaw.pipeline.llm4ad_task_packages import _discover_instances, _RESULT_MARKER
+    _instance_argv = json.dumps([str(p) for p in _discover_instances(base_exp_dir)])
+
+    def _score(algo_name: str, algo_file: Path) -> tuple[dict[str, float] | None, str, set[str] | None]:
+        """Per-instance primary-metric values via the experiment's own evaluator.
+
+        Returns ``(values, detail, failures)``.  ``values`` is None when scoring
+        could not run at all; ``detail`` explains why and is surfaced in the
+        comparison artifact so a failure is not mistaken for "no improvement".
+        ``failures`` is the set of instance names the evaluator could not score
+        (crashed / non-finite), or None when scoring did not run. It lets the
+        caller report how much of a candidate's loss is due to instances the
+        baseline solved.
+        """
+        try:
+            proc = _sp.run(
+                [_sys.executable, str(_runner), str(base_exp_dir), algo_name, str(algo_file)],
+                input=_instance_argv,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=_SCORING_TIMEOUT_SEC,
+            )
+        except (OSError, _sp.TimeoutExpired) as _pexc:
+            return None, f"scoring failed to run: {_pexc}", None
+        if proc.returncode != 0:
+            return None, (
+                f"scoring exited {proc.returncode}: "
+                f"{(proc.stderr or proc.stdout or '').strip()[-200:]}"
+            ), None
+        # The runner prefixes its payload with the result marker; the
+        # experiment's own `evaluate_instance`/`load_instance` is generated code
+        # that may legitimately print (it is shared with main.py, whose contract
+        # requires it to print its metric), so the line is found by marker rather
+        # than taken as the whole stdout. Should a package emit no marker line,
+        # fall back to the last line so an older runner still scores.
+        _marker = _RESULT_MARKER
+        payload = None
+        for _line in (proc.stdout or "").splitlines():
+            _idx = _line.find(_marker)
+            if _idx == -1:
+                continue
+            payload = _safe_json_loads(_line[_idx + len(_marker):].strip(), None)
+            break
+        if payload is None:
+            _last = ""
+            for _line in (proc.stdout or "").splitlines():
+                if _line.strip():
+                    _last = _line.strip()
+            payload = _safe_json_loads(_last, None)
+        if not isinstance(payload, dict):
+            return None, "scoring returned unparsable stdout", None
+        if payload.get("error"):
+            return None, str(payload["error"]), None
+        values = payload.get("values")
+        failures = payload.get("failures")
+        _fset = set(failures.keys()) if isinstance(failures, dict) else None
+        if not isinstance(values, dict) or not values:
+            _first = next(iter(failures.values()), "") if isinstance(failures, dict) else ""
+            return None, f"no finite primary metric on any instance{f'; e.g. {_first}' if _first else ''}", _fset
+        try:
+            return {str(k): float(v) for k, v in values.items()}, "", _fset
+        except (TypeError, ValueError):
+            return None, "scoring returned non-numeric values", _fset
+
+    comparison: dict[str, Any] = {}
+    n_promoted = 0
+    if not evolution_dir.is_dir():
+        # Nothing to promote, but the attempted set still has to be reported:
+        # this is exactly the run where evolution failed wholesale.
+        return 0, _failed_census(attempted_algos)
+
+    for algo_pkg in sorted(evolution_dir.iterdir()):
+        if not algo_pkg.is_dir():
+            continue
+        algo_name = algo_pkg.name
+        # Because `local_path = algorithms/<algo>`, the winning individual's
+        # worktree holds the evolved module FLAT at the root here. The nested
+        # path is the pre-flattening layout, kept so older packages still promote.
+        evolved_src = algo_pkg / f"{algo_name}.py"
+        if not evolved_src.is_file():
+            evolved_src = algo_pkg / "algorithms" / algo_name / f"{algo_name}.py"
+        if not evolved_src.is_file():
+            continue
+
+        # Map back to the original layout: algorithms/<algo>/<algo>.py.
+        base_algo = base_exp_dir / "algorithms" / algo_name / f"{algo_name}.py"
+        _dest = final_dir / "algorithms" / algo_name / f"{algo_name}.py"
+        _dest.parent.mkdir(parents=True, exist_ok=True)
+
+        if not base_algo.is_file():
+            # No clean counterpart — cannot judge improvement, keep clean code.
+            comparison[algo_name] = {
+                "baseline": None, "evolved": None, "delta_pct": None,
+                "promoted": False, "failed": True,
+                "reason": "baseline algorithm file missing",
+            }
+            continue
+
+        # Byte-identical source means no evolvable change: keep the clean code.
+        try:
+            identical = evolved_src.read_bytes() == base_algo.read_bytes()
+        except OSError:
+            identical = False
+
+        if identical:
+            comparison[algo_name] = {
+                "baseline": None, "evolved": None, "delta_pct": None,
+                "promoted": False, "failed": False,
+                "reason": "evolved source identical to baseline; no change to promote",
+            }
+            logger.info("Stage 13: %s unchanged — keeping baseline", algo_name)
+            continue
+
+        baseline_values, baseline_detail, baseline_failures = _score(algo_name, base_algo)
+        evolved_values, evolved_detail, evolved_failures = _score(algo_name, evolved_src)
+
+        # A failed/unsaved evolution counts as "no improvement": never degrade.
+        # Which side failed matters (different follow-up, and mixing them up
+        # already misled one investigation).
+        if baseline_values is None or evolved_values is None:
+            if baseline_values is None and evolved_values is None:
+                _reason = (
+                    f"scoring failed on both sides (baseline: {baseline_detail}; "
+                    f"evolved: {evolved_detail})"
+                )
+            elif evolved_values is None:
+                _reason = f"evolved scoring failed ({evolved_detail})"
+            else:
+                _reason = f"baseline scoring failed ({baseline_detail})"
+            comparison[algo_name] = {
+                "baseline": None, "evolved": None, "delta_pct": None,
+                "promoted": False, "failed": True, "reason": _reason,
+            }
+            logger.warning("Stage 13: %s — %s; keeping baseline", algo_name, _reason)
+            continue
+
+        # Compare like with like: if each side averaged over its own instance set,
+        # a candidate that crashed on instances the baseline solved would compare
+        # two different quantities and could get promoted despite being worse.
+        common = sorted(set(baseline_values) & set(evolved_values))
+        if not common:
+            comparison[algo_name] = {
+                "baseline": None, "evolved": None, "delta_pct": None,
+                "promoted": False, "failed": True,
+                "reason": "no instance was scored by both baseline and evolved",
+            }
+            logger.warning(
+                "Stage 13: %s — no shared scored instance; keeping baseline", algo_name,
+            )
+            continue
+
+        baseline_score = sum(baseline_values[k] for k in common) / len(common)
+        evolved_score = sum(evolved_values[k] for k in common) / len(common)
+        n_total = max(len(baseline_values), len(evolved_values))
+
+        # Direction-aware improvement test (minimize → lower is better).
+        better = evolved_score < baseline_score if not maximize else evolved_score > baseline_score
+        if better:
+            _sh_promote.copy2(evolved_src, _dest)
+            n_promoted += 1
+        # Direction-agnostic percent change, divided by |baseline| so a negative
+        # baseline (log-likelihood, -MSE, …) does not flip the sign of a genuine
+        # improvement into a negative delta. The sign that matters ("is this an
+        # improvement?") is carried separately by `better` below; delta_pct only
+        # reports how far apart the two are.
+        delta_pct = (
+            (evolved_score - baseline_score) / abs(baseline_score) * 100.0
+            if baseline_score
+            else None
+        )
+        comparison[algo_name] = {
+            "baseline": baseline_score,
+            "evolved": evolved_score,
+            "delta_pct": delta_pct,
+            "promoted": better,
+            "failed": False,
+            "n_instances_compared": len(common),
+            "n_instances_total": n_total,
+            # Instances the evolved candidate failed to score but the baseline
+            # solved. Reported, not gated: a candidate may win on the shared
+            # instances while losing some — exposing the count keeps a reviewer
+            # from reading a mean-only delta as "strictly better everywhere".
+            "lost_instances": (
+                len(evolved_failures & set(baseline_values))
+                if evolved_failures else 0
+            ),
+            "reason": "improved" if better else "equal or worse than baseline",
+        }
+        logger.info(
+            "Stage 13: %s %s (baseline=%.6g evolved=%.6g delta=%.3f%% over %d/%d instances)",
+            algo_name, "promoted" if better else "kept baseline",
+            baseline_score, evolved_score, delta_pct if delta_pct is not None else 0.0,
+            len(common), n_total,
+        )
+
+    # Completeness census: an algorithm that was attempted but produced no
+    # evolution_results/ entry must not vanish from the comparison. Without this,
+    # a failed-to-evolve algorithm (package timeout, llm4ad internal crash,
+    # smoke-check rejection) is absent from both llm4ad_comparison.json and
+    # experiment_final/ with no trace — the ml25 run silently dropped esn and gp.
+    # The attempted set is the union of what the run tried and what somehow landed
+    # in evolution_results/ (which the loop above already recorded in
+    # ``comparison`` if it promoted/kept it). Anything left over that is not
+    # already in ``comparison`` is recorded as failed with its error message.
+    _census_src: dict[str, str] = dict(attempted_algos or {})
+    if evolution_dir.is_dir():
+        for algo_pkg in sorted(evolution_dir.iterdir()):
+            if algo_pkg.is_dir():
+                _census_src.setdefault(algo_pkg.name, "")
+    _census_src = {k: v for k, v in _census_src.items() if k not in comparison}
+    comparison.update(_failed_census(_census_src))
+
+    if not n_promoted:
+        logger.warning(
+            "Stage 13: no evolved algorithm beat its baseline — experiment_final/ "
+            "left as the clean stage-10 code"
+        )
+    return n_promoted, comparison
+
+
+def _load_project_files(exp_dir: Path) -> dict[str, str]:
+    """Read every text file of an experiment project, keyed by relative path.
+
+    Recurses so nested modules and data (``algorithms/``, ``data/*.json``)
+    survive into refinement. Binary and unreadable files are skipped.
+    """
+    files: dict[str, str] = {}
+    if not exp_dir.is_dir():
+        return files
+    for src_file in sorted(exp_dir.rglob("*")):
+        if not src_file.is_file():
+            continue
+        if src_file.suffix.lower().lstrip(".") in (
+            "py", "txt", "yaml", "yml", "json", "cfg", "ini", "sh",
+        ):
+            try:
+                files[src_file.relative_to(exp_dir).as_posix()] = src_file.read_text(
+                    encoding="utf-8"
+                )
+            except UnicodeDecodeError:
+                pass  # skip binary files
+    return files
+
+
+def _plan_condition_names(exp_plan_text: str) -> set[str]:
+    """Condition names the experiment plan fixed, or an empty set.
+
+    Only ``conditions`` is read. ``baselines``/``ablations`` hold prose in real
+    plans (``"random_search_baseline as a budget-matched non-adaptive
+    baseline"``), and treating that as a name would reject every candidate that
+    legitimately lacks it. ``conditions`` names the runnable conditions and is
+    the list the prompt tells the model to preserve.
+
+    An empty set means "could not tell", which every caller reads as permission
+    rather than as a violation.
+    """
+    if not exp_plan_text.strip():
+        return set()
+    try:
+        import yaml as _yaml
+
+        plan = _yaml.safe_load(exp_plan_text)
+    except Exception:  # noqa: BLE001 — plan text is model-written, any failure is data
+        return set()
+    if not isinstance(plan, dict):
+        return set()
+
+    names: set[str] = set()
+    for entry in plan.get("conditions") or []:
+        if isinstance(entry, dict) and entry.get("name"):
+            names.add(str(entry["name"]).strip())
+        elif isinstance(entry, str) and entry.strip():
+            names.add(entry.strip())
+    return {n for n in names if n}
+
+
+def _algorithm_names_in_files(files: dict[str, str]) -> set[str]:
+    """Algorithm directory names present in a candidate file set."""
+    return {
+        key.split("/")[1]
+        for key in files
+        if key.startswith("algorithms/") and key.count("/") >= 2
+    }
+
+
+def _check_refine_preserved_plan(
+    files: dict[str, str],
+    plan_names: set[str],
+) -> str:
+    """Why a refined candidate departs from the experiment plan, or "".
+
+    Stage 13's prompt states the rule plainly — never rename or drop a
+    condition, never add one the plan did not name — and a model still
+    rewrote a four-condition plan into nine differently-named algorithms,
+    which silently invalidated the design the paper reports and left LLM4AD's
+    evolution (run against the clean project's names) with nothing to match.
+
+    Kept to the two things that are unambiguous: a plan name that vanished,
+    and an algorithm that is not a plan name at all. Both are facts about the
+    file set, so a genuine rename cannot be mistaken for a new condition.
+    """
+    if not plan_names:
+        return ""
+    present = _algorithm_names_in_files(files)
+    if not present:
+        return ""
+    lowered = {p.lower() for p in present}
+    missing = sorted(n for n in plan_names if n.lower() not in lowered)
+    added = sorted(p for p in present if p.lower() not in {n.lower() for n in plan_names})
+    # A name that disappeared AND an unrecognised one that appeared is the
+    # signature of a rename; either alone is still a departure worth naming.
+    problems = []
+    if missing:
+        problems.append(f"dropped/renamed plan condition(s): {missing}")
+    if added:
+        problems.append(f"added condition(s) not in the plan: {added}")
+    return "; ".join(problems)
+
+
 def _execute_iterative_refine(
     stage_dir: Path,
     run_dir: Path,
@@ -879,18 +1846,8 @@ def _execute_iterative_refine(
         )
     if not exp_dir_text:
         exp_dir_text = _read_prior_artifact(run_dir, "experiment/")
-    best_files: dict[str, str] = {}
-    if exp_dir_text and Path(exp_dir_text).is_dir():
-        # BUG-EX-02: Load ALL text files (not just .py) — requirements.txt,
-        # setup.py, config files are needed for Docker sandbox phases.
-        for src_file in sorted(Path(exp_dir_text).iterdir()):
-            if src_file.is_file() and src_file.suffix in (
-                ".py", ".txt", ".yaml", ".yml", ".json", ".cfg", ".ini", ".sh",
-            ):
-                try:
-                    best_files[src_file.name] = src_file.read_text(encoding="utf-8")
-                except UnicodeDecodeError:
-                    pass  # skip binary files
+    best_files: dict[str, str] = _load_project_files(Path(exp_dir_text)) if exp_dir_text else {}
+
     if not best_files:
         # Backward compat: single experiment.py
         original_code = _read_prior_artifact(run_dir, "experiment.py") or ""
@@ -940,12 +1897,146 @@ def _execute_iterative_refine(
     def _write_project(target_dir: Path, project_files: dict[str, str]) -> None:
         target_dir.mkdir(parents=True, exist_ok=True)
         for fname, code in project_files.items():
-            (target_dir / fname).write_text(code, encoding="utf-8")
+            _wf = target_dir / fname
+            _wf.parent.mkdir(parents=True, exist_ok=True)
+            _wf.write_text(code, encoding="utf-8")
+
+    def _restore_evolve_markers(
+        new_files: dict[str, str], old_files: dict[str, str],
+    ) -> list[str]:
+        """Re-wrap `optimize` in EVOLVE markers that a refine rewrite dropped.
+
+        Stage 10 puts `# EVOLVE_START` / `# EVOLVE_END` around each algorithm's
+        `optimize` so the evolution stage can replace that function. Refining the
+        project legitimately rewrites an algorithm — but this loop's prompt is
+        about improving the implementation, and a model that rewrites the body
+        rarely remembers to re-emit the markers. When they vanish, LLM4AD's
+        analyzer finds zero evolvable blocks, every candidate is skipped with
+        "InitSampler requires analyzed_repository with at least one evolvable
+        block", and evolution produces nothing after burning the whole stage.
+
+        Re-wrapping rather than reverting keeps whatever the refinement actually
+        improved; reverting would throw that away to fix a formatting loss. A
+        file whose `optimize` no longer parses is left alone — there is nothing
+        to wrap, and the caller's validation reports it.
+
+        Returns the file names that were fixed.
+        """
+        import ast as _ast_markers
+
+        fixed: list[str] = []
+        for fname, code in list(new_files.items()):
+            if "/" not in fname or not fname.endswith(".py"):
+                continue
+            prior = old_files.get(fname, "")
+            had = "EVOLVE_START" in prior and "EVOLVE_END" in prior
+            has = "EVOLVE_START" in code and "EVOLVE_END" in code
+            # Only rescue a marker pair this refine step dropped. A file that
+            # never had markers is left as generated — inventing a block there
+            # would make an helper module evolvable.
+            if not had or has:
+                continue
+
+            # splitlines(keepends=True) leaves the last line without a newline
+            # when the file does not end in one; appending a marker after it
+            # would merge the two into `}# EVOLVE_END`. Normalise first.
+            lines = code.splitlines(keepends=True)
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] = lines[-1] + "\n"
+            lines = [ln if ln.endswith("\n") else ln + "\n" for ln in lines]
+            try:
+                tree = _ast_markers.parse(code)
+            except SyntaxError:
+                continue
+            fn = next(
+                (
+                    n for n in _ast_markers.walk(tree)
+                    if isinstance(n, _ast_markers.FunctionDef) and n.name == "optimize"
+                ),
+                None,
+            )
+            if fn is None:
+                continue
+            # Markers go OUTSIDE the function, as the reference task packages
+            # lay them out: the whole `def ... return` is the evolvable unit.
+            start_line = fn.lineno - 1          # 0-based, the `def` line
+            end_line = fn.end_lineno            # 0-based index just past the body
+            # Leave any decorator above `def` outside the block (Python 3.8+).
+            for dec in getattr(fn, "decorator_list", []):
+                start_line = min(start_line, dec.lineno - 1)
+            if not (0 <= start_line < end_line <= len(lines)):
+                continue
+            patched = (
+                lines[:start_line]
+                + ["# EVOLVE_START\n"]
+                + lines[start_line:end_line]
+                + ["# EVOLVE_END\n"]
+                + lines[end_line:]
+            )
+            new_files[fname] = "".join(patched)
+            fixed.append(fname)
+
+        if fixed:
+            logger.warning(
+                "Stage 13: restored dropped EVOLVE markers in %d file(s): %s — "
+                "a rewrite without them is not evolvable, and would have left "
+                "Stage 13 with nothing to evolve.",
+                len(fixed), ", ".join(fixed),
+            )
+        return fixed
 
     # --- Helper: format all files for LLM context ---
-    def _files_to_context(project_files: dict[str, str]) -> str:
+    def _files_to_context(
+        project_files: dict[str, str],
+        *,
+        changed_files: set[str] | None = None,
+        error_files: set[str] | None = None,
+        max_files: int = 8,
+    ) -> str:
+        """Render the project as prompt context — RELEVANT files only.
+
+        Smart file selection to prevent prompt bloat with many algorithm files:
+        1. Always include: main.py (entry point)
+        2. Priority to: error_files (when validation/runtime fails)
+        3. Otherwise: changed_files (from LLM's last output)
+        4. Cap at max_files to keep prompt under ~160KB
+
+        ``best_files`` is the project payload as well as the prompt context, and
+        the two need different contents.  ``_write_project`` must keep every
+        collected file so the refined project stays runnable (data/*.json
+        included), but the refinement prompt asks for ``filename:xxx.py`` back
+        and never acts on a data file.  One ML23 run carried 3.8MB of
+        data/*.json into the prompt — ~1M tokens — and every gateway rejected it
+        with HTTP 400 across three vendors before the fallback chain gave up.
+        Filtering here, not at collection time, keeps both uses correct.
+        """
+        # Priority 1: Always include main.py (entry point)
+        selected = {"main.py"} if "main.py" in project_files else set()
+
+        # Priority 2: Error-related files (validation/runtime failures)
+        if error_files:
+            selected.update(f for f in error_files if f in project_files and f.endswith(".py"))
+
+        # Priority 3: Recently changed files (what LLM just modified)
+        elif changed_files:
+            selected.update(f for f in changed_files if f in project_files and f.endswith(".py"))
+
+        # Priority 4: If still under max_files, add other .py files
+        if len(selected) < max_files:
+            for fname in sorted(project_files.keys()):
+                if fname.endswith(".py") and fname not in selected:
+                    selected.add(fname)
+                    if len(selected) >= max_files:
+                        break
+
+        # Render selected files with smart truncation (head + tail)
         parts = []
-        for fname, code in sorted(project_files.items()):
+        for fname in sorted(selected):
+            if fname not in project_files:
+                continue
+            code = project_files[fname]
+            if len(code) > _CONTEXT_FILE_MAX_CHARS:
+                code = _smart_truncate(code, _CONTEXT_FILE_MAX_CHARS)
             parts.append(f"```filename:{fname}\n{code}\n```")
         return "\n\n".join(parts)
 
@@ -1011,6 +2102,9 @@ def _execute_iterative_refine(
         )
         _write_refinement_log()
         artifacts = ("refinement_log.json", "experiment_final/")
+        artifacts += _generate_llm4ad_task_packages(
+            stage_dir, run_dir, config, exp_dir_text, log
+        )
         return StageResult(
             stage=Stage.ITERATIVE_REFINE,
             status=StageStatus.DONE,
@@ -1023,6 +2117,15 @@ def _execute_iterative_refine(
 
     # R7-3: Read experiment plan to detect condition coverage gaps
     _exp_plan_text = _read_prior_artifact(run_dir, "exp_plan.yaml") or ""
+    # The plan's condition names, used to reject a candidate that rewrites the
+    # experiment rather than its implementations. Empty when the plan names
+    # none, which the guard reads as "nothing to enforce".
+    _plan_names = _plan_condition_names(_exp_plan_text)
+    if _plan_names:
+        logger.info(
+            "Stage 13: experiment plan fixes %d condition(s): %s",
+            len(_plan_names), sorted(_plan_names),
+        )
     _condition_coverage_hint = ""
     if _exp_plan_text and run_summaries:
         # Check if stdout contains condition labels
@@ -1093,7 +2196,10 @@ def _execute_iterative_refine(
                 )
                 logger.warning("Stage 13: metric saturation detected, injecting difficulty upgrade hint")
 
-        files_context = _files_to_context(best_files)
+        files_context = _files_to_context(
+            best_files,
+            changed_files=None,  # First iteration: include all (up to max_files)
+        )
         # BUG-10 fix: anchor refinement to original experiment plan
         _exp_plan_anchor = ""
         if _exp_plan_text.strip():
@@ -1117,14 +2223,30 @@ def _execute_iterative_refine(
         user_prompt = ip.user + _saturation_hint
         if prior_timed_out and baseline_metric is None:
             timeout_refine_attempts += 1
+            # Shrink the COMPUTE, not the comparison. The previous wording told
+            # the model to "remove conditions that are not essential" and to
+            # "add time.time() checks to stop gracefully" — i.e. exactly the two
+            # edits that silently destroy a controlled comparison: a dropped
+            # condition (one run lost its only tuned baseline this way, and the
+            # plan had named it) and a loop that abandons every remaining
+            # condition once the clock runs out. `iterative_improve` already
+            # forbids renaming/removing conditions; this hint used to contradict
+            # it, and the hint is what the model saw last.
             timeout_hint = (
                 f"\n\nCRITICAL: The experiment TIMED OUT after {prior_time_budget}s "
-                f"with NO results. You MUST drastically reduce the experiment scale:\n"
-                f"- Reduce total runs to ≤50\n"
-                f"- Reduce steps per run to ≤2000\n"
-                f"- Remove conditions that are not essential\n"
-                f"- Add time.time() checks to stop gracefully before timeout\n"
-                f"- Print intermediate metrics frequently so partial data is captured\n"
+                f"with NO results. Cut the COST of each run — never the condition\n"
+                f"list. Every condition named in the plan MUST still appear:\n"
+                f"- Keep ALL conditions from the experiment plan. Do NOT remove any:\n"
+                f"  a missing condition is a missing baseline, and the comparison\n"
+                f"  cannot be recovered downstream.\n"
+                f"- Reduce work per condition instead: fewer steps per run (≤2000),\n"
+                f"  smaller batches/instances, fewer epochs.\n"
+                f"- Give each (condition, instance, seed) run its OWN time slice, e.g.\n"
+                f"  per_run_budget = budget / (n_conditions * n_instances * n_seeds),\n"
+                f"  and check the deadline INSIDE a run. Never break out of the\n"
+                f"  condition loop — that drops every condition still to come.\n"
+                f"- Print each result the moment it is computed, so a stop still\n"
+                f"  leaves completed conditions on stdout.\n"
                 f"- Time budget is {prior_time_budget}s — design for ≤{int(prior_time_budget * 0.7)}s\n"
             )
             user_prompt = user_prompt + timeout_hint
@@ -1163,6 +2285,10 @@ def _execute_iterative_refine(
         candidate_files = dict(best_files)
         if extracted_files:
             candidate_files.update(extracted_files)
+        # A refine rewrite that drops the EVOLVE markers leaves LLM4AD with zero
+        # evolvable blocks, which silently wastes the whole evolution stage.
+        # Restore them before this iteration is written or run.
+        _restore_evolve_markers(candidate_files, best_files)
         # If LLM returned nothing at all, candidate_files == best_files (unchanged)
 
         # BUG-R6-02: Preserve entry point when LLM strips main() function.
@@ -1206,10 +2332,15 @@ def _execute_iterative_refine(
             irp = _pm.sub_prompt(
                 "iterative_repair",
                 issue_text=issue_text,
-                all_files_ctx=_files_to_context(candidate_files),
+                all_files_ctx=_files_to_context(
+                    candidate_files,
+                    error_files={"main.py"},  # Focus on entry point for validation errors
+                ),
             )
             try:
-                repair_response = _chat_with_prompt(llm, irp.system, irp.user)
+                repair_response = _chat_with_prompt(
+                    llm, irp.system, irp.user, max_tokens=irp.max_tokens
+                )
             except RuntimeError as exc:
                 if "ACP prompt timed out after" in str(exc):
                     logger.warning(
@@ -1242,6 +2373,23 @@ def _execute_iterative_refine(
         }
         if issue_text:
             iter_record["validation_issues"] = issue_text
+
+        # Structural guard: a refinement must edit the implementations, not the
+        # experiment. Checked before the sandbox run so an off-plan candidate
+        # costs no compute, and recorded either way so the artifact shows what
+        # was rejected rather than silently omitting an iteration.
+        _plan_violation = _check_refine_preserved_plan(candidate_files, _plan_names)
+        if _plan_violation:
+            iter_record["plan_violation"] = _plan_violation
+            logger.warning(
+                "Stage 13 iteration %d departs from the experiment plan — %s. "
+                "Not evaluated: the paper reports this plan's conditions, so a "
+                "candidate that renames or adds them cannot be the result.",
+                iteration, _plan_violation,
+            )
+            log["iterations"].append(iter_record)
+            consecutive_no_metrics += 1
+            continue
 
         metric_val = None  # R6-3: initialize before conditional block
         if validation.ok and config.experiment.mode in ("sandbox", "docker"):
@@ -1331,10 +2479,15 @@ def _execute_iterative_refine(
                 rrp = _pm.sub_prompt(
                     "iterative_repair",
                     issue_text=runtime_issues,
-                    all_files_ctx=_files_to_context(candidate_files),
+                    all_files_ctx=_files_to_context(
+                        candidate_files,
+                        error_files={"main.py"},  # Focus on entry point for runtime errors
+                    ),
                 )
                 try:
-                    repair_resp = _chat_with_prompt(llm, rrp.system, rrp.user)
+                    repair_resp = _chat_with_prompt(
+                        llm, rrp.system, rrp.user, max_tokens=rrp.max_tokens
+                    )
                 except RuntimeError as exc:
                     if "ACP prompt timed out after" in str(exc):
                         logger.warning(
@@ -1438,7 +2591,151 @@ def _execute_iterative_refine(
         log["ablation_identical_warning"] = True
     _write_refinement_log()
 
+    # ── LLM4AD comparison mode ─────────────────────────────────────────
+    # When llm4ad_boost is on, the refined output above is the comparison
+    # *baseline*, not the deliverable: snapshot it, let llm4ad evolve from the
+    # clean stage-10 code, then overlay its best algorithms into
+    # experiment_final/ for Stage 14+. Keeps a fabricated refinement pass from
+    # ever reaching the paper.
+    _l4b_final = getattr(getattr(config, "experiment", None), "llm4ad_boost", None)
+    _l4b_enabled = bool(
+        _l4b_final is not None and getattr(_l4b_final, "enabled", False)
+    )
+    _legacy_baseline = stage_dir / "legacy_refine_baseline"
+    if _l4b_enabled:
+        # 1. Snapshot the refined output as the comparison baseline.
+        try:
+            import shutil as _sh_clean_baseline
+
+            if _legacy_baseline.exists():
+                _sh_clean_baseline.rmtree(_legacy_baseline, ignore_errors=True)
+            _sh_clean_baseline.copytree(final_dir, _legacy_baseline)
+            _legacy_result = {
+                "generated": _utcnow_iso(),
+                "source": "iterative_refine",
+                "metric_key": metric_key,
+                "metric_direction": metric_direction,
+                "best_metric": best_metric,
+                "best_version": best_version,
+                "refinement_log": str(stage_dir / "refinement_log.json"),
+            }
+            (stage_dir / "legacy_refine_result.json").write_text(
+                json.dumps(_legacy_result, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            log["legacy_refine_baseline"] = {
+                "dir": str(_legacy_baseline),
+                "result_json": str(stage_dir / "legacy_refine_result.json"),
+                "best_metric": best_metric,
+                "note": (
+                    "Refinement output snapshotted before llm4ad promotion; it is "
+                    "the comparison baseline, not the final artifact."
+                ),
+            }
+            logger.info(
+                "Stage 13: snapshotted refinement output as %s (best_metric=%s)",
+                _legacy_baseline,
+                f"{best_metric:.6g}" if best_metric is not None else "N/A",
+            )
+        except OSError as _baseline_err:
+            logger.warning(
+                "Stage 13: could not snapshot refinement baseline: %s",
+                _baseline_err,
+            )
+
     artifacts = ["refinement_log.json", "experiment_final/"]
+    if _l4b_enabled and _legacy_baseline.is_dir():
+        # Keep the refinement snapshot as a first-class artifact so the
+        # comparison baseline survives into the run directory for review.
+        artifacts += ["legacy_refine_baseline/", "legacy_refine_result.json"]
+    artifacts += _generate_llm4ad_task_packages(
+        stage_dir, run_dir, config, exp_dir_text, log
+    )
+
+    # 3. Promote evolved algorithms into experiment_final/ (llm4ad mode only,
+    #    and only when evolution actually produced a usable package).
+    if _l4b_enabled and "evolution_results/" in artifacts:
+        _evo_dir = stage_dir / "evolution_results"
+        # llm4ad evolved from the CLEAN stage-10 code, so the base must also be
+        # the clean stage-10 code — NOT the refined experiment_final/ that was
+        # just snapshotted. Rebuild from that clean source.
+        _clean_exp = _read_prior_artifact(run_dir, "experiment/")
+        if _clean_exp and Path(_clean_exp).is_dir():
+            # Promote must use the SAME single source of truth as task-package
+            # build (see _generate_llm4ad_task_packages): config override, else
+            # the generated code's METRIC_DEF declaration. Falling back to a
+            # hard-coded "minimize" here would judge a maximize metric that the
+            # evolution optimised the other way, silently discarding real gains.
+            from researchclaw.pipeline._helpers import resolve_metric_direction
+            _metric_direction = resolve_metric_direction(config, Path(_clean_exp))
+            # Complete census: every algorithm the run attempted to evolve, keyed
+            # to its per-package error message ("" = ran to completion). Derived
+            # from the evolution log so an algorithm that failed to evolve is
+            # still reported as failed in llm4ad_comparison.json rather than
+            # dropped (see _promote_llm4ad_to_experiment_final).
+            _attempted: dict[str, str] = {}
+            for _r in (log.get("evolution") or {}).get("results", []):
+                if isinstance(_r, dict) and _r.get("algo"):
+                    _attempted[str(_r["algo"])] = str(_r.get("error_message") or "")
+            _n, _comparison = _promote_llm4ad_to_experiment_final(
+                Path(_clean_exp), _evo_dir, final_dir,
+                metric_direction=_metric_direction,
+                attempted_algos=_attempted,
+            )
+            # Persist the per-algo evolvability comparison so reviewers can see
+            # which evolved algorithms were actually promoted into experiment_final/.
+            _cmp_path = stage_dir / "llm4ad_comparison.json"
+            try:
+                _cmp_path.write_text(
+                    json.dumps(
+                        {
+                            "generated": _utcnow_iso(),
+                            "metric_direction": _metric_direction,
+                            "base": _clean_exp,
+                            "n_promoted": _n,
+                            "algorithms": _comparison,
+                        },
+                        ensure_ascii=False, indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError as _cmp_err:
+                logger.warning(
+                    "Stage 13: could not write llm4ad_comparison.json: %s", _cmp_err,
+                )
+            else:
+                artifacts.append("llm4ad_comparison.json")
+            log["llm4ad_promoted"] = {
+                "n_algorithms_overlaid": _n,
+                "n_algorithms_total": len(_comparison),
+                "base": _clean_exp,
+                "metric_direction": _metric_direction,
+                "comparison": _comparison,
+                "note": (
+                    "only evolved <algo>.py that beat their clean baseline under the "
+                    "experiment's own evaluator protocol are overlaid into "
+                    "experiment_final/; main.py, data/, other algorithms come from "
+                    "clean stage-10 code"
+                ),
+            }
+            # Keep experiment_final.py consistent with the promoted main.py.
+            _promoted_main = final_dir / "main.py"
+            if _promoted_main.is_file():
+                (stage_dir / "experiment_final.py").write_text(
+                    _promoted_main.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+            _write_refinement_log()
+        else:
+            # evolution_results/ exists but there is no clean stage-10 experiment
+            # to overlay onto. This is not "evolution found nothing" — promote
+            # never ran — so say so, or the run reads as an unexplained 0-promoted.
+            logger.warning(
+                "Stage 13: LLM4AD evolution produced results under %s, but no "
+                "clean experiment/ directory was found under %s; promote was "
+                "skipped, so experiment_final/ contains no evolved algorithm.",
+                _evo_dir, run_dir,
+            )
+
     artifacts.extend(
         entry["version_dir"]
         for entry in log["iterations"]
