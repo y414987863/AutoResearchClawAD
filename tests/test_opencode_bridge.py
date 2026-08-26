@@ -290,19 +290,18 @@ class TestOpenCodeBridge:
         assert "requirements.txt" in files
         assert "main.py" in files
 
-    def test_collect_files_flattens_subdirectories(self, tmp_path):
-        """Files in subdirs should be flattened to basenames (BUG-D fix)."""
+    def test_collect_files_preserves_subdirectories(self, tmp_path):
+        """Files in subdirs keep their relative path (LLM4AD layout supported)."""
         src = tmp_path / "src"
         src.mkdir()
         (src / "model.py").write_text("class Model: pass")
         (src / "utils.py").write_text("def helper(): pass")
         (tmp_path / "main.py").write_text("from model import Model")
         files = OpenCodeBridge._collect_files(tmp_path)
-        # Keys should be flat basenames, not paths like "src/model.py"
-        assert "model.py" in files
-        assert "utils.py" in files
+        # Keys keep relative subdir paths, not flat basenames.
+        assert "src/model.py" in files
+        assert "src/utils.py" in files
         assert "main.py" in files
-        assert not any("/" in k for k in files)
 
     def test_collect_files_root_takes_priority_over_subdir(self, tmp_path):
         """Root-level file wins when basename collides with subdir file."""

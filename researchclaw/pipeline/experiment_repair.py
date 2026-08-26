@@ -33,9 +33,12 @@ logger = logging.getLogger(__name__)
 
 MAX_REPAIR_CYCLES = 3
 
-# Regex for extracting ```python filename.py\n...\n``` blocks from LLM output
+# Regex for extracting ```python filename.py\n...\n``` blocks from LLM output.
+# The language-tag/path separator is optional whitespace OR a colon, so
+# ```python:main.py is recognized too — otherwise it fell through to
+# _UNNAMED_BLOCK_RE and every file overwrote main.py.
 _CODE_BLOCK_RE = re.compile(
-    r"```(?:python)?\s*([\w./\\-]+\.(?:py|txt))\s*\n(.*?)```",
+    r"```(?:python)?[^\S\n]*:?[^\S\n]*([\w./\\-]+\.(?:py|txt))[^\S\n]*\n(.*?)```",
     re.DOTALL,
 )
 # Fallback: unnamed python blocks

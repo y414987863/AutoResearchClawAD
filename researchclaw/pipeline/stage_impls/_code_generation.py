@@ -224,6 +224,90 @@ def _check_rl_compatibility(code: str) -> list[str]:
     return errors
 
 
+def _check_llm4ad_structure(files: dict[str, str]) -> list[str]:
+    """Validate that generated files satisfy the LLM4AD task-package layout.
+
+    Returns deficiency strings; empty means the structure is package-ready (one
+    evolvable module per algorithm, EVOLVE markers, static data/, and a main.py
+    supporting the ``--algorithm`` / importlib / primary-metric contract).
+    """
+    problems: list[str] = []
+
+    algo_files = [
+        k for k in files
+        if k.startswith("algorithms/") and k.endswith(".py")
+    ]
+    if not algo_files:
+        problems.append(
+            "LLM4AD_STRUCTURE: no `algorithms/<algo>/<algo>.py` found — each "
+            "evolvable algorithm must live in its own subdirectory."
+        )
+
+    for k in algo_files:
+        parts = k.split("/")
+        if len(parts) < 3 or parts[-2] != parts[-1][: -len(".py")]:
+            problems.append(
+                f"LLM4AD_STRUCTURE: `{k}` — file name must match its directory "
+                "name (algorithms/<algo>/<algo>.py)."
+            )
+        code = files[k]
+        if "EVOLVE_START" not in code or "EVOLVE_END" not in code:
+            problems.append(
+                f"LLM4AD_STRUCTURE: `{k}` missing EVOLVE_START/EVOLVE_END markers."
+            )
+        if "def optimize(" not in code:
+            problems.append(
+                f"LLM4AD_STRUCTURE: `{k}` missing `def optimize(instance, seed)`."
+            )
+
+    if not any(k.startswith("data/") and k.endswith(".json") for k in files):
+        problems.append(
+            "LLM4AD_STRUCTURE: no `data/*.json` instance files — static "
+            "instances must be generated once and shipped with the code."
+        )
+
+    main_code = files.get("main.py", "")
+    if not main_code:
+        problems.append(
+            "LLM4AD_STRUCTURE: missing `main.py` entry point."
+        )
+    else:
+        for needle, label in (
+            ("--algorithm", "`--algorithm` CLI argument"),
+            ("importlib", "dynamic `importlib` loading"),
+            ("primary_metric", "`primary_metric` output"),
+            ('if __name__ == "__main__":', "`if __name__ == \"__main__\":` entry guard"),
+        ):
+            if needle not in main_code:
+                problems.append(
+                    f"LLM4AD_STRUCTURE: main.py missing {label}."
+                )
+
+    # Stage-13 imports these symbols BY NAME; a missing export fails every
+    # algorithm at package-build time (after Stage 10). Check the code text
+    # rather than execute it — importing would run arbitrary generated code.
+    for mod, needles, label in (
+        ("benchmarks.py", ("def get_bounds(",), "`get_bounds(func_name, dim)`"),
+        ("stats_utils.py", ("SEEDS", "mean_std", "rng_from_instance"),
+         "`SEEDS`, `mean_std`, `rng_from_instance`"),
+        # evaluator.py is the shared instance-level metric used by BOTH main.py
+        # and the package runner; without these the runner cannot aggregate.
+        ("evaluator.py", ("PRIMARY_METRIC", "prepare_start", "evaluate_instance"),
+         "`PRIMARY_METRIC`, `prepare_start`, `evaluate_instance`"),
+    ):
+        code = files.get(mod, "")
+        # ``needles`` holds only the symbols/text that must appear in the module;
+        # ``label`` is the human-readable name used in the message.
+        missing = [n for n in needles if n not in code]
+        if missing:
+            problems.append(
+                f"LLM4AD_STRUCTURE: {mod} missing {label} — "
+                f"the task-package runner imports it by name."
+            )
+
+    return problems
+
+
 def _execute_code_generation(
     stage_dir: Path,
     run_dir: Path,
@@ -486,6 +570,23 @@ def _execute_code_generation(
         "- The experiment MUST be self-contained and runnable without GPU.\n"
     )
 
+    # --- LLM4AD task-package structure guidance (all channels) -----------
+    # Injected before the Beast/CodeAgent/Legacy dispatch so every channel
+    # that consumes extra_guidance carries the LLM4AD structure requirement.
+    _l4b = getattr(config.experiment, "llm4ad_boost", None)
+    if (
+        _l4b is not None
+        and getattr(_l4b, "enabled", False)
+        and config.experiment.mode in ("sandbox", "docker")
+    ):
+        try:
+            extra_guidance += _pm.block("llm4ad_task_package_guidance")
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "llm4ad_task_package_guidance block unavailable; skipping",
+                exc_info=True,
+            )
+
     # --- Code generation: Beast Mode → CodeAgent → Legacy single-shot ---
     _code_agent_active = False
     _beast_mode_used = False
@@ -581,6 +682,9 @@ def _execute_code_generation(
                     json.dumps(
                         {
                             "success": _oc_result.success,
+                            "recovered_from_failure": (
+                                _oc_result.recovered_from_failure
+                            ),
                             "elapsed_sec": _oc_result.elapsed_sec,
                             "files": list(_oc_result.files.keys()),
                             "error": _oc_result.error,
@@ -596,12 +700,44 @@ def _execute_code_generation(
                     files = _oc_result.files
                     _beast_mode_used = True
                     _code_agent_active = True  # skip legacy path
-                    logger.info(
-                        "Beast mode: SUCCESS — %d files in %.1fs",
-                        len(files),
-                        _oc_result.elapsed_sec,
-                    )
+                    if _oc_result.recovered_from_failure:
+                        # BUG-03: every OpenCode attempt failed; these files
+                        # were salvaged from a killed/timed-out run and the
+                        # agent never validated them. They still go through the
+                        # validation + repair loop below, but flag it loudly so
+                        # a downstream failure is attributable.
+                        logger.warning(
+                            "Beast mode: SALVAGED — %d files recovered from a "
+                            "FAILED OpenCode run (never agent-validated); "
+                            "relying on stage-10 validation/repair",
+                            len(files),
+                        )
+                    else:
+                        logger.info(
+                            "Beast mode: SUCCESS — %d files in %.1fs",
+                            len(files),
+                            _oc_result.elapsed_sec,
+                        )
                 else:
+                    if _oc_cfg.require_success:
+                        # OpenCode is the intended sole generator and it
+                        # failed. A fallback artifact would be a different
+                        # (usually weaker) channel — degrade loudly instead of
+                        # silently blending quality. Mark beast mode as "used"
+                        # so the Legacy fallback below is not reached.
+                        logger.error(
+                            "Beast mode: FAILED (%s) and "
+                            "opencode.require_success=true — failing Stage 10 "
+                            "instead of falling back",
+                            _oc_result.error or "unknown error",
+                        )
+                        _beast_mode_used = True
+                        return StageResult(
+                            stage=Stage.CODE_GENERATION,
+                            status=StageStatus.FAILED,
+                            artifacts=(),
+                            evidence_refs=(),
+                        )
                     logger.warning(
                         "Beast mode: FAILED (%s) — falling back to CodeAgent",
                         _oc_result.error or "unknown error",
@@ -765,6 +901,45 @@ def _execute_code_generation(
                 max_tokens=32768,
             )
             files = _extract_multi_file_blocks(resp.content)
+        if files and "main.py" not in files:
+            # _extract_multi_file_blocks no longer fabricates a main.py by
+            # renaming an arbitrary file (that corrupted two files at once and
+            # satisfied every `"main.py" in files` guard downstream). Instead,
+            # re-ask with an explicit correction — a named-but-entry-point-less
+            # response is a formatting failure, not a content failure.
+            logger.warning(
+                "Stage 10: LLM returned %d file(s) but no main.py (%s). "
+                "Retrying with an explicit entry-point requirement.",
+                len(files),
+                ", ".join(sorted(files)),
+            )
+            resp = _chat_with_prompt(
+                llm,
+                sp.system,
+                sp.user
+                + (
+                    "\n\nIMPORTANT — your previous reply was REJECTED: it "
+                    f"defined {', '.join(sorted(files))} but no `main.py`.\n"
+                    "Re-emit ALL files, and include `main.py` as the runnable "
+                    "entry point with an `if __name__ == \"__main__\":` block. "
+                    "Label every block as ```python filename:<path>. Do NOT "
+                    "rename an existing file to main.py — write a real entry "
+                    "point that imports and drives the others."
+                ),
+                json_mode=sp.json_mode,
+                max_tokens=_code_max_tokens,
+            )
+            _retry_files = _extract_multi_file_blocks(resp.content)
+            if _retry_files and "main.py" in _retry_files:
+                files = _retry_files
+            else:
+                # Keep the original files rather than the entry-point-less
+                # retry; the fallback experiment below supplies a main.py only
+                # when `files` is empty, so log loudly that this will fail.
+                logger.error(
+                    "Stage 10: retry still produced no main.py — the generated "
+                    "package has no entry point and will fail at execution"
+                )
         if not files:
             logger.warning(
                 "R13-2: _extract_multi_file_blocks returned empty. "
@@ -806,6 +981,16 @@ def _execute_code_generation(
 
     # --- Validate each file + auto-repair loop ---
     all_valid = True
+
+    # --- LLM4AD task-package structure validation (all channels) ---
+    _l4b_v = getattr(config.experiment, "llm4ad_boost", None)
+    if _l4b_v is not None and getattr(_l4b_v, "enabled", False):
+        _l4b_problems = _check_llm4ad_structure(files)
+        for _prob in _l4b_problems:
+            logger.warning("Stage 10: %s", _prob)
+            validation_log.append(_prob)
+        if _l4b_problems:
+            all_valid = False
     attempt = 0
     for fname, code in list(files.items()):
         # Skip non-Python files (requirements.txt, setup.py, etc.)
@@ -900,8 +1085,13 @@ def _execute_code_generation(
     # local module that doesn't exist in the files dict.  This catches the
     # case where Beast Mode/CodeAgent produced an intermediate file that
     # got lost during repair iterations.
+    # Both the bare module name and the full relative path are known, so a
+    # nested file like algorithms/nm/nm.py satisfies `import nm` (which is how
+    # main.py's importlib loader reaches it) without a false positive.
     _known_modules = {
-        f.replace(".py", "") for f in files if f.endswith(".py")
+        Path(f).stem for f in files if f.endswith(".py")
+    } | {
+        f[: -len(".py")].replace("/", ".") for f in files if f.endswith(".py")
     }
     _stdlib_and_common = {
         "os", "sys", "json", "math", "time", "copy", "re", "random",
@@ -933,7 +1123,9 @@ def _execute_code_generation(
     exp_dir = stage_dir / "experiment"
     exp_dir.mkdir(parents=True, exist_ok=True)
     for fname, code in files.items():
-        (exp_dir / fname).write_text(code, encoding="utf-8")
+        _wp = exp_dir / fname
+        _wp.parent.mkdir(parents=True, exist_ok=True)
+        _wp.write_text(code, encoding="utf-8")
 
     # --- Write validation report ---
     if validation_log or not all_valid:
@@ -1045,10 +1237,23 @@ def _execute_code_generation(
                 max_tokens=_code_max_tokens,
             )
             repaired = _extract_multi_file_blocks(repair_resp.content)
-            if repaired and "main.py" in repaired:
-                files = repaired
-                for fname, code in files.items():
-                    (exp_dir / fname).write_text(code, encoding="utf-8")
+            # A repair reply legitimately contains only the files it changed —
+            # requiring main.py here would discard every targeted fix. Accept
+            # any subset whose names we already know, and merge rather than
+            # replace so untouched modules survive (cf. BUG-106 in Stage 13).
+            _known = {k: v for k, v in (repaired or {}).items() if k in files}
+            _unknown = sorted(set(repaired or {}) - set(files))
+            if _unknown:
+                logger.warning(
+                    "Stage 10: deep repair returned unknown file(s) %s — ignored",
+                    ", ".join(_unknown),
+                )
+            if _known:
+                files = {**files, **_known}
+                for fname, code in _known.items():
+                    _wp = exp_dir / fname
+                    _wp.parent.mkdir(parents=True, exist_ok=True)
+                    _wp.write_text(code, encoding="utf-8")
                 # Re-check after repair
                 deep_warnings_after = deep_validate_files(files)
                 fixed = len(critical_deep) - len([
@@ -1181,10 +1386,24 @@ def _execute_code_generation(
                             max_tokens=_code_max_tokens,
                         )
                         fixed_files = _extract_multi_file_blocks(fix_resp.content)
-                        if fixed_files and "main.py" in fixed_files:
-                            files = fixed_files
-                            for fname, code in files.items():
-                                (exp_dir / fname).write_text(code, encoding="utf-8")
+                        # Partial reply is normal — see deep-repair note above.
+                        _fx = {
+                            k: v for k, v in (fixed_files or {}).items()
+                            if k in files
+                        }
+                        _fx_unknown = sorted(set(fixed_files or {}) - set(files))
+                        if _fx_unknown:
+                            logger.warning(
+                                "Stage 10: review-fix returned unknown file(s) "
+                                "%s — ignored",
+                                ", ".join(_fx_unknown),
+                            )
+                        if _fx:
+                            files = {**files, **_fx}
+                            for fname, code in _fx.items():
+                                _wp = exp_dir / fname
+                                _wp.parent.mkdir(parents=True, exist_ok=True)
+                                _wp.write_text(code, encoding="utf-8")
                             logger.info(
                                 "Stage 10: Code fixed after review "
                                 "(was %d/10, %d critical issues)",
@@ -1346,7 +1565,9 @@ def _execute_code_generation(
                         continue
                     files = regen_files
                     for fname, code in files.items():
-                        (exp_dir / fname).write_text(code, encoding="utf-8")
+                        _wp = exp_dir / fname
+                        _wp.parent.mkdir(parents=True, exist_ok=True)
+                        _wp.write_text(code, encoding="utf-8")
                     # Re-check alignment on regenerated code (BUG-171 fix)
                     _rc_inv = []
                     for _fn, _cd in files.items():
@@ -1460,7 +1681,9 @@ def _execute_code_generation(
                     if repaired_files and "main.py" in repaired_files:
                         files = repaired_files
                         for fname, code in files.items():
-                            (exp_dir / fname).write_text(code, encoding="utf-8")
+                            _wp = exp_dir / fname
+                            _wp.parent.mkdir(parents=True, exist_ok=True)
+                            _wp.write_text(code, encoding="utf-8")
                         logger.info(
                             "Stage 10: Ablation repair applied — "
                             "rewrote duplicate conditions"

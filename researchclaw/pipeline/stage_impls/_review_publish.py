@@ -2468,10 +2468,19 @@ def _execute_export_publish(
         code_dir.mkdir(parents=True, exist_ok=True)
         all_code_combined = ""
         code_file_names: list[str] = []
-        for src in sorted(Path(exp_final_dir_path).glob("*.py")):
-            (code_dir / src.name).write_bytes(src.read_bytes())
+        # Recurse so llm4ad-mode nested modules (algorithms/<algo>/<algo>.py,
+        # data/*.json) are packaged too — a flat glob dropped them, leaving a
+        # code package whose main.py imported a missing algorithm. Keep each
+        # file's path relative to the experiment root so same-named files in
+        # different subdirs don't collide.
+        exp_root = Path(exp_final_dir_path)
+        for src in sorted(exp_root.rglob("*.py")):
+            rel = src.relative_to(exp_root)
+            dst = code_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(src.read_bytes())
             all_code_combined += src.read_text(encoding="utf-8") + "\n"
-            code_file_names.append(src.name)
+            code_file_names.append(rel.as_posix())
 
         # Detect dependencies from all files
         detected: set[str] = set()

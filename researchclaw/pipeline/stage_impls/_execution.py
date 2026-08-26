@@ -573,6 +573,392 @@ def _execute_experiment_run(
     )
 
 
+def _generate_llm4ad_task_packages(
+    stage_dir: Path,
+    run_dir: Path,
+    config: Any,
+    exp_dir_text: str | None,
+    log: dict,
+) -> tuple[str, ...]:
+    """Generate LLM4AD task packages from the stage-10/12 experiment directory.
+
+    Deterministic template generation (no LLM, no evolution). Returns extra
+    artifact names to append to the StageResult; log is mutated in place.
+    Non-fatal: any failure logs a warning and returns nothing.
+    """
+    _l4b = getattr(getattr(config, "experiment", None), "llm4ad_boost", None)
+    if _l4b is None or not getattr(_l4b, "enabled", False):
+        return ()
+
+    try:
+        from researchclaw.pipeline.llm4ad_task_packages import (
+            generate_task_packages,
+        )
+    except Exception as _l4b_imp:  # pragma: no cover - defensive
+        logger.warning(
+            "Stage 13: llm4ad task-package generator unavailable: %s",
+            _l4b_imp,
+        )
+        return ()
+
+    # Inject the live LLM connection settings into each package's config.yaml.
+    _llm = getattr(config, "llm", None)
+    _llm_config: dict = {}
+    if _llm is not None:
+        try:
+            _llm_config = {
+                "base_url": getattr(_llm, "base_url", "") or "",
+                "api_key": getattr(_llm, "api_key", "") or "",
+                "model": getattr(_llm, "primary_model", "") or "",
+                "provider": getattr(_llm, "provider", "") or "",
+                "timeout": getattr(_llm, "timeout_sec", None),
+            }
+            # api_key may live in an env var and be empty on the config object.
+            if not _llm_config.get("api_key"):
+                _env = getattr(_llm, "api_key_env", "") or ""
+                if _env:
+                    import os as _os
+                    _llm_config["api_key"] = _os.environ.get(_env, "") or ""
+        except Exception as _l4b_cfg:
+            logger.warning(
+                "Stage 13: could not read LLM config for task package: %s",
+                _l4b_cfg,
+            )
+            _llm_config = {}
+
+    # Evolution must start from the CLEAN stage-10 experiment/, never the
+    # refined experiment_final/ that ``exp_dir_text`` points at on PIVOT
+    # rollback (BUG-58) — that copy may carry LLM-modified data/metrics.
+    # Fall back to exp_dir_text only when no clean directory exists.
+    _tp_exp = _read_prior_artifact(run_dir, "experiment/") or exp_dir_text
+    if not _tp_exp or not Path(_tp_exp).is_dir():
+        logger.warning(
+            "Stage 13: no experiment directory found for LLM4AD task "
+            "package generation (%s); skipping", _tp_exp,
+        )
+        return ()
+
+    try:
+        _tp_out = stage_dir / "task_packages"
+        _evo_cfg = _l4b_dataclass_to_dict(getattr(_l4b, "evolution", None))
+        _res_cfg = _l4b_dataclass_to_dict(getattr(_l4b, "resources", None))
+        # Live topic from config.arc.yaml becomes the LLM4AD `background` the
+        # sampler feeds to the LLM; the explicit metric_direction overrides the
+        # name-based inference so evolution optimises the right way.
+        _topic = getattr(getattr(config, "research", None), "topic", "") or ""
+        _direction = getattr(getattr(config, "experiment", None), "metric_direction", "") or ""
+        # Optional eval-budget override so evolution gets headroom the stage-10
+        # instances (max_evals=200) did not leave. 0 = keep as generated.
+        _max_evals = int(_res_cfg.get("max_evals", 0) or 0)
+        _manifests = generate_task_packages(
+            Path(_tp_exp), _tp_out, _llm_config, _evo_cfg, _res_cfg,
+            background=_topic, metric_direction=_direction,
+            max_evals=_max_evals,
+        )
+        logger.info(
+            "Stage 13: generated %d LLM4AD task package(s) under %s",
+            len(_manifests), _tp_out,
+        )
+        log["task_packages"] = {
+            "dir": str(_tp_out),
+            "count": len(_manifests),
+            "packages": [
+                {
+                    "algo": m.algo,
+                    "path": m.path,
+                    "primary_metric": m.primary_metric,
+                    "metric_direction": m.metric_direction,
+                    "n_instances": m.n_instances,
+                }
+                for m in _manifests
+            ],
+        }
+
+        # --- Run LLM4AD evolution on the generated packages (optional) ---
+        artifact_extra = _run_llm4ad_evolution(stage_dir, _tp_out, config, log)
+        return ("task_packages/",) + artifact_extra
+    except Exception as _l4b_exc:
+        # exc_info matters here: this handler previously swallowed a plain
+        # NameError in the evolution path and reported it as a business
+        # failure, so the bug survived every run without a traceback.
+        logger.warning(
+            "Stage 13: LLM4AD task-package generation failed: %s",
+            _l4b_exc,
+            exc_info=True,
+        )
+        log["task_packages_error"] = f"{type(_l4b_exc).__name__}: {_l4b_exc}"
+        if not bool(getattr(_l4b, "fail_silently", True)):
+            raise
+        return ()
+
+
+def _l4b_dataclass_to_dict(obj: Any) -> dict:
+    """Shallow-convert a frozen llm4ad_boost sub-config to a plain dict."""
+    if obj is None:
+        return {}
+    try:
+        from dataclasses import asdict, is_dataclass
+
+        if is_dataclass(obj):
+            return asdict(obj)
+    except Exception:  # noqa: BLE001 - defensive, config shape is user-supplied
+        pass
+    return {
+        k: getattr(obj, k)
+        for k in dir(obj)
+        if not k.startswith("_") and not callable(getattr(obj, k, None))
+    }
+
+
+def _resolve_llm4ad_cmd(config: Any) -> str:
+    """Resolve the ``llm4ad`` executable.
+
+    Prefers an on-PATH ``llm4ad``; on Windows, falls back to the venv's
+    Scripts/llm4ad.exe if present. Returns the command name otherwise so the
+    Runner reports a clean 'not found' error.
+    """
+    import shutil as _sh
+
+    found = _sh.which("llm4ad")
+    if found:
+        return found
+    # Windows venv layout: <venv>/Scripts/llm4ad.exe (or equivalent on PATH).
+    _py = getattr(getattr(config, "experiment", None), "sandbox", None)
+    _py_path = getattr(_py, "python_path", "") or ""
+    if _py_path:
+        exe = Path(_py_path).resolve().parent / ("llm4ad.exe" if Path(_py_path).suffix == ".exe" else "llm4ad")
+        if exe.exists():
+            return str(exe)
+        # python_path may be a forward-slash or bare name; try the venv root.
+        venv = Path(_py_path).resolve().parent
+        for cand in (venv / "llm4ad.exe", venv / "llm4ad"):
+            if cand.exists():
+                return str(cand)
+    return "llm4ad"
+
+
+def _run_llm4ad_evolution(
+    stage_dir: Path, packages_dir: Path, config: Any, log: dict
+) -> tuple[str, ...]:
+    """Run llm4ad evolution on task packages; degrade gracefully on failure.
+
+    Returns extra artifact names ('' or ('evolution_results/',)). Mutates log.
+    Honors ``config.experiment.llm4ad_boost.fail_silently`` and ``resources``.
+    """
+    import shutil
+
+    _l4b = getattr(getattr(config, "experiment", None), "llm4ad_boost", None)
+    if _l4b is None or not getattr(_l4b, "enabled", False):
+        return ()
+    if not packages_dir.is_dir() or not any(packages_dir.glob("*/config.yaml")):
+        logger.info("Stage 13: no task packages to evolve; skipping LLM4AD evolution")
+        return ()
+
+    try:
+        from researchclaw.pipeline.llm4ad_task_packages import (
+            run_evolution_on_packages,
+        )
+    except Exception as _eval_imp:  # pragma: no cover - defensive
+        logger.warning("Stage 13: llm4ad evolution runner unavailable: %s", _eval_imp)
+        return ()
+
+    cmd = _resolve_llm4ad_cmd(config)
+    _res = getattr(_l4b, "resources", None)
+    total_budget = int(getattr(_res, "time_budget_sec", 1800) or 1800)
+    fail_silently = bool(getattr(_l4b, "fail_silently", True))
+
+    # Per-package wall-clock budget. When ``per_package_timeout_sec`` is set
+    # (> 0) it wins — the real failure mode last run was NOT a small budget but
+    # every package being killed mid-generation because total_budget was divided
+    # across N packages (1800//6 = 300s, less than one generation). A long
+    # evolution deserves its own ceiling per package; otherwise fall back to the
+    # old total-budget division so prior configs keep working unchanged.
+    _n_pkgs = max(1, len(list(packages_dir.glob("*/config.yaml"))))
+    _per_pkg = int(getattr(_res, "per_package_timeout_sec", 0) or 0)
+    if _per_pkg > 0:
+        timeout = max(60, _per_pkg)
+    else:
+        timeout = max(60, total_budget // _n_pkgs)
+
+    # Provider env vars: pass through (base_url/api_key already in config.yaml,
+    # but keep ambient keys available to the subprocess).
+    env: dict[str, Any] = {}
+    _llm = getattr(config, "llm", None)
+    if _llm is not None and getattr(_llm, "api_key", ""):
+        env["OPENAI_API_KEY"] = getattr(_llm, "api_key", "")
+    if _llm is not None and getattr(_llm, "api_key_env", "") and getattr(_llm, "api_key_env", "") not in env:
+        import os as _os
+        _k = getattr(_llm, "api_key_env", "")
+        if _os.environ.get(_k):
+            env[_k] = _os.environ[_k]
+
+    logger.info(
+        "Stage 13: running LLM4AD evolution on %d package(s) under %s "
+        "(cmd=%s, per-package timeout=%ds%s)",
+        _n_pkgs, packages_dir, cmd, timeout,
+        f" of {total_budget}s total" if _per_pkg <= 0 else "",
+    )
+    try:
+        results = run_evolution_on_packages(
+            packages_dir, llm4ad_cmd=cmd, timeout_sec=timeout, env=env or None
+        )
+    except Exception as _eval_exc:
+        logger.warning(
+            "Stage 13: LLM4AD evolution failed: %s", _eval_exc, exc_info=True
+        )
+        log["evolution_error"] = f"{type(_eval_exc).__name__}: {_eval_exc}"
+        if not fail_silently:
+            raise
+        return ()
+
+    ok = [r for r in results if r.success]
+    # LLM4AD's MetricType.MINIMIZE negates the metric in compute_score, so the
+    # logged best_score is sign-flipped vs the raw objective. Surface both + the
+    # configured direction: a best_score far ABOVE the baseline (or 0.0 from a
+    # failed run) means evolution optimised the WRONG way. Print the raw metric
+    # so we can sanity-check the sign ourselves.
+    _direction_cfg = str(
+        getattr(getattr(config, "experiment", None), "metric_direction", "") or ""
+    ).strip().upper()
+    for r in ok:
+        if r.best_score is None:
+            continue
+        _raw = (r.best_metrics or {}).get("mean_best_objective_value")
+        logger.info(
+            "Stage 13: %s best_score=%.6g (raw metric=%s, configured direction=%s) — "
+            "MINIMIZE expects best_score <= 0 (raw objective >= 0, negated)",
+            r.algo, r.best_score,
+            f"{_raw:.6g}" if _raw is not None else "n/a",
+            _direction_cfg or "inferred",
+        )
+    log["evolution"] = {
+        "cmd": cmd,
+        "timeout_sec": timeout,
+        "total_budget_sec": total_budget,
+        "metric_direction": _direction_cfg,
+        "total": len(results),
+        "succeeded": len(ok),
+        "failed": len(results) - len(ok),
+        "results": [
+            {
+                "algo": r.algo,
+                "success": r.success,
+                "best_score": r.best_score,
+                "best_metrics": r.best_metrics,
+                "best_code_dir": r.best_code_dir,
+                "run_id": r.run_id,
+                "error_message": r.error_message,
+            }
+            for r in results
+        ],
+    }
+    if not ok:
+        logger.warning(
+            "Stage 13: LLM4AD evolution produced no successes (%d packages "
+            "attempted); first error: %s",
+            len(results),
+            next((r.error_message for r in results if r.error_message), "n/a"),
+        )
+        return ()
+
+    # Report the scores explicitly — a run whose best_score is None produced no
+    # measurable evidence of improvement, which is worth surfacing loudly.
+    _scored = [r for r in ok if r.best_score is not None]
+    if not _scored:
+        logger.warning(
+            "Stage 13: LLM4AD evolution succeeded but no best_score was "
+            "recovered (no best/metadata.json) — the run has no quantitative "
+            "result to report downstream"
+        )
+    else:
+        for r in _scored:
+            logger.info(
+                "Stage 13: LLM4AD best score for %s: %.6g (run_id=%s)",
+                r.algo, r.best_score, r.run_id,
+            )
+
+    # Materialise best evolved code to a stable evolution_results/ dir.
+    evo_out = stage_dir / "evolution_results"
+    evo_out.mkdir(parents=True, exist_ok=True)
+    for r in results:
+        if not r.success or not r.best_code_dir:
+            continue
+        src = Path(r.best_code_dir)
+        if not src.is_dir():
+            continue
+        dst = evo_out / r.algo
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+    log["evolution"]["results_dir"] = str(evo_out)
+    logger.info(
+        "Stage 13: LLM4AD evolution succeeded for %d/package(s); results under %s",
+        len(ok), evo_out,
+    )
+    return ("evolution_results/",)
+
+
+def _promote_llm4ad_to_experiment_final(
+    base_exp_dir: Path,
+    evolution_dir: Path,
+    final_dir: Path,
+) -> int:
+    """Overlay evolved algorithm modules onto a clean project directory.
+
+    Each ``evolution_results/<algo>/`` is an LLM4AD task package
+    (``<algo>.py`` next to run_single.py / evaluator.py / config.yaml / runs/ /
+    .git/), but downstream stages consume ``experiment_final/`` as a top-level
+    project (``main.py`` + ``algorithms/<algo>/<algo>.py`` + ``data/*.json``).
+    Copying the package wholesale would push llm4ad's scaffolding into the
+    artifact, so we rebuild ``final_dir`` from ``base_exp_dir`` (the clean
+    stage-10 code) and overlay ONLY ``algorithms/<algo>/<algo>.py``.
+
+    Returns the number of algorithm modules overlaid (0 means nothing promoted).
+    """
+    import shutil as _sh_promote
+
+    if not base_exp_dir.is_dir():
+        logger.warning(
+            "Stage 13: cannot promote llm4ad results — base experiment dir "
+            "missing: %s", base_exp_dir,
+        )
+        return 0
+
+    # Rebuild final_dir from the clean base (remove errant leftover, if any).
+    if final_dir.exists():
+        _sh_promote.rmtree(final_dir, ignore_errors=True)
+    _sh_promote.copytree(base_exp_dir, final_dir, symlinks=False)
+
+    n_promoted = 0
+    if not evolution_dir.is_dir():
+        return 0
+    for algo_pkg in sorted(evolution_dir.iterdir()):
+        if not algo_pkg.is_dir():
+            continue
+        algo_name = algo_pkg.name
+        # The evolved algorithm module sits at the package root as
+        # evolution_results/<algo>/<algo>.py.
+        evolved_src = algo_pkg / f"{algo_name}.py"
+        if not evolved_src.is_file():
+            continue
+        # Map back to the original layout: algorithms/<algo>/<algo>.py.
+        _dest = final_dir / "algorithms" / algo_name / f"{algo_name}.py"
+        _dest.parent.mkdir(parents=True, exist_ok=True)
+        _sh_promote.copy2(evolved_src, _dest)
+        n_promoted += 1
+        logger.info(
+            "Stage 13: promoted evolved %s/algorithms/%s/%s.py into experiment_final/",
+            algo_name, algo_name, algo_name,
+        )
+
+    if not n_promoted:
+        logger.warning(
+            "Stage 13: llm4ad evolution produced no overlayable algorithm "
+            "module — experiment_final/ left as the clean stage-10 code"
+        )
+    return n_promoted
+
+
 def _execute_iterative_refine(
     stage_dir: Path,
     run_dir: Path,
@@ -881,14 +1267,19 @@ def _execute_iterative_refine(
         exp_dir_text = _read_prior_artifact(run_dir, "experiment/")
     best_files: dict[str, str] = {}
     if exp_dir_text and Path(exp_dir_text).is_dir():
-        # BUG-EX-02: Load ALL text files (not just .py) — requirements.txt,
-        # setup.py, config files are needed for Docker sandbox phases.
-        for src_file in sorted(Path(exp_dir_text).iterdir()):
-            if src_file.is_file() and src_file.suffix in (
-                ".py", ".txt", ".yaml", ".yml", ".json", ".cfg", ".ini", ".sh",
+        # Load all text files (requirements.txt, setup.py, config etc. are
+        # needed for Docker sandbox phases), recursing so nested modules and
+        # data (algorithms/, data/*.json) survive into refinement.
+        _exp_root = Path(exp_dir_text)
+        for src_file in sorted(_exp_root.rglob("*")):
+            if not src_file.is_file():
+                continue
+            if src_file.suffix.lower().lstrip(".") in (
+                "py", "txt", "yaml", "yml", "json", "cfg", "ini", "sh",
             ):
+                _rel = src_file.relative_to(_exp_root).as_posix()
                 try:
-                    best_files[src_file.name] = src_file.read_text(encoding="utf-8")
+                    best_files[_rel] = src_file.read_text(encoding="utf-8")
                 except UnicodeDecodeError:
                     pass  # skip binary files
     if not best_files:
@@ -940,7 +1331,9 @@ def _execute_iterative_refine(
     def _write_project(target_dir: Path, project_files: dict[str, str]) -> None:
         target_dir.mkdir(parents=True, exist_ok=True)
         for fname, code in project_files.items():
-            (target_dir / fname).write_text(code, encoding="utf-8")
+            _wf = target_dir / fname
+            _wf.parent.mkdir(parents=True, exist_ok=True)
+            _wf.write_text(code, encoding="utf-8")
 
     # --- Helper: format all files for LLM context ---
     def _files_to_context(project_files: dict[str, str]) -> str:
@@ -1011,6 +1404,9 @@ def _execute_iterative_refine(
         )
         _write_refinement_log()
         artifacts = ("refinement_log.json", "experiment_final/")
+        artifacts += _generate_llm4ad_task_packages(
+            stage_dir, run_dir, config, exp_dir_text, log
+        )
         return StageResult(
             stage=Stage.ITERATIVE_REFINE,
             status=StageStatus.DONE,
@@ -1438,7 +1834,95 @@ def _execute_iterative_refine(
         log["ablation_identical_warning"] = True
     _write_refinement_log()
 
+    # ── LLM4AD comparison mode ─────────────────────────────────────────
+    # When llm4ad_boost is on, the refined output above is the comparison
+    # *baseline*, not the deliverable: snapshot it, let llm4ad evolve from the
+    # clean stage-10 code, then overlay its best algorithms into
+    # experiment_final/ for Stage 14+. Keeps a fabricated refinement pass from
+    # ever reaching the paper.
+    _l4b_final = getattr(getattr(config, "experiment", None), "llm4ad_boost", None)
+    _l4b_enabled = bool(
+        _l4b_final is not None and getattr(_l4b_final, "enabled", False)
+    )
+    _legacy_baseline = stage_dir / "legacy_refine_baseline"
+    if _l4b_enabled:
+        # 1. Snapshot the refined output as the comparison baseline.
+        try:
+            import shutil as _sh_clean_baseline
+
+            if _legacy_baseline.exists():
+                _sh_clean_baseline.rmtree(_legacy_baseline, ignore_errors=True)
+            _sh_clean_baseline.copytree(final_dir, _legacy_baseline)
+            _legacy_result = {
+                "generated": _utcnow_iso(),
+                "source": "iterative_refine",
+                "metric_key": metric_key,
+                "metric_direction": metric_direction,
+                "best_metric": best_metric,
+                "best_version": best_version,
+                "refinement_log": str(stage_dir / "refinement_log.json"),
+            }
+            (stage_dir / "legacy_refine_result.json").write_text(
+                json.dumps(_legacy_result, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            log["legacy_refine_baseline"] = {
+                "dir": str(_legacy_baseline),
+                "result_json": str(stage_dir / "legacy_refine_result.json"),
+                "best_metric": best_metric,
+                "note": (
+                    "Refinement output snapshotted before llm4ad promotion; it is "
+                    "the comparison baseline, not the final artifact."
+                ),
+            }
+            logger.info(
+                "Stage 13: snapshotted refinement output as %s (best_metric=%s)",
+                _legacy_baseline,
+                f"{best_metric:.6g}" if best_metric is not None else "N/A",
+            )
+        except OSError as _baseline_err:
+            logger.warning(
+                "Stage 13: could not snapshot refinement baseline: %s",
+                _baseline_err,
+            )
+
     artifacts = ["refinement_log.json", "experiment_final/"]
+    if _l4b_enabled and _legacy_baseline.is_dir():
+        # Keep the refinement snapshot as a first-class artifact so the
+        # comparison baseline survives into the run directory for review.
+        artifacts += ["legacy_refine_baseline/", "legacy_refine_result.json"]
+    artifacts += _generate_llm4ad_task_packages(
+        stage_dir, run_dir, config, exp_dir_text, log
+    )
+
+    # 3. Promote evolved algorithms into experiment_final/ (llm4ad mode only,
+    #    and only when evolution actually produced a usable package).
+    if _l4b_enabled and "evolution_results/" in artifacts:
+        _evo_dir = stage_dir / "evolution_results"
+        # llm4ad evolved from the CLEAN stage-10 code, so the base must also be
+        # the clean stage-10 code — NOT the refined experiment_final/ that was
+        # just snapshotted. Rebuild from that clean source.
+        _clean_exp = _read_prior_artifact(run_dir, "experiment/")
+        if _clean_exp and Path(_clean_exp).is_dir():
+            _n = _promote_llm4ad_to_experiment_final(
+                Path(_clean_exp), _evo_dir, final_dir
+            )
+            log["llm4ad_promoted"] = {
+                "n_algorithms_overlaid": _n,
+                "base": _clean_exp,
+                "note": (
+                    "algorithms/<algo>/<algo>.py overlaid from evolution_results/; "
+                    "main.py, data/, other algorithms come from clean stage-10 code"
+                ),
+            }
+            # Keep experiment_final.py consistent with the promoted main.py.
+            _promoted_main = final_dir / "main.py"
+            if _promoted_main.is_file():
+                (stage_dir / "experiment_final.py").write_text(
+                    _promoted_main.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+            _write_refinement_log()
+
     artifacts.extend(
         entry["version_dir"]
         for entry in log["iterations"]

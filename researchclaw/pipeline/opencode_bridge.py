@@ -12,6 +12,7 @@ invoked via ``opencode run --format json "prompt"``.  This module provides:
 from __future__ import annotations
 
 import ast
+import itertools
 import json
 import logging
 import os
@@ -159,13 +160,12 @@ def score_complexity(
     domain_score = min(domain_hits / 3.0, 1.0)
 
     # Signal 4: Condition count (weight 0.15)
-    # Look for numbered conditions, ablation mentions, variant mentions
+    # Numbered conditions/ablations/variants, plus baseline mentions.
     condition_pattern = re.compile(
         r"(?:condition|ablation|variant|experiment)\s*[\-_:]?\s*\d+",
         re.IGNORECASE,
     )
     condition_matches = len(condition_pattern.findall(combined))
-    # Also count bullet points in conditions/ablations sections
     condition_matches += combined.lower().count("baseline")
     condition_score = min(condition_matches / 8.0, 1.0)
 
@@ -231,33 +231,124 @@ class OpenCodeResult:
     opencode_log: str = ""
     elapsed_sec: float = 0.0
     error: str = ""
+    # True when ``files`` was salvaged from a workspace whose OpenCode run
+    # actually FAILED (timeout / non-zero exit). ``success`` is still True
+    # because a usable package was recovered, but the package was never validated
+    # by the agent itself — callers must not treat it as a clean generation.
+    recovered_from_failure: bool = False
 
 
+# Top-level modules that must NEVER be swapped into ``main.py`` even if they
+# carry a ``__main__`` guard. They have a fixed role in the LLM4AD layout —
+# ``run_single.py`` imports ``benchmarks``/``stats_utils`` by name — so
+# relocating their contents breaks the package. See _is_entry_swap_candidate.
+_ENTRY_SWAP_EXCLUDED = frozenset({
+    "benchmarks.py",
+    "evaluator.py",
+    "stats_utils.py",
+    "run_single.py",
+    "setup.py",
+    "conftest.py",
+})
+
+
+# The CLI prompt is passed as a single argv element, so it MUST stay short:
+# Windows caps a command line at 32767 chars and POSIX at ARG_MAX. The full
+# instructions therefore live in TASK.md inside the workspace (see
+# _TASK_MD_TEMPLATE) and this prompt only points at them. Keep additions here
+# to a few lines; put anything substantial in TASK.md instead.
 _MEGA_PROMPT_TEMPLATE = """\
-You are implementing a complete, runnable ML/science experiment.
+Implement the experiment described in this repository. Work autonomously.
 
-Read the files in the current workspace:
-- EXPERIMENT_PLAN.yaml — the full experiment design
-- GUIDANCE.md — topic, metric, environment constraints, domain-specific guidance
+Read these workspace files FIRST, in order:
+1. TASK.md — your task, requirements, and constraints (READ THIS FIRST)
+2. EXPERIMENT_PLAN.yaml — the experiment design to implement
+3. GUIDANCE.md — metric, environment, and domain constraints
 
-Your task:
-1. Design the file structure (main.py is the required entry point).
+Do NOT ask questions. No human will answer: this session is driven by an
+automated pipeline and any reply that asks a question instead of writing code
+is discarded as a failure. If a detail is unclear, pick a sensible default,
+note it in a comment, and continue.
+
+Your first action must be a tool call that reads TASK.md — never a text reply.
+You are done when main.py and its supporting modules exist and run.
+Writing no files is a failure.
+"""
+
+# Full instructions, written to the workspace as TASK.md. This is read by the
+# agent via a tool call, so it is not subject to the command-line length limit.
+_TASK_MD_TEMPLATE = """\
+# Task
+
+Implement a complete, runnable ML/science experiment in this repository.
+
+Read `EXPERIMENT_PLAN.yaml` for the experiment design (conditions, baselines,
+ablations, metrics) and `GUIDANCE.md` for the environment and domain
+constraints. Implement what the plan specifies — do not substitute a different
+method or dataset.
+
+## Requirements
+
+1. Design the file structure. `main.py` is the required entry point.
 2. Implement ALL files with complete, runnable code. No placeholders or TODOs.
-3. main.py must be the entry point and print the primary metric as:
-   {metric}: <value>
+3. `main.py` must print the primary metric as: `{metric}: <value>`
 4. Include numerical stability guards (gradient clipping, NaN detection, etc.).
 5. Use multi-seed evaluation (seeds 0, 1, 2) and report mean ± std.
-6. Each ablation/condition MUST be genuinely different — not copy-paste with a renamed variable.
-7. Implement a time guard: stop gracefully at 80% of the time budget ({time_budget_sec} seconds).
-8. Write requirements.txt listing any extra pip packages needed.
-9. If the experiment needs dataset downloads, write a setup.py that handles them.
+6. Each ablation/condition MUST be genuinely different — not a copy-paste with
+   a renamed variable.
+7. Implement a time guard: stop gracefully at 80% of the time budget
+   ({time_budget_sec} seconds).
+8. Write `requirements.txt` listing any extra pip packages needed — UNLESS
+   `GUIDANCE.md` forbids it (offline runs cannot pip install; then use only the
+   preinstalled packages it lists).
+9. If the experiment needs dataset downloads AND `GUIDANCE.md` permits network
+   access, write a `setup.py` that handles them. If downloads are forbidden, do
+   NOT create `setup.py`.
 
-IMPORTANT CONSTRAINTS:
-- The code will run in an isolated Docker container with PyTorch, torchvision, and common ML packages pre-installed.
-- Do NOT use argparse or CLI arguments — hardcode all configuration.
-- All output must go to stdout (print statements).
+## Constraints
+
+- The code runs in an isolated container. `GUIDANCE.md` lists exactly which
+  packages are available and is AUTHORITATIVE: where it and this file disagree,
+  `GUIDANCE.md` wins.
+- Do NOT use argparse or CLI arguments — hardcode all configuration, UNLESS
+  `GUIDANCE.md` explicitly requires a CLI flag (e.g. an `--algorithm` selector).
+- All results must go to stdout via print statements.
 - Keep the experiment feasible within {time_budget_sec} seconds total.
+
+## Working style
+
+- Do not ask clarifying questions; no human is available to answer. Choose a
+  reasonable default, record it in a comment, and keep going.
+- Finish by writing the files to disk. Producing no files is a failure.
 """
+
+# Prepended to the CLI prompt on a retry. Kept deliberately short for the same
+# command-line length reason; the detail goes in RETRY.md.
+_RETRY_PROMPT_PREFIX = """\
+RETRY: the previous attempt FAILED and produced no usable code.
+Read RETRY.md for what went wrong, then implement the task properly this time.
+
+"""
+
+_RETRY_MD_TEMPLATE = """\
+# Retry {attempt} of {total} — the previous attempt FAILED
+
+Reason: {reason}
+
+{no_files_note}Do not repeat the previous mistake. Write the actual files this
+time: create `main.py` and every supporting module with real, runnable code.
+
+The previous attempt's output is in `PREVIOUS_ATTEMPT/` and its log in
+`PREVIOUS_ATTEMPT_ERROR.txt`, for reference only.
+
+Re-read `TASK.md` and follow it.
+"""
+
+_NO_FILES_NOTE = (
+    "The previous attempt produced NO code files at all. It replied with a "
+    "question or with commentary instead of calling tools to write files. That "
+    "is exactly the failure mode to avoid: ask nothing, write code.\n\n"
+)
 
 
 class OpenCodeBridge:
@@ -319,16 +410,60 @@ class OpenCodeBridge:
         pkg_hint: str,
         extra_guidance: str,
         time_budget_sec: int,
+        prev_error: str = "",
+        prev_files: dict[str, str] | None = None,
+        retry_note: str = "",
     ) -> Path:
         """Create a temporary workspace directory with context files."""
-        ws = stage_dir / f"opencode_beast_{int(time.time())}_{time.monotonic_ns() % 100000}"
+        # Each attempt needs its OWN workspace. The previous name mixed
+        # time.time() with time.monotonic_ns() % 100000, but the monotonic clock
+        # has ~15.6ms granularity on Windows, so that suffix is frequently 0 and
+        # two attempts in the same second collided — mkdir(exist_ok=True) then
+        # silently reused the directory and the retry inherited the old output.
+        # An explicit counter makes each attempt unique.
+        for _n in itertools.count():
+            ws = stage_dir / f"opencode_beast_{int(time.time())}_{_n}"
+            if not ws.exists():
+                break
         ws.mkdir(parents=True, exist_ok=True)
+
+        # Write the full task instructions. These live here rather than in the
+        # CLI prompt because argv has a hard length limit (32767 on Windows).
+        (ws / "TASK.md").write_text(
+            _TASK_MD_TEMPLATE
+            .replace("{metric}", metric)
+            .replace("{time_budget_sec}", str(time_budget_sec)),
+            encoding="utf-8",
+        )
+
+        # On a retry, spell out what went wrong last time.
+        if retry_note:
+            (ws / "RETRY.md").write_text(retry_note, encoding="utf-8")
 
         # Write experiment plan
         (ws / "EXPERIMENT_PLAN.yaml").write_text(
             exp_plan or "# No experiment plan provided\n",
             encoding="utf-8",
         )
+
+        # Seed the retry with the previous attempt's partial output, so a new
+        # session can resume/fix instead of starting from a blank repo.
+        if prev_files:
+            prev_dir = ws / "PREVIOUS_ATTEMPT"
+            prev_dir.mkdir(parents=True, exist_ok=True)
+            for fname, content in prev_files.items():
+                p = prev_dir / fname
+                p.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    p.write_text(content, encoding="utf-8")
+                except OSError as exc:
+                    logger.warning("Beast mode: failed to seed %s: %s", fname, exc)
+
+        # Write the previous attempt's error/log so the retry knows what failed.
+        if prev_error:
+            (ws / "PREVIOUS_ATTEMPT_ERROR.txt").write_text(
+                prev_error, encoding="utf-8",
+            )
 
         # Write guidance document
         guidance_parts = [
@@ -598,38 +733,65 @@ class OpenCodeBridge:
 
     # -- file collection -------------------------------------------------------
 
+    # Scaffolding files written into the workspace as *input* for the agent.
+    # These are not experiment code — leaking them downstream trips the stage-10
+    # validation checks and pollutes the package, so they are never collected.
+    _INPUT_SCAFFOLD_FILES = frozenset(
+        {
+            "TASK.md",
+            "RETRY.md",
+            "GUIDANCE.md",
+            "EXPERIMENT_PLAN.yaml",
+            "opencode.json",
+            "PREVIOUS_ATTEMPT_ERROR.txt",
+        }
+    )
+    _INPUT_SCAFFOLD_DIRS = frozenset({"PREVIOUS_ATTEMPT"})
+
     @staticmethod
     def _collect_files(workspace: Path) -> dict[str, str]:
-        """Collect generated Python files, requirements.txt, and setup.py.
+        """Collect generated files (Python, JSON data, requirements, etc.).
 
-        File names are flattened to basenames (e.g. ``src/main.py`` → ``main.py``)
-        because the downstream executor expects a flat file dict.  If two files
-        share the same basename, the one closer to the workspace root wins.
+        Relative subdirectory paths are preserved (e.g. ``algorithms/nm/nm.py``,
+        ``data/rastrigin_d2_s0.json``) so nested structures produced by the
+        LLM4AD task-package guidance survive.  Files are keyed by their path
+        relative to the workspace root; when two files share that path the one
+        closer to the root wins.
+
+        Input scaffolding (TASK.md, GUIDANCE.md, the plan, PREVIOUS_ATTEMPT/…)
+        is excluded — only the agent's own output is returned.
         """
         files: dict[str, str] = {}
-        # Sort by depth (fewer parts first) so root-level files take priority
-        py_files = sorted(
-            workspace.rglob("*.py"),
+        # Sort by depth (fewer parts first) so root-level files take priority.
+        all_files = sorted(
+            workspace.rglob("*"),
             key=lambda p: len(p.relative_to(workspace).parts),
         )
-        for py_file in py_files:
-            rel = py_file.relative_to(workspace)
+        for fpath in all_files:
+            if not fpath.is_file():
+                continue
+            try:
+                rel = fpath.relative_to(workspace)
+            except ValueError:
+                continue
             parts = rel.parts
             if any(p.startswith("__pycache__") or p.startswith(".") for p in parts):
                 continue
-            # Flatten to basename — executor expects flat structure
-            basename = rel.name
-            if basename not in files:
-                try:
-                    files[basename] = py_file.read_text(encoding="utf-8", errors="replace")
-                except OSError as exc:
-                    logger.warning("Beast mode: failed to read %s: %s", py_file, exc)
-
-        # Also collect requirements.txt and setup.py at root
-        for extra in ("requirements.txt", "setup.py"):
-            p = workspace / extra
-            if p.exists() and extra not in files:
-                files[extra] = p.read_text(encoding="utf-8", errors="replace")
+            # Preserve relative subdirectory paths; skip dotfiles.
+            if parts and parts[-1].startswith("."):
+                continue
+            # Skip the scaffolding we wrote in as input.
+            if len(parts) == 1 and parts[0] in OpenCodeBridge._INPUT_SCAFFOLD_FILES:
+                continue
+            if parts[0] in OpenCodeBridge._INPUT_SCAFFOLD_DIRS:
+                continue
+            key = rel.as_posix()
+            if key in files:
+                continue
+            try:
+                files[key] = fpath.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                logger.warning("Beast mode: failed to read %s: %s", fpath, exc)
 
         return files
 
@@ -653,6 +815,27 @@ class OpenCodeBridge:
         return False
 
     @staticmethod
+    def _is_entry_swap_candidate(fname: str) -> bool:
+        """Whether ``fname`` may be swapped into ``main.py`` (BUG-17 guard).
+
+        Only top-level ``.py`` files that are not fixed-role modules qualify.
+        Anything nested (``algorithms/nm/nm.py``) or role-bound
+        (``benchmarks.py``, ``evaluator.py``, ``stats_utils.py``, ``setup.py``,
+        ``conftest.py``, ``test_*.py``) is off limits: those files have a
+        contract with the rest of the package and moving their contents breaks
+        both ends of the swap.
+        """
+        if fname == "main.py" or not fname.endswith(".py"):
+            return False
+        norm = fname.replace("\\", "/")
+        if "/" in norm:
+            return False  # nested module — never a top-level driver
+        if norm in _ENTRY_SWAP_EXCLUDED:
+            return False
+        base = norm[:-3]
+        return not (base.startswith("test_") or base.endswith("_test"))
+
+    @staticmethod
     def _ensure_main_entry_point(files: dict[str, str]) -> dict[str, str]:
         """Ensure ``main.py`` has an ``if __name__ == "__main__"`` guard.
 
@@ -664,11 +847,20 @@ class OpenCodeBridge:
 
         Strategy:
         1. If ``main.py`` already has the guard → return unchanged.
-        2. Find the first other ``.py`` file that **does** have the guard.
+        2. Find the first *eligible* other ``.py`` file that **does** have the
+           guard.  Eligible means top-level (no ``/`` in the name) and not one
+           of the fixed-role modules — see ``_ENTRY_SWAP_EXCLUDED``.
         3. Swap: rename that file to ``main.py`` and the old ``main.py`` to a
            helper module (its original basename, or ``_lib.py``).
         4. If no file has a guard, append a minimal stub to ``main.py`` that
            calls the most likely entry function (``main()``, ``run()``, etc.).
+
+        BUG-17: strategies 2/3 used to consider **every** ``.py`` key. With the
+        LLM4AD layout the dict carries ``algorithms/<algo>/<algo>.py``,
+        ``benchmarks.py``, ``evaluator.py`` and ``stats_utils.py``, each of which
+        may legitimately carry a ``__main__`` guard — swapping one into
+        ``main.py`` corrupts both files. Restricting the candidate set to
+        plausible top-level drivers makes that impossible.
         """
         main_code = files.get("main.py", "")
         if not main_code:
@@ -679,7 +871,7 @@ class OpenCodeBridge:
 
         # -- Strategy 2/3: find another file with the guard and swap -----------
         for fname, code in files.items():
-            if fname == "main.py" or not fname.endswith(".py"):
+            if not OpenCodeBridge._is_entry_swap_candidate(fname):
                 continue
             if OpenCodeBridge._has_main_guard(code):
                 logger.info(
@@ -756,8 +948,51 @@ class OpenCodeBridge:
 
         workspace: Path | None = None
         last_error = ""
+        files: dict[str, str] = {}
+        elapsed = 0.0
+        prev_error = ""
+        prev_files: dict[str, str] = {}
+        prev_had_no_files = False
+
+        # BUG-03: files salvaged from a FAILED attempt are a last resort, not a
+        # reason to stop retrying. Stash them and keep going — a later attempt
+        # may still succeed cleanly, and it gets the salvaged output as
+        # PREVIOUS_ATTEMPT context. Only if every attempt fails do we return
+        # the stash, flagged via ``recovered_from_failure``.
+        salvaged_files: dict[str, str] = {}
+        salvaged_error = ""
+        salvaged_elapsed = 0.0
+        # BUG-07: keep at most ONE failed workspace on disk for post-mortem.
+        # Retries used to leak every workspace, each nesting the previous
+        # attempt's PREVIOUS_ATTEMPT/ copy inside it.
+        kept_workspace: Path | None = None
+
+        def _retire(ws: Path | None) -> None:
+            """Drop ``ws``, keeping it only if it is the newest failed one."""
+            nonlocal kept_workspace
+            if ws is None:
+                return
+            if kept_workspace is not None and kept_workspace != ws:
+                shutil.rmtree(kept_workspace, ignore_errors=True)
+            kept_workspace = ws
 
         for attempt in range(1 + self._max_retries):
+            # On a retry, tell the agent what failed last time. A byte-identical
+            # prompt reliably reproduced the same failure — notably the model
+            # replying with a clarifying question and writing nothing.
+            retry_note = ""
+            if attempt > 0:
+                retry_note = (
+                    _RETRY_MD_TEMPLATE
+                    .replace("{attempt}", str(attempt + 1))
+                    .replace("{total}", str(1 + self._max_retries))
+                    .replace(
+                        "{no_files_note}",
+                        _NO_FILES_NOTE if prev_had_no_files else "",
+                    )
+                    .replace("{reason}", last_error or "unknown")
+                )
+
             # Prepare workspace
             try:
                 workspace = self._prepare_workspace(
@@ -768,25 +1003,34 @@ class OpenCodeBridge:
                     pkg_hint=pkg_hint,
                     extra_guidance=extra_guidance,
                     time_budget_sec=time_budget_sec,
+                    prev_error=prev_error,
+                    prev_files=prev_files or None,
+                    retry_note=retry_note,
                 )
             except OSError as exc:
                 last_error = f"Failed to prepare workspace: {exc}"
                 logger.warning("Beast mode: %s", last_error)
                 continue
 
-            # Build the mega-prompt (use replace instead of .format() to
-            # avoid KeyError when metric contains curly braces like "F{1}")
+            # Build the CLI prompt. It only points at TASK.md, so it stays well
+            # inside the argv length limit regardless of plan/guidance size.
+            # Use replace instead of .format() to avoid KeyError when the metric
+            # contains curly braces like "F{1}".
             prompt = _MEGA_PROMPT_TEMPLATE.replace(
                 "{metric}", metric
             ).replace(
                 "{time_budget_sec}", str(time_budget_sec)
             )
+            if retry_note:
+                prompt = _RETRY_PROMPT_PREFIX + prompt
 
             logger.info(
-                "Beast mode: invoking OpenCode (attempt %d/%d, timeout=%ds)",
+                "Beast mode: invoking OpenCode (attempt %d/%d, timeout=%ds, "
+                "prompt=%d chars)",
                 attempt + 1,
                 1 + self._max_retries,
                 self._timeout_sec,
+                len(prompt),
             )
 
             success, log, elapsed = self._invoke_opencode(workspace, prompt)
@@ -798,10 +1042,25 @@ class OpenCodeBridge:
                         "Beast mode: OpenCode succeeded but no main.py found "
                         "(files: %s)", list(files.keys()),
                     )
-                    last_error = "No main.py in OpenCode output"
-                    # Cleanup failed workspace
-                    if self._workspace_cleanup and workspace.exists():
-                        shutil.rmtree(workspace, ignore_errors=True)
+                    # Distinguish "wrote nothing at all" (replied with text
+                    # instead of calling tools) from "wrote code but no
+                    # main.py" — they need different retry guidance.
+                    if not any(f.endswith(".py") for f in files):
+                        last_error = (
+                            "OpenCode wrote no code files at all — it replied "
+                            "with text instead of generating the experiment"
+                        )
+                        prev_had_no_files = True
+                    else:
+                        last_error = "No main.py in OpenCode output"
+                        prev_had_no_files = False
+                    # Carry this attempt's output + reason to the next retry.
+                    prev_error = log
+                    prev_files = files
+                    # BUG-07: keep the workspace so partial output can be
+                    # inspected — but only the newest one. This path used to
+                    # skip cleanup entirely and leak one directory per retry.
+                    _retire(workspace)
                     continue
 
                 # BUG-R52-01: Ensure main.py has an entry point
@@ -815,9 +1074,14 @@ class OpenCodeBridge:
                 except OSError as _wexc:
                     logger.warning("Beast mode: failed to write log: %s", _wexc)
 
-                # Cleanup workspace if configured
-                if self._workspace_cleanup and workspace.exists():
-                    shutil.rmtree(workspace, ignore_errors=True)
+                # Cleanup workspace if configured. A clean success supersedes
+                # every earlier failed attempt, so drop those too.
+                if self._workspace_cleanup:
+                    if workspace.exists():
+                        shutil.rmtree(workspace, ignore_errors=True)
+                    if kept_workspace is not None:
+                        shutil.rmtree(kept_workspace, ignore_errors=True)
+                        kept_workspace = None
 
                 return OpenCodeResult(
                     success=True,
@@ -833,15 +1097,61 @@ class OpenCodeBridge:
                 elapsed,
                 log[:500],
             )
-            # Cleanup failed workspace
-            if self._workspace_cleanup and workspace and workspace.exists():
-                shutil.rmtree(workspace, ignore_errors=True)
+            # Attempt to recover output even on failure/timeout: opencode may
+            # have written a complete package before the process was killed
+            # (e.g. timed out during the final full-run validation). Prefer
+            # that over discarding it, and only wipe the workspace when there
+            # is nothing useful to keep.
+            if workspace and workspace.exists():
+                recovered = self._collect_files(workspace)
+                prev_error = log
+                prev_files = recovered
+                if "main.py" not in recovered:
+                    if self._workspace_cleanup:
+                        shutil.rmtree(workspace, ignore_errors=True)
+                    else:
+                        _retire(workspace)
+                else:
+                    logger.info(
+                        "Beast mode: recovered %d file(s) from failed attempt; "
+                        "stashing as fallback and continuing to retry",
+                        len(recovered),
+                    )
+                    # BUG-03: stash, do NOT break. The newest salvage wins —
+                    # it saw the accumulated retry guidance.
+                    salvaged_files = recovered
+                    salvaged_error = log
+                    salvaged_elapsed = elapsed
+                    _retire(workspace)
+
+        if salvaged_files:
+            files = self._ensure_main_entry_point(salvaged_files)
+            if self._workspace_cleanup and kept_workspace is not None:
+                shutil.rmtree(kept_workspace, ignore_errors=True)
+                kept_workspace = None
+            logger.warning(
+                "Beast mode: all %d attempt(s) failed; falling back to %d "
+                "file(s) salvaged from a failed run — package was never "
+                "validated by the agent",
+                1 + self._max_retries,
+                len(files),
+            )
+            return OpenCodeResult(
+                success=True,
+                files=files,
+                opencode_log=salvaged_error,
+                elapsed_sec=salvaged_elapsed,
+                recovered_from_failure=True,
+            )
 
         # All attempts failed
         return OpenCodeResult(
             success=False,
             opencode_log=last_error,
-            error=f"OpenCode failed after {1 + self._max_retries} attempt(s)",
+            error=(
+                f"OpenCode failed after {1 + self._max_retries} attempt(s): "
+                f"{last_error or 'unknown'}"
+            ),
         )
 
 

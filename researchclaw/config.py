@@ -495,6 +495,57 @@ class OpenCodeConfig:
     timeout_sec: int = 600  # Max seconds for opencode run
     max_retries: int = 1
     workspace_cleanup: bool = True
+    # When True, an OpenCode (Beast Mode) run that FAILS fails the whole stage
+    # instead of silently degrading to the CodeAgent/Legacy fallback. Use this
+    # when OpenCode is the intended sole code generator and a half-finished
+    # fallback artifact is worse than a hard error.
+    require_success: bool = False
+
+
+@dataclass(frozen=True)
+class Llm4adEvolutionConfig:
+    """LLM4AD evolution hyperparameters (drives the llm4ad run config)."""
+
+    method: str = "island_ga"
+    max_generations: int = 2
+    elite_ratio: float = 0.2
+    mutation_rate: float = 0.6
+    crossover_rate: float = 0.3
+    island: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Llm4adResourcesConfig:
+    """Resource budget for running LLM4AD evolution on task packages."""
+
+    time_budget_sec: int = 1800
+    eval_timeout_sec: int = 120
+    parallel_workers: int = 4
+    # Per-package wall-clock budget for ONE ``llm4ad run``. When > 0 it is used
+    # directly as the subprocess timeout, so a long evolution is not cut short by
+    # dividing time_budget_sec across N packages (which left every package
+    # killed mid-generation). When 0, falls back to time_budget_sec // n_pkgs.
+    per_package_timeout_sec: int = 0
+    # Override for the per-instance evaluation budget ``max_evals`` written into
+    # each task package's data/*.json and coder prompt. When > 0 it REPLACES the
+    # value baked in at stage-10 generation, so evolution and the baseline
+    # comparison see the same budget. 0 keeps the per-instance value untouched.
+    max_evals: int = 0
+
+
+@dataclass(frozen=True)
+class Llm4adBoostConfig:
+    """LLM4AD task-package boost for stage-10 generated experiment code.
+
+    When enabled, stage-10 additionally structures the generated code as
+    LLM4AD task packages (per-algorithm directory + EVOLVE markers + static
+    instance data), so downstream builds one evolvable package per algorithm.
+    """
+
+    enabled: bool = False
+    fail_silently: bool = True  # on failure, warn and keep Stage 13 best
+    evolution: Llm4adEvolutionConfig = field(default_factory=Llm4adEvolutionConfig)
+    resources: Llm4adResourcesConfig = field(default_factory=Llm4adResourcesConfig)
 
 
 @dataclass(frozen=True)
@@ -603,6 +654,7 @@ class ExperimentConfig:
     colab_drive: ColabDriveConfig = field(default_factory=ColabDriveConfig)
     code_agent: CodeAgentConfig = field(default_factory=CodeAgentConfig)
     opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
+    llm4ad_boost: Llm4adBoostConfig = field(default_factory=Llm4adBoostConfig)
     benchmark_agent: BenchmarkAgentConfig = field(default_factory=BenchmarkAgentConfig)
     figure_agent: FigureAgentConfig = field(default_factory=FigureAgentConfig)
     repair: ExperimentRepairConfig = field(default_factory=ExperimentRepairConfig)
@@ -1414,6 +1466,7 @@ def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
         stat_agent=_parse_stat_agent_config(data.get("stat_agent") or {}),
         code_agent=_parse_code_agent_config(data.get("code_agent") or {}),
         opencode=_parse_opencode_config(data.get("opencode") or {}),
+        llm4ad_boost=_parse_llm4ad_boost_config(data.get("llm4ad_boost") or {}),
         benchmark_agent=_parse_benchmark_agent_config(
             data.get("benchmark_agent") or {}
         ),
@@ -1522,6 +1575,44 @@ def _parse_opencode_config(data: dict[str, Any]) -> OpenCodeConfig:
         timeout_sec=_safe_int(data.get("timeout_sec"), 600),
         max_retries=_safe_int(data.get("max_retries"), 1),
         workspace_cleanup=bool(data.get("workspace_cleanup", True)),
+        require_success=bool(data.get("require_success", False)),
+    )
+
+
+def _parse_llm4ad_evolution_config(data: dict[str, Any]) -> Llm4adEvolutionConfig:
+    if not data:
+        return Llm4adEvolutionConfig()
+    island = data.get("island") or {}
+    return Llm4adEvolutionConfig(
+        method=str(data.get("method", "island_ga")),
+        max_generations=_safe_int(data.get("max_generations"), 2),
+        elite_ratio=_safe_float(data.get("elite_ratio"), 0.2),
+        mutation_rate=_safe_float(data.get("mutation_rate"), 0.6),
+        crossover_rate=_safe_float(data.get("crossover_rate"), 0.3),
+        island=dict(island) if isinstance(island, dict) else {},
+    )
+
+
+def _parse_llm4ad_resources_config(data: dict[str, Any]) -> Llm4adResourcesConfig:
+    if not data:
+        return Llm4adResourcesConfig()
+    return Llm4adResourcesConfig(
+        time_budget_sec=_safe_int(data.get("time_budget_sec"), 1800),
+        eval_timeout_sec=_safe_int(data.get("eval_timeout_sec"), 120),
+        parallel_workers=_safe_int(data.get("parallel_workers"), 4),
+        per_package_timeout_sec=_safe_int(data.get("per_package_timeout_sec"), 0),
+        max_evals=_safe_int(data.get("max_evals"), 0),
+    )
+
+
+def _parse_llm4ad_boost_config(data: dict[str, Any]) -> Llm4adBoostConfig:
+    if not data:
+        return Llm4adBoostConfig()
+    return Llm4adBoostConfig(
+        enabled=bool(data.get("enabled", False)),
+        fail_silently=bool(data.get("fail_silently", True)),
+        evolution=_parse_llm4ad_evolution_config(data.get("evolution") or {}),
+        resources=_parse_llm4ad_resources_config(data.get("resources") or {}),
     )
 
 

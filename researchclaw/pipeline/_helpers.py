@@ -47,8 +47,10 @@ class StageResult:
 # Constants
 # ---------------------------------------------------------------------------
 
+# NOTE: ``torch`` is intentionally absent — the deployment server has no GPU,
+# so a torch import is a genuine error we want to surface, not auto-install.
 _SANDBOX_SAFE_PACKAGES = {
-    "numpy", "scipy", "torch", "sklearn", "matplotlib",
+    "numpy", "scipy", "sklearn", "matplotlib",
     "pandas", "seaborn", "tqdm", "gymnasium", "gym",
 }
 
@@ -334,7 +336,18 @@ def _write_stage_meta(
 
 
 def _ensure_sandbox_deps(code: str, python_path: str) -> list[str]:
-    """P7: Scan code imports and auto-install missing common packages."""
+    """P7: Scan code imports and auto-install missing common packages.
+
+    Only packages in :data:`_SANDBOX_SAFE_PACKAGES` are considered. A package is
+    skipped if it already imports; otherwise we install it and return its name.
+    A failed install does **not** block the run — per the deployment decision,
+    let the code blow up with the real ``ModuleNotFoundError`` rather than fail
+    early on our own install guess. We just stop claiming it was installed.
+
+    Prefers the interpreter's own pip first, then ``uv pip`` (uv-created venvs
+    often ship without pip). Both are silent no-ops for already-satisfied
+    packages, so re-running is harmless.
+    """
     import subprocess as _sp
 
     imports: set[str] = set()
@@ -360,21 +373,78 @@ def _ensure_sandbox_deps(code: str, python_path: str) -> list[str]:
                 capture_output=True, timeout=10,
                 encoding="utf-8", errors="replace",
             )
-            if r.returncode != 0:
-                pip_name = "scikit-learn" if pkg == "sklearn" else pkg
-                logger.info("Sandbox: installing missing dependency '%s'", pip_name)
-                _sp.run(
-                    [str(py_path), "-m", "pip", "install", pip_name, "--quiet"],
-                    capture_output=True, timeout=120,
-                    encoding="utf-8", errors="replace",
-                )
+            if r.returncode == 0:
+                continue  # already available
+            pip_name = "scikit-learn" if pkg == "sklearn" else pkg
+            logger.info("Sandbox: installing missing dependency '%s'", pip_name)
+            ok = _pip_install(str(py_path), pip_name)
+            if ok:
                 installed.append(pip_name)
-        except Exception as exc:
+            else:
+                # Not fatal per decision above — just don't claim success. The
+                # sandbox will surface the real ModuleNotFoundError if it needs
+                # this package.
+                logger.warning(
+                    "Sandbox: failed to install '%s' via pip and uv. "
+                    "Letting the experiment run; it will error on import if "
+                    "the dependency is actually required.",
+                    pip_name,
+                )
+        except Exception as exc:  # noqa: BLE001
             logger.warning("Sandbox: failed to check/install '%s': %s", pkg, exc)
 
     if installed:
         logger.info("Sandbox: auto-installed packages: %s", ", ".join(installed))
     return installed
+
+
+def _pip_install(python: str, pip_name: str) -> bool:
+    """Install *pip_name* into the sandbox interpreter or the active uv env.
+
+    Tries ``python -m pip`` first, then ``uv pip`` (which targets the active
+    environment, so it works even where pip is missing). Returns True on a
+    zero exit code — i.e. the package is now importable.
+    """
+    import subprocess as _sp
+
+    # 1) Interpreter's own pip.
+    try:
+        r = _sp.run(
+            [python, "-m", "pip", "install", pip_name, "--quiet"],
+            capture_output=True, timeout=180,
+            encoding="utf-8", errors="replace",
+        )
+        if r.returncode == 0:
+            return True
+        if "No module named pip" not in r.stderr:
+            logger.warning(
+                "Sandbox: pip install of '%s' failed: %s",
+                pip_name, (r.stderr or r.stdout).strip()[-300:],
+            )
+        # else fall through to uv
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Sandbox: pip install '%s' raised: %s", pip_name, exc)
+
+    # 2) uv as fallback for pip-less (uv-created) venvs. ``--python`` pins the
+    # target interpreter explicitly — a bare ``uv pip install`` from an unset
+    # shell targets the *system* Python, not this venv, which would install to
+    # the wrong place.
+    try:
+        r = _sp.run(
+            ["uv", "pip", "install", "--python", python, pip_name, "--quiet"],
+            capture_output=True, timeout=180,
+            encoding="utf-8", errors="replace",
+        )
+        if r.returncode == 0:
+            return True
+        logger.warning(
+            "Sandbox: uv pip install of '%s' failed: %s",
+            pip_name, (r.stderr or r.stdout).strip()[-300:],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Sandbox: uv pip install '%s' raised: %s", pip_name, exc)
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -580,7 +650,34 @@ def _safe_json_loads(text: str, default: Any) -> Any:
     return default
 
 
+def _is_python_info_string(info: str) -> bool:
+    """True if a fence info string denotes Python (or is unlabelled).
+
+    Accepts ``""``, ``python``, ``py``, ``python:main.py``, ``python filename:x.py``
+    and rejects ``bash``, ``json``, ``yaml``, ``text`` … so a shell/JSON block
+    elsewhere in the reply is not mistaken for the code.
+    """
+    info = info.strip()
+    if not info:
+        return True
+    # First token up to a separator is the language tag.
+    tag = re.split(r"[\s:=]", info, maxsplit=1)[0].lower()
+    if tag in ("python", "python3", "py", ""):
+        return True
+    # Unlabelled but path-carrying: ```:main.py or ``` filename:main.py
+    return tag.endswith(".py") or "filename" in info.lower()
+
+
 def _extract_code_block(content: str) -> str:
+    # Consume the whole info string on the opening fence (```python:foo.py,
+    # ```py title=x, ```python) so it never lands in the code body. Matching
+    # only ``` plus an optional `python` left a `:foo.py` remnant as the first
+    # line (a SyntaxError). Non-Python fences are skipped, not returned, so a
+    # leading ```bash / ```json block isn't mistaken for the code.
+    for match in re.finditer(r"```([^\n`]*)\n(.*?)\s*```", content, flags=re.DOTALL):
+        if _is_python_info_string(match.group(1)):
+            return match.group(2).strip()
+    # Fenced snippet with no newline before the code: ```code```
     match = re.search(r"```(?:python)?\s*(.*?)\s*```", content, flags=re.DOTALL)
     if match is not None:
         return match.group(1).strip()
@@ -613,6 +710,7 @@ def _extract_multi_file_blocks(content: str) -> dict[str, str]:
         ```
 
     Also handles common LLM format variations:
+    - ````` ```python:main.py````` (colon directly after the language tag)
     - ````` ```python filename:main.py````` (space before filename)
     - ````` ``` filename:main.py````` (space after backticks)
     - ``filename:main.py`` on next line after backticks
@@ -625,6 +723,15 @@ def _extract_multi_file_blocks(content: str) -> dict[str, str]:
     """
     # R13-2: Multiple patterns to handle LLM format variations
     patterns = [
+        # ```python:xxx.py or ```:xxx.py — no `filename:` keyword, the path
+        # follows the language tag directly. Models emit this often; when it
+        # went unrecognized every file collapsed into the single-block
+        # fallback below, which yielded one main.py holding another file's
+        # body with a stray `:xxx.py` first line.
+        re.compile(
+            r"```(?:python)?:(\S+\.\w+)[^\S\n]*\n(.*?)```",
+            flags=re.DOTALL,
+        ),
         # Original: ```filename:xxx.py or ```python filename:xxx.py
         re.compile(
             r"```(?:python\s+)?filename:(\S+)\s*\n(.*?)```",
@@ -642,7 +749,7 @@ def _extract_multi_file_blocks(content: str) -> dict[str, str]:
         ),
         # Variation: ```python\n# filename: xxx.py (comment marker)
         re.compile(
-            r"```(?:python)?\s*\n#\s*(?:FILE|filename)\s*:\s*(\S+\.py)\s*\n(.*?)```",
+            r"```(?:python)?\s*\n#\s*(?:FILE|filename)\s*:\s*(\S+)\s*\n(.*?)```",
             flags=re.DOTALL,
         ),
     ]
@@ -660,16 +767,22 @@ def _extract_multi_file_blocks(content: str) -> dict[str, str]:
             # Security: prevent path traversal
             if ".." in fname or fname.startswith("/"):
                 continue
-            # Normalise to flat filenames (strip leading ./ or subdirs for safety)
-            fname = fname.replace("\\", "/").split("/")[-1]
-            if fname and fname.endswith(".py"):
+            # Keep relative subdirectory paths (strip leading ./) so nested
+            # files like algorithms/<algo>/<algo>.py and data/*.json survive.
+            fname = fname.replace("\\", "/")
+            fname = fname[2:] if fname.startswith("./") else fname
+            if fname:
                 files[fname] = code.strip()
         if files:
-            # Ensure there is a main.py entry point
-            if "main.py" not in files:
-                # Pick the first file as main.py
-                first_key = next(iter(files))
-                files["main.py"] = files.pop(first_key)
+            # No entry-point promotion here, by design. Every filename in this
+            # branch was stated explicitly by the model, so renaming one to
+            # main.py discards information it gave us and fabricates an entry
+            # point, corrupting both files — real main.py is overwritten by a
+            # helper's body, and the helper never lands under its own name (so
+            # a repair aimed at it is lost). The forgery also satisfies every
+            # caller's `"main.py" in files` guard. A response with no main.py is
+            # returned as-is so callers reject it; promotion is only sound in
+            # the unnamed single-block fallback, where no filename is lost.
             return files
 
     # Fallback: single code block → main.py
