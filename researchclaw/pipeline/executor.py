@@ -466,7 +466,7 @@ def _run_collaboration_loop(
     try:
         if config is not None:
             from researchclaw.llm import create_llm_client
-            llm_client = create_llm_client(config)
+            llm_client = create_llm_client(config, run_dir=run_dir)
             topic_obj = getattr(config, "research", None)
             topic = topic_obj.topic if topic_obj else "Research"
         else:
@@ -639,9 +639,9 @@ def execute_stage(
     llm = None
     try:
         if config.llm.provider == "acp":
-            llm = create_llm_client(config)
+            llm = create_llm_client(config, run_dir=run_dir)
         else:
-            candidate = LLMClient.from_rc_config(config)
+            candidate = LLMClient.from_rc_config(config, run_dir=run_dir)
             if candidate.config.base_url and candidate.config.api_key:
                 llm = candidate
     except Exception as _llm_exc:  # noqa: BLE001

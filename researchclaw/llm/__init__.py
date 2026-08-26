@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Union
+from pathlib import Path
 
 if TYPE_CHECKING:
     from researchclaw.config import RCConfig
@@ -57,7 +58,7 @@ PROVIDER_PRESETS = {
 }
 
 
-def create_llm_client(config: RCConfig) -> LLMClient | ACPClient:
+def create_llm_client(config: RCConfig, *, run_dir: str | Path | None = None) -> LLMClient | ACPClient:
     """Factory: return the right LLM client based on ``config.llm.provider``.
 
     - ``"acp"`` → :class:`ACPClient` (spawns an ACP-compatible agent)
@@ -74,6 +75,9 @@ def create_llm_client(config: RCConfig) -> LLMClient | ACPClient:
     OpenRouter is fully compatible with the OpenAI API format, making it
     a drop-in replacement with access to 200+ models from Anthropic, Google,
     Meta, Mistral, and more. See: https://openrouter.ai/models
+
+    ``run_dir``, when given and ``log_traces`` is enabled with no explicit
+    ``trace_path``, defaults the trace jsonl to ``<run_dir>/llm_traces.jsonl``.
     """
     if config.llm.provider == "acp":
         from researchclaw.llm.acp_client import ACPClient as _ACP
@@ -82,7 +86,7 @@ def create_llm_client(config: RCConfig) -> LLMClient | ACPClient:
     from researchclaw.llm.client import LLMClient as _LLM
 
     # Use from_rc_config to properly initialize adapters (e.g., Anthropic)
-    return _LLM.from_rc_config(config)
+    return _LLM.from_rc_config(config, run_dir=run_dir)
 
 
 def build_reviewer_llm(config: RCConfig):

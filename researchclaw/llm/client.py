@@ -18,9 +18,37 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _truncate_trace_text(text: str, max_chars: int) -> str:
+    """Trim a prompt/response for the trace log so a single huge call
+    (code generation, paper draft) can't produce an unbounded line."""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"\n...[truncated {len(text) - max_chars} chars]"
+
+
+def _append_trace(path: str, record: dict[str, object]) -> None:
+    """Atomically append one JSON line to the trace file. Best-effort:
+    a failing logger must never break an LLM call."""
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except OSError as exc:
+        logger.warning("Failed to write LLM trace to %s: %s", path, exc)
+
+
+def _safe_int(value: object, default: int) -> int:
+    """Coerce *value* to int, returning *default* on missing/invalid input."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
 
 # Models that require max_completion_tokens instead of max_tokens
 _NEW_PARAM_MODELS = frozenset(
@@ -88,6 +116,11 @@ class LLMConfig:
     # MetaClaw bridge: fallback URL if primary (proxy) is unreachable
     fallback_url: str = ""
     fallback_api_key: str = ""
+    # LLM call tracing: when enabled, every chat() invocation appends one
+    # JSON line (prompt + response) to trace_path for offline debugging.
+    log_traces: bool = False
+    trace_path: str = ""
+    trace_max_chars: int = 200_000
 
 
 class LLMClient:
@@ -120,7 +153,7 @@ class LLMClient:
         return not any(model.startswith(prefix) for prefix in _NO_TEMPERATURE_MODELS)
 
     @classmethod
-    def from_rc_config(cls, rc_config: Any) -> LLMClient:
+    def from_rc_config(cls, rc_config: Any, *, run_dir: Path | None = None) -> LLMClient:
         from researchclaw.llm import PROVIDER_PRESETS
 
         provider = getattr(rc_config.llm, "provider", "openai")
@@ -154,6 +187,14 @@ class LLMClient:
             if bridge.fallback_api_key:
                 fallback_api_key = bridge.fallback_api_key
 
+        # Resolve trace path: an explicit config value wins; otherwise default
+        # to <run_dir>/llm_traces.jsonl so the log lands beside the stage
+        # artifacts without the user configuring a path.
+        _trace_path = str(getattr(rc_config.llm, "trace_path", "") or "")
+        _log_traces = getattr(rc_config.llm, "log_traces", False)
+        if _log_traces and not _trace_path and run_dir is not None:
+            _trace_path = str(Path(run_dir) / "llm_traces.jsonl")
+
         config = LLMConfig(
             base_url=base_url,
             api_key=api_key,
@@ -163,6 +204,9 @@ class LLMClient:
             fallback_url=fallback_url,
             fallback_api_key=fallback_api_key,
             timeout_sec=getattr(rc_config.llm, "timeout_sec", 600),
+            log_traces=_log_traces,
+            trace_path=_trace_path,
+            trace_max_chars=getattr(rc_config.llm, "trace_max_chars", 200_000),
         )
         client = cls(config)
 
@@ -225,6 +269,9 @@ class LLMClient:
             primary_model=reviewer_model,
             fallback_models=[],
             timeout_sec=getattr(llm, "timeout_sec", 600),
+            log_traces=getattr(llm, "log_traces", False),
+            trace_path=getattr(llm, "trace_path", "") or "",
+            trace_max_chars=getattr(llm, "trace_max_chars", 200_000),
         )
         client = cls(config)
 
@@ -235,6 +282,36 @@ class LLMClient:
                 base_url, api_key, config.timeout_sec
             )
         return client
+
+    def _trace(self, kind: str, messages: list[dict[str, str]], *,
+               model: str, resp: LLMResponse | None = None,
+               elapsed_sec: float = 0.0, error: str = "") -> None:
+        """Record one chat() invocation to the trace JSONL file (opt-in)."""
+        cfg = self.config
+        if not cfg.log_traces or not cfg.trace_path:
+            return
+        record: dict[str, object] = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+            "kind": kind,
+            "model": model,
+            "final_model": resp.model if resp else "",
+            "messages": _truncate_trace_text(
+                json.dumps(messages, ensure_ascii=False), cfg.trace_max_chars
+            ),
+            "elapsed_sec": round(elapsed_sec, 3),
+        }
+        if resp is not None:
+            record["response"] = _truncate_trace_text(
+                resp.content, cfg.trace_max_chars
+            )
+            record["prompt_tokens"] = resp.prompt_tokens
+            record["completion_tokens"] = resp.completion_tokens
+            record["total_tokens"] = resp.total_tokens
+            record["finish_reason"] = resp.finish_reason
+            record["truncated"] = resp.truncated
+        if error:
+            record["error"] = _truncate_trace_text(error, 2000)
+        _append_trace(cfg.trace_path, record)
 
     def chat(
         self,
@@ -276,6 +353,8 @@ class LLMClient:
         temp = temperature if temperature is not None else self.config.temperature
 
         last_error: Exception | None = None
+        _trace_start = time.monotonic()
+        _trace_model = models[0] if models else ""
 
         for m in models:
             try:
@@ -293,11 +372,23 @@ class LLMClient:
                         truncated=resp.truncated,
                         raw=resp.raw,
                     )
+                self._trace(
+                    "success", messages, model=m, resp=resp,
+                    elapsed_sec=time.monotonic() - _trace_start,
+                )
                 return resp
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Model %s failed: %s. Trying next.", m, exc)
                 last_error = exc
 
+        self._trace(
+            "error", messages, model=_trace_model,
+            elapsed_sec=time.monotonic() - _trace_start,
+            error=(
+                f"{type(last_error).__name__}: {last_error}"
+                if last_error else "all models failed"
+            ),
+        )
         raise RuntimeError(
             f"All models failed. Last error: {last_error}"
         ) from last_error
@@ -754,5 +845,8 @@ def create_client_from_yaml(yaml_path: str | None = None) -> LLMClient:
             fallback_models=llm_section.get(
                 "fallback_models", ["gpt-4.1", "gpt-4o-mini"]
             ),
+            log_traces=bool(llm_section.get("log_traces", False)),
+            trace_path=str(llm_section.get("trace_path", "") or ""),
+            trace_max_chars=_safe_int(llm_section.get("trace_max_chars", 200_000)),
         )
     )

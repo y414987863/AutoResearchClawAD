@@ -228,6 +228,10 @@ class LlmConfig:
     tournament_enabled: bool = False
     tournament_candidates: int = 3
     acp: AcpConfig = field(default_factory=AcpConfig)
+    # LLM call tracing: append every prompt/response as a JSON line to a file.
+    log_traces: bool = False
+    trace_path: str = ""
+    trace_max_chars: int = 200_000
 
 
 @dataclass(frozen=True)
@@ -1208,6 +1212,9 @@ def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
             timeout_sec=int(acp_data.get("timeout_sec", 1800)),
             max_turns=_safe_int(acp_data.get("max_turns"), 1),
         ),
+        log_traces=bool(data.get("log_traces", False)),
+        trace_path=str(data.get("trace_path", "") or ""),
+        trace_max_chars=_safe_int(data.get("trace_max_chars"), 200_000),
     )
 
 

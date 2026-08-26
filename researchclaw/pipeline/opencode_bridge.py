@@ -20,6 +20,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -267,6 +268,7 @@ class OpenCodeBridge:
         *,
         model: str = "",
         llm_base_url: str = "",
+        api_key: str = "",
         api_key_env: str = "",
         llm_provider: str = "openai-compatible",
         timeout_sec: int = 600,
@@ -275,6 +277,7 @@ class OpenCodeBridge:
     ) -> None:
         self._model = model
         self._llm_base_url = llm_base_url
+        self._api_key = api_key
         self._api_key_env = api_key_env
         self._llm_provider = llm_provider
         self._timeout_sec = timeout_sec
@@ -405,8 +408,14 @@ class OpenCodeBridge:
                 "openai": {
                     "options": {
                         "baseURL": self._llm_base_url,
-                        "apiKey": f"{{env:{self._api_key_env}}}"
-                        if self._api_key_env
+                        # ``_invoke_opencode`` exports the resolved key (from
+                        # llm.api_key or llm.api_key_env) as OPENAI_API_KEY, so
+                        # point at that one name instead of the configured env
+                        # var — this also works when the key came from
+                        # ``llm.api_key``, and keeps the literal secret out of
+                        # the on-disk config.
+                        "apiKey": "{env:OPENAI_API_KEY}"
+                        if self._resolve_api_key()
                         else "",
                     },
                     "models": {},
@@ -451,6 +460,23 @@ class OpenCodeBridge:
             return self._model
         return f"openai/{self._model}"
 
+    # -- credentials -----------------------------------------------------------
+
+    def _resolve_api_key(self) -> str:
+        """Resolve the API key, preferring the configured value over the env var.
+
+        Mirrors the resolution order used for the main LLM client
+        (``llm.api_key or os.environ[llm.api_key_env]``): a key written directly
+        into the config wins, and ``api_key_env`` names a variable to read when
+        it isn't. Previously only the env-var path existed here, so a key set as
+        ``llm.api_key`` never reached the CLI.
+        """
+        if self._api_key:
+            return self._api_key
+        if self._api_key_env:
+            return os.environ.get(self._api_key_env, "")
+        return ""
+
     # -- invocation ------------------------------------------------------------
 
     def _invoke_opencode(
@@ -460,14 +486,16 @@ class OpenCodeBridge:
     ) -> tuple[bool, str, float]:
         """Run ``opencode run`` in the workspace. Returns (success, log, elapsed)."""
         env = os.environ.copy()
-        # Pass API key via environment if configured
-        if self._api_key_env:
-            api_key = os.environ.get(self._api_key_env, "")
-            if api_key:
-                # We always use the "openai" provider for OpenCode now,
-                # which reads OPENAI_API_KEY (works for Azure too via
-                # Bearer token auth on the OpenAI-compatible endpoint).
-                env["OPENAI_API_KEY"] = api_key
+        # Pass API key via environment if configured. The key still has to reach
+        # the CLI as an env var (that is opencode's only input for it), but we
+        # take it straight from the resolved config when it was set there rather
+        # than requiring a round-trip through the ambient environment.
+        api_key = self._resolve_api_key()
+        if api_key:
+            # We always use the "openai" provider for OpenCode now,
+            # which reads OPENAI_API_KEY (works for Azure too via
+            # Bearer token auth on the OpenAI-compatible endpoint).
+            env["OPENAI_API_KEY"] = api_key
 
         # Use -m flag to specify model (more reliable than opencode.json)
         resolved_model = self._resolve_opencode_model()
@@ -475,31 +503,66 @@ class OpenCodeBridge:
         cmd = self._build_opencode_command(opencode_cmd, resolved_model, prompt)
 
         t0 = time.monotonic()
+        # Stream live: unlike subprocess.run(capture_output=True), which blocks
+        # until the process exits, we read the merged stdout/stderr line-by-line
+        # from a background thread and echo each line to the logger as it
+        # arrives. The full text is still collected into ``log`` so the caller's
+        # return value and opencode_log.txt are unchanged.
+        proc = None
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
                 cwd=str(workspace),
-                capture_output=True,
+                # ``opencode run`` reads stdin (to allow piped input) and only
+                # starts work once it sees EOF. Whatever stdin the host process
+                # happens to have is therefore load-bearing: a console or closed
+                # handle gives EOF immediately, but an open-and-never-written
+                # pipe (e.g. when launched from an IDE run configuration) leaves
+                # opencode blocked forever. Pin it to DEVNULL so EOF is
+                # immediate regardless of how the pipeline itself was launched.
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=self._timeout_sec,
+                bufsize=1,
                 env=env,
             )
-            elapsed = time.monotonic() - t0
-            log = result.stdout + "\n" + result.stderr
-            return result.returncode == 0, log, elapsed
-        except subprocess.TimeoutExpired as exc:
-            elapsed = time.monotonic() - t0
-            log = f"TIMEOUT after {elapsed:.1f}s"
-            if exc.stdout:
-                log += f"\nstdout: {exc.stdout[:2000] if isinstance(exc.stdout, str) else exc.stdout.decode(errors='replace')[:2000]}"
-            return False, log, elapsed
         except FileNotFoundError:
             return False, "opencode CLI not found", 0.0
         except Exception as exc:  # noqa: BLE001
+            return False, f"Unexpected error: {exc}", 0.0
+
+        log_parts: list[str] = []
+
+        def _reader() -> None:
+            assert proc is not None and proc.stdout is not None
+            for line in proc.stdout:
+                _line = line.rstrip("\n")
+                log_parts.append(line)
+                if _line.strip():
+                    logger.info("[opencode] %s", _line.rstrip())
+            # On EOF the pipe closes even if we timeout-kill the process, so the
+            # reader thread terminates cleanly either way.
+
+        reader = threading.Thread(target=_reader, daemon=True)
+        reader.start()
+
+        try:
+            proc.wait(timeout=self._timeout_sec)
+        except subprocess.TimeoutExpired:
             elapsed = time.monotonic() - t0
-            return False, f"Unexpected error: {exc}", elapsed
+            proc.kill()
+            reader.join(timeout=2.0)
+            log = "".join(log_parts)
+            log += f"\nTIMEOUT after {elapsed:.1f}s"
+            logger.warning("opencode timed out after %.1fs, killed", elapsed)
+            return False, log, elapsed
+        reader.join(timeout=2.0)
+        elapsed = time.monotonic() - t0
+        log = "".join(log_parts)
+        return proc.returncode == 0, log, elapsed
 
     @staticmethod
     def _build_opencode_command(

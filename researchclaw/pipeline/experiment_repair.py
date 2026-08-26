@@ -673,6 +673,7 @@ def _repair_via_opencode(
         bridge = OpenCodeBridge(
             model=getattr(_oc_cfg, "model", "") or "",
             llm_base_url=getattr(config.llm, "base_url", "") or "",
+            api_key=getattr(config.llm, "api_key", "") or "",
             api_key_env=getattr(config.llm, "api_key_env", "") or "",
             llm_provider=getattr(config.llm, "provider", "openai-compatible") or "openai-compatible",
             timeout_sec=getattr(_oc_cfg, "timeout_sec", 600),

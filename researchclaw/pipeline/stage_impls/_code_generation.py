@@ -552,6 +552,7 @@ def _execute_code_generation(
                 _bridge = OpenCodeBridge(
                     model=_oc_model,
                     llm_base_url=config.llm.base_url,
+                    api_key=config.llm.api_key,
                     api_key_env=config.llm.api_key_env,
                     llm_provider=config.llm.provider,
                     timeout_sec=_oc_cfg.timeout_sec,
