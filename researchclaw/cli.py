@@ -1509,6 +1509,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    import logging
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format='%(asctime)s.%(msecs)03d | %(levelname)-8s | %(filename)s:%(lineno)d - %(message)s',
+        )
     parser = build_parser()
     args = parser.parse_args(argv)
 
