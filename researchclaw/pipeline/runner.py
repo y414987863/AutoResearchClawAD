@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time as _time
 from pathlib import Path
+from typing import Callable
 
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
@@ -441,8 +442,31 @@ def execute_pipeline(
     skip_noncritical: bool = False,
     kb_root: Path | None = None,
     cancel_event: "threading.Event | None" = None,
+    progress_callback: "Callable[[dict], None] | None" = None,
 ) -> list[StageResult]:
-    """Execute pipeline stages sequentially from *from_stage* to *to_stage* (inclusive)."""
+    """Execute pipeline stages sequentially from *from_stage* to *to_stage* (inclusive).
+
+    ``progress_callback``: optional sink for structured stage-progress events.
+    When supplied, it is invoked (best-effort, exceptions swallowed) at each
+    stage boundary with a dict payload::
+
+        {"type": "stage_start", "stage": <int>, "name": <str>}
+        {"type": "stage_end",   "stage": <int>, "name": <str>,
+         "status": "done"|"failed"|"degraded"|..., "elapsed_sec": <float>,
+         "error": <str|None>}
+
+    This lets an out-of-process bridge (e.g. the LLM4AD web backend) push live
+    progress without polling the run directory.  The callback is threaded into
+    the recursive REFINE/PIVOT re-run below so rolled-back stages report too.
+    """
+
+    def _notify_progress(**payload: object) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(dict(payload))
+        except Exception:  # noqa: BLE001 — never let a bad sink break the pipeline
+            logger.debug("progress_callback raised (ignored)")
 
     results: list[StageResult] = []
     started = False
@@ -504,6 +528,9 @@ def execute_pipeline(
             except Exception:
                 pass
 
+        # ── Progress callback: stage start ──
+        _notify_progress(type="stage_start", stage=stage_num, name=stage.name)
+
         # ── Cost budget check ──
         if cost_budget > 0:
             try:
@@ -547,6 +574,13 @@ def execute_pipeline(
                 ))
             except Exception:
                 pass
+
+        # ── Progress callback: stage end ──
+        _notify_progress(
+            type="stage_end", stage=stage_num, name=stage.name,
+            status=result.status.value, elapsed_sec=round(elapsed, 1),
+            error=result.error,
+        )
 
         # ── ExperimentSpec: generate after design, validate after analysis ──
         if stage == Stage.EXPERIMENT_DESIGN and result.status == StageStatus.DONE:
@@ -770,6 +804,7 @@ def execute_pipeline(
                     skip_noncritical=skip_noncritical,
                     kb_root=kb_root,
                     cancel_event=cancel_event,
+                    progress_callback=progress_callback,
                 )
                 results.extend(pivot_results)
                 # BUG-211: Promote best stage-14 after REFINE completes so
