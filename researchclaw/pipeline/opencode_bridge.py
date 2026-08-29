@@ -271,8 +271,9 @@ is discarded as a failure. If a detail is unclear, pick a sensible default,
 note it in a comment, and continue.
 
 Your first action must be a tool call that reads TASK.md — never a text reply.
-You are done when main.py and its supporting modules exist and run.
-Writing no files is a failure.
+You are NOT done when the files exist — you are done when you have RUN them and
+they work. TASK.md tells you which interpreter to use and what to check.
+Writing no files is a failure; so is reporting success for code you never ran.
 """
 
 # Full instructions, written to the workspace as TASK.md. This is read by the
@@ -314,6 +315,53 @@ method or dataset.
   `GUIDANCE.md` explicitly requires a CLI flag (e.g. an `--algorithm` selector).
 - All results must go to stdout via print statements.
 - Keep the experiment feasible within {time_budget_sec} seconds total.
+
+## Verify before you finish (MANDATORY)
+
+Writing the files is not the end of the task. Code that has never been executed
+is not done — a single bad line (an accumulator reset to `None`, a key that no
+data file carries) is invisible on reading and fatal on running, and nothing
+downstream will fix it for you.
+
+1. Always use this exact interpreter, never a bare `python`. It is the
+   environment the experiment is executed in later, and the only one guaranteed
+   to have the packages `GUIDANCE.md` lists. Keep it quoted — the path may
+   contain spaces:
+
+       "{python}"
+
+2. Run the DEFAULT entry point — this is what the pipeline executes later, so it
+   is the ONLY valid completion check:
+
+       "{python}" main.py
+
+   It must exit 0 and print a finite `{metric}`. A traceback, `nan`/`inf`, or a
+   missing metric means the task is NOT done — no exception.
+
+   If it fails, FIX the code and re-run the default. Keep fixing and re-running
+   until the default passes. This is a loop, not a single try.
+
+   If `GUIDANCE.md` defines a single-unit mode (e.g. an `--algorithm` selector),
+   you may run `"{python}" main.py --algorithm <name>` to LOCATE which algorithm
+   is at fault when the default fails — but a passing single-unit run is NOT a
+   pass. Only the default run (no flags) counts as done.
+
+3. Read the output. It must exit 0 and print a finite `{metric}`. A traceback,
+   a `nan`/`inf`, or a missing metric means the task is NOT done.
+
+4. Fix whatever you find and run it again. Repeat until it passes.
+
+   One exception: if it fails only because a package `GUIDANCE.md` lists as
+   available cannot be imported here, that is an environment gap, not a defect.
+   The experiment may be executed elsewhere (a container) where the package does
+   exist. Note it in a comment and move on — do NOT restructure the code, drop
+   the dependency, or reimplement it by hand to make the import go away.
+
+5. Keep the default configuration small enough that this verification finishes
+   in seconds. Shrink the workload, not the correctness.
+
+Never report success for code you did not run to completion. If it still fails
+after your best effort, say so explicitly and leave the files in place.
 
 ## Working style
 
@@ -365,6 +413,7 @@ class OpenCodeBridge:
         timeout_sec: int = 600,
         max_retries: int = 1,
         workspace_cleanup: bool = True,
+        python_path: str = "",
     ) -> None:
         self._model = model
         self._llm_base_url = llm_base_url
@@ -374,6 +423,11 @@ class OpenCodeBridge:
         self._timeout_sec = timeout_sec
         self._max_retries = max_retries
         self._workspace_cleanup = workspace_cleanup
+        # Interpreter the generated code will actually be executed with later
+        # (the sandbox's). The agent is told to verify with THIS one, because a
+        # bare `python` on PATH is often a different environment without the
+        # scientific packages, so "it ran for me" would not transfer.
+        self._python_path = python_path
 
     # -- availability check ---------------------------------------------------
 
@@ -429,8 +483,24 @@ class OpenCodeBridge:
 
         # Write the full task instructions. These live here rather than in the
         # CLI prompt because argv has a hard length limit (32767 on Windows).
+        #
+        # The interpreter is spelled out so the agent verifies with the SAME
+        # environment the experiment later runs in; falling back to "python"
+        # only when none is configured, which at least keeps the instruction
+        # runnable.
+        _py = self._python_path or "python"
+        try:
+            if self._python_path:
+                # POSIX separators on purpose: the agent runs this through a
+                # shell, and a Windows path like ``D:\4.work\...`` would have
+                # ``\4`` eaten as an escape. Windows accepts forward slashes for
+                # every API we need, so this form is safe on both platforms.
+                _py = Path(self._python_path).resolve().as_posix()
+        except OSError:
+            pass
         (ws / "TASK.md").write_text(
             _TASK_MD_TEMPLATE
+            .replace("{python}", _py)
             .replace("{metric}", metric)
             .replace("{time_budget_sec}", str(time_budget_sec)),
             encoding="utf-8",

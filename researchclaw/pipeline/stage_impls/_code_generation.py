@@ -6,6 +6,7 @@ import ast
 import json
 import logging
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -246,7 +247,11 @@ def _hard_indexed_instance_keys(code: str) -> set[str]:
     aliases: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "optimize":
-            args = node.args.args or node.args.posonlyargs
+            # Positional-only params come FIRST in the signature, so they must be
+            # concatenated, not used as a fallback: `def optimize(instance, /, seed)`
+            # has posonlyargs=[instance] and args=[seed], and picking `args` there
+            # tracked `seed` and silently disabled this whole check.
+            args = node.args.posonlyargs + node.args.args or node.args.kwonlyargs
             if args:
                 aliases.add(args[0].arg)
     if not aliases:
@@ -288,11 +293,21 @@ def _hard_indexed_instance_keys(code: str) -> set[str]:
 
 
 def _injected_instance_keys(code: str) -> set[str]:
-    """Keys the evaluator writes into a dict before handing it to the algorithm.
+    """Keys the evaluator supplies to the algorithm on top of the instance file.
 
-    Any ``<name>["k"] = ...`` counts. Deliberately generous: the point is to avoid
-    false positives in the data-field check, and an over-broad exemption only
-    weakens the check rather than blocking a valid experiment.
+    Recognises the three ways generated evaluators build an augmented instance:
+
+    - a dict literal, usually ``{**instance, "x0": ..., "_objective": ...}``
+      passed straight into the call. This is the idiomatic form because it does
+      not mutate the caller's dict, and it is exactly what the deficiency
+      message recommends, so missing it flagged correct code as broken.
+    - ``dict(instance, x0=...)`` keyword form.
+    - ``<name>["k"] = ...`` subscript assignment.
+    - ``<name>.setdefault("k", ...)``, which injects a key without overwriting.
+
+    Deliberately generous: the point is to avoid false positives in the
+    data-field check, and an over-broad exemption only weakens that check rather
+    than blocking a valid experiment.
     """
     try:
         tree = ast.parse(code)
@@ -300,6 +315,29 @@ def _injected_instance_keys(code: str) -> set[str]:
         return set()
     keys: set[str] = set()
     for node in ast.walk(tree):
+        # {"k": v} / {**instance, "k": v}
+        if isinstance(node, ast.Dict):
+            for k in node.keys:
+                if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                    keys.add(k.value)
+        # dict(instance, k=v)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "dict"
+        ):
+            keys.update(kw.arg for kw in node.keywords if kw.arg)
+        # d.setdefault("k", v)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "setdefault"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            keys.add(node.args[0].value)
+        # d["k"] = v
         targets: list[ast.expr] = []
         if isinstance(node, ast.Assign):
             targets = list(node.targets)
@@ -370,10 +408,29 @@ def _evolve_block_problems(path: str, code: str) -> list[str]:
         and n.name != "optimize"
     }
     if helpers:
+        # A name bound inside `optimize` is a LOCAL that shadows the module-level
+        # helper, not a call to it — `tour_length = 0.0` next to a module-level
+        # `def tour_length(...)` is not delegation. Filtering on Load context
+        # alone is not enough: reading the local afterwards is also a Load, so
+        # every locally-bound name is excluded outright.
+        #
+        # ``ast.arg`` covers the parameters of nested closures too (a `def
+        # inner(helper)` inside optimize), which are bindings just like an
+        # assignment. Erring generous here is deliberate: over-excluding only
+        # weakens this advisory check, while a false positive accuses correct
+        # code of hiding the algorithm outside the evolvable markers.
+        local_names = {
+            a.arg for a in ast.walk(fn) if isinstance(a, ast.arg)
+        } | {
+            n.id for n in ast.walk(fn)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+        }
         used = sorted(
             n.id for n in ast.walk(fn)
             if isinstance(n, ast.Name)
+            and isinstance(n.ctx, ast.Load)
             and n.id in helpers
+            and n.id not in local_names
             and start_line <= n.lineno <= end_line
         )
         if used:
@@ -400,7 +457,17 @@ def _check_llm4ad_structure(files: dict[str, str]) -> list[str]:
 
     algo_files = [
         k for k in files
-        if k.startswith("algorithms/") and k.endswith(".py")
+        if k.startswith("algorithms/")
+        and k.endswith(".py")
+        # `__init__.py` / `__main__.py` are package machinery, not algorithms.
+        # The Stage-13 packager only ever picks `algorithms/<algo>/<algo>.py`
+        # (see `_discover_algorithms`), so holding a dunder module to the
+        # algorithm contract invents deficiencies for a file nobody evolves —
+        # and the nested layout needs an `__init__.py` in every algorithm dir,
+        # so this fired on every run. A non-dunder module whose name does not
+        # match its directory is still reported below: the packager skips it
+        # silently, and saying so here is better than losing it later.
+        and not Path(k).name.startswith("__")
     ]
     if not algo_files:
         problems.append(
@@ -426,11 +493,29 @@ def _check_llm4ad_structure(files: dict[str, str]) -> list[str]:
             )
         problems.extend(_evolve_block_problems(k, code))
 
-    if not any(k.startswith("data/") and k.endswith(".json") for k in files):
+    # Any extension counts. Instance formats in this domain are not all JSON
+    # (TSPLIB, .mps, .npz, .csv), and the runner delegates parsing to
+    # `evaluator.load_instance`, so demanding `.json` here would reject valid
+    # experiments. What matters is that instances are shipped as static files.
+    _instance_names = [
+        k for k in files
+        if k.startswith("data/") and "/" not in k[len("data/"):]
+    ]
+    if not _instance_names:
         problems.append(
-            "LLM4AD_STRUCTURE: no `data/*.json` instance files — static "
+            "LLM4AD_STRUCTURE: no instance files under `data/` — static "
             "instances must be generated once and shipped with the code."
         )
+    else:
+        # A non-JSON instance is fine, but only if the experiment says how to
+        # read it: run_single.py falls back to json.load and raises otherwise.
+        _non_json = [k for k in _instance_names if not k.endswith(".json")]
+        if _non_json and "def load_instance(" not in files.get("evaluator.py", ""):
+            problems.append(
+                f"LLM4AD_STRUCTURE: `{_non_json[0]}` is not JSON, but evaluator.py "
+                "defines no `load_instance(path)`. Add it so the package runner "
+                "can read this format (it only falls back to json.load)."
+            )
 
     main_code = files.get("main.py", "")
     if not main_code:
@@ -539,6 +624,119 @@ def _check_llm4ad_structure(files: dict[str, str]) -> list[str]:
                 )
 
     return problems
+
+
+def _dangling_local_imports(files: dict[str, str]) -> list[tuple[str, str]]:
+    """Report imports nothing can satisfy — informational only, never a gate.
+
+    A real judgment on whether the package runs belongs to the smoke run; this
+    only surfaces candidates when a generated file imports a name that is
+    neither a generated module nor importable here.
+    """
+    import importlib.util as _ilu
+
+    known = {
+        Path(f).stem for f in files if f.endswith(".py")
+    } | {
+        f[: -len(".py")].replace("/", ".") for f in files if f.endswith(".py")
+    }
+
+    _installed: dict[str, bool] = {}
+
+    def _is_installed(mod: str) -> bool:
+        if mod not in _installed:
+            try:
+                _installed[mod] = _ilu.find_spec(mod) is not None
+            except (ImportError, ValueError, AttributeError):
+                # A parent package that refuses to load tells us nothing about
+                # whether the name resolves at runtime; assume it does rather
+                # than raise a false alarm.
+                _installed[mod] = True
+        return _installed[mod]
+
+    out: list[tuple[str, str]] = []
+    for fname, code in files.items():
+        if not fname.endswith(".py"):
+            continue
+        for mod in re.findall(
+            r"^\s*(?:from|import)\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+            code, re.MULTILINE,
+        ):
+            if mod in known or mod.startswith("_"):
+                continue
+            if not _is_installed(mod):
+                out.append((fname, mod))
+    return out
+
+
+def _merge_repaired_files(
+    files: dict[str, str], repaired: dict[str, str] | None, *, label: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Merge a repair reply into ``files``, accepting all new files.
+
+    A repair reply contains only the files it changed, so requiring ``main.py``
+    would discard targeted fixes. New files are accepted wholesale — a rename
+    arrives as a NEW module plus edits to its importers. Whether the merge is
+    sane is the smoke run's job; guessing here mis-classifies.
+    """
+    repaired = repaired or {}
+    known = {k: v for k, v in repaired.items() if k in files}
+    new = {k: v for k, v in repaired.items() if k not in files}
+    if new:
+        logger.info("Stage 10: %s added new file(s) %s", label, ", ".join(sorted(new)))
+    applied = {**known, **new}
+    return {**files, **applied}, applied
+
+
+def _try_smoke_run(exp_dir: Path, config: Any) -> tuple[int, str] | None:
+    """Run the DEFAULT entry point once; None on success.
+
+    Stage 12 runs ``main.py`` with no flags, so a crash on that path (an
+    ablation assert, a full-comparison check) must be caught here — running
+    ``--algorithm`` would bypass it.
+    """
+    import subprocess as _sp
+
+    py = getattr(getattr(config, "experiment", None), "sandbox", None)
+    py_path = getattr(py, "python_path", "") or ""
+
+    # Resolve to absolute paths. run_dir (and thus exp_dir/main_py) is built
+    # from the user's `--output`, which may be relative — passing a relative
+    # main_py with cwd=exp_dir makes Python resolve the path against cwd again,
+    # producing ".../experiment/artifacts/.../experiment/main.py" (duplicated)
+    # and "can't open file" even though main.py exists.
+    exp_dir = Path(exp_dir).resolve()
+    main_py = exp_dir / "main.py"
+    if not main_py.is_file():
+        # No entry point — the stage's own main.py check reports that.
+        return None
+
+    try:
+        proc = _sp.run(
+            [py_path or sys.executable, str(main_py)],
+            cwd=str(exp_dir),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+    except _sp.TimeoutExpired:
+        # A slow-but-legal run is not a launch failure: it started and is
+        # simply past the budget. OpenCode is expected to ship a seconds-scale
+        # demo config; if it did not, that is a warning, not a reason to kill
+        # the stage. Return None (success) and let the run proceed.
+        logger.warning(
+            "Stage 10: smoke run exceeded 120s — experiment started but is slow; "
+            "not treating as a launch failure"
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return (1, f"failed to launch: {exc}")
+    if proc.returncode == 0:
+        return None
+    tail = (proc.stderr or "")[-1500:] or (proc.stdout or "")[-1500:]
+    return (proc.returncode, tail)
 
 
 def _execute_code_generation(
@@ -892,6 +1090,9 @@ def _execute_code_generation(
                     timeout_sec=_oc_cfg.timeout_sec,
                     max_retries=_oc_cfg.max_retries,
                     workspace_cleanup=_oc_cfg.workspace_cleanup,
+                    # Verify with the interpreter the sandbox will actually use,
+                    # so "it ran for the agent" means it runs in Stage 12 too.
+                    python_path=config.experiment.sandbox.python_path,
                 )
 
                 logger.info(
@@ -1289,6 +1490,13 @@ def _execute_code_generation(
     if not all_valid:
         _has_critical = False
         for fname, code in files.items():
+            # Only Python files. `validate_code` parses its input as Python, so
+            # a README.md reports a "syntax" error and blocks the whole stage —
+            # the per-file loop above skips non-.py for exactly this reason, and
+            # this loop must agree. Any check that flips `all_valid` (including
+            # the LLM4AD structure checks) otherwise fails the stage on prose.
+            if not fname.endswith(".py"):
+                continue
             _v = validate_code(code)
             if not _v.ok:
                 for issue in _v.issues:
@@ -1318,39 +1526,12 @@ def _execute_code_generation(
     # local module that doesn't exist in the files dict.  This catches the
     # case where Beast Mode/CodeAgent produced an intermediate file that
     # got lost during repair iterations.
-    # Both the bare module name and the full relative path are known, so a
-    # nested file like algorithms/nm/nm.py satisfies `import nm` (which is how
-    # main.py's importlib loader reaches it) without a false positive.
-    _known_modules = {
-        Path(f).stem for f in files if f.endswith(".py")
-    } | {
-        f[: -len(".py")].replace("/", ".") for f in files if f.endswith(".py")
-    }
-    _stdlib_and_common = {
-        "os", "sys", "json", "math", "time", "copy", "re", "random",
-        "pathlib", "argparse", "logging", "collections", "functools",
-        "itertools", "abc", "typing", "dataclasses", "enum", "io",
-        "csv", "pickle", "glob", "shutil", "subprocess", "datetime",
-        "numpy", "np", "torch", "torchvision", "gymnasium", "gym",
-        "sklearn", "scipy", "pandas", "matplotlib", "PIL", "tqdm",
-        "einops", "timm", "transformers", "datasets", "peft",
-        "stable_baselines3",
-    }
-    for fname, code in list(files.items()):
-        if not fname.endswith(".py"):
-            continue
-        for _m in re.findall(
-            r"^(?:from|import)\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-            code, re.MULTILINE,
-        ):
-            if (_m not in _known_modules
-                    and _m not in _stdlib_and_common
-                    and not _m.startswith("_")):
-                logger.warning(
-                    "BUG-184: %s imports '%s' which is not in generated "
-                    "files — experiment may crash on import",
-                    fname, _m,
-                )
+    for _f, _m in _dangling_local_imports(files):
+        logger.warning(
+            "BUG-184: %s imports '%s' which is not in generated "
+            "files — experiment may crash on import",
+            _f, _m,
+        )
 
     # --- Write experiment directory ---
     exp_dir = stage_dir / "experiment"
@@ -1470,19 +1651,10 @@ def _execute_code_generation(
                 max_tokens=_code_max_tokens,
             )
             repaired = _extract_multi_file_blocks(repair_resp.content)
-            # A repair reply legitimately contains only the files it changed —
-            # requiring main.py here would discard every targeted fix. Accept
-            # any subset whose names we already know, and merge rather than
-            # replace so untouched modules survive (cf. BUG-106 in Stage 13).
-            _known = {k: v for k, v in (repaired or {}).items() if k in files}
-            _unknown = sorted(set(repaired or {}) - set(files))
-            if _unknown:
-                logger.warning(
-                    "Stage 10: deep repair returned unknown file(s) %s — ignored",
-                    ", ".join(_unknown),
-                )
+            files, _known = _merge_repaired_files(
+                files, repaired, label="deep repair"
+            )
             if _known:
-                files = {**files, **_known}
                 for fname, code in _known.items():
                     _wp = exp_dir / fname
                     _wp.parent.mkdir(parents=True, exist_ok=True)
@@ -1620,19 +1792,10 @@ def _execute_code_generation(
                         )
                         fixed_files = _extract_multi_file_blocks(fix_resp.content)
                         # Partial reply is normal — see deep-repair note above.
-                        _fx = {
-                            k: v for k, v in (fixed_files or {}).items()
-                            if k in files
-                        }
-                        _fx_unknown = sorted(set(fixed_files or {}) - set(files))
-                        if _fx_unknown:
-                            logger.warning(
-                                "Stage 10: review-fix returned unknown file(s) "
-                                "%s — ignored",
-                                ", ".join(_fx_unknown),
-                            )
+                        files, _fx = _merge_repaired_files(
+                            files, fixed_files, label="review-fix"
+                        )
                         if _fx:
-                            files = {**files, **_fx}
                             for fname, code in _fx.items():
                                 _wp = exp_dir / fname
                                 _wp.parent.mkdir(parents=True, exist_ok=True)
@@ -1894,10 +2057,14 @@ def _execute_code_generation(
                     f"- 'no_<component>': REMOVE the component entirely "
                     f"(e.g., replace attention with mean pooling, remove a loss term)\n"
                     f"- 'reduced_capacity': HALVE hidden dimensions or layers\n"
-                    f"- Different conditions MUST produce different outputs on the "
-                    f"same input. Add a startup assertion that runs one forward pass "
-                    f"per condition on identical input and prints:\n"
-                    f"  ABLATION_CHECK: <cond1> vs <cond2> outputs_differ=True\n\n"
+                    f"- Conditions should differ in CODE, not merely in a label.\n"
+                    f"Do NOT add a startup assertion that raises when two conditions "
+                    f"produce the same numeric output: stochastic optimizers can "
+                    f"coincidentally agree on one input, and a raise at runtime then "
+                    f"kills the whole experiment at Stage 12. Instead, if you want a "
+                    f"self-check, print a diagnostic line (e.g. "
+                    f"\"ABLATION_CHECK: <cond1> vs <cond2> outputs_differ=True/False\") "
+                    f"without ever raising.\n\n"
                     f"Return ALL files using ```filename:xxx.py format.\n\n"
                     f"Current code:\n{all_code_ctx}\n"
                 )
@@ -1977,6 +2144,83 @@ Multi-file experiment project with {len(files)} file(s): {file_list}
             artifacts=tuple(artifacts),
             evidence_refs=tuple(f"stage-10/{a}" for a in artifacts),
             error=f"Topic-experiment misalignment: {alignment_note}",
+        )
+
+    # --- Real smoke run: the last thing that can go wrong is a runtime crash
+    # the static gates cannot see. A generated experiment carries self-checks
+    # (e.g. an ablation assert that raises when two stochastic conditions
+    # coincide on one input); those pass "validation" but raise the moment the
+    # code actually runs — and Stage 12 has no retry. Run main.py with the exact
+    # sandbox interpreter, and if it fails, feed the traceback back to the LLM
+    # to fix the code, then re-run — a loop, not a single FAIL.
+    _smoke_failures = 0
+    _smoke_max = 3
+    while True:
+        _smoke = _try_smoke_run(exp_dir, config)
+        if _smoke is None:
+            break
+        _rc, _tail = _smoke
+        _smoke_failures += 1
+        logger.error(
+            "Stage 10: generated experiment failed to run (attempt %d/%d, exit=%s) — "
+            "feeding traceback back to fix.\n%s",
+            _smoke_failures, _smoke_max, _rc, _tail,
+        )
+        if llm is None or _smoke_failures >= _smoke_max:
+            break
+
+        # Ask the LLM to fix the files the runtime crash points at.
+        _ctx = "\n\n".join(
+            f"```filename:{f}\n{c}\n```" for f, c in files.items()
+        )
+        _fix_prompt = (
+            f"The generated experiment crashed on the DEFAULT entry point "
+            f"(what Stage 12 runs). Fix the runtime error.\n\n"
+            f"RUNTIME ERROR (exit {_rc}):\n```\n{_tail}\n```\n\n"
+            f"Current code:\n{_ctx}\n\n"
+            "Return the FIXED files. Every import the code references MUST resolve "
+            "(the default run loads ALL algorithms; a missing module or a stray "
+            "entry in the algorithm list is a runtime failure). Keep the result "
+            "runnable in a few seconds. Do NOT remove, rename or reselect any "
+            "algorithm or ablation condition that EXPERIMENT_PLAN.yaml lists — your "
+            "task is to make the existing design run, not to shrink it."
+        )
+        try:
+            _fix_resp = _chat_with_prompt(
+                llm, _pm.system("code_generation"), _fix_prompt,
+                max_tokens=_code_max_tokens,
+            )
+            _fixed = _extract_multi_file_blocks(_fix_resp.content)
+            files, _applied = _merge_repaired_files(files, _fixed, label="smoke fix")
+            for _fn, _code in _applied.items():
+                _wp = exp_dir / _fn
+                _wp.parent.mkdir(parents=True, exist_ok=True)
+                _wp.write_text(_code, encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Stage 10: smoke-fix repair failed: %s", exc)
+            break
+
+    if _smoke is not None:
+        _rc, _tail = _smoke
+        logger.error(
+            "Stage 10: generated experiment still does not run (exit=%s) after "
+            "%d fix attempt(s) — refusing to ship code that cannot run.\n%s",
+            _rc, _smoke_failures, _tail,
+        )
+        (stage_dir / "validation_report.md").write_text(
+            "# Code Validation Report\n\n"
+            "**Status**: BLOCKED — experiment failed to run\n\n"
+            f"exit code: {_rc}\n\n```\n{_tail}\n```",
+            encoding="utf-8",
+        )
+        if "validation_report.md" not in artifacts:
+            artifacts.append("validation_report.md")
+        return StageResult(
+            stage=Stage.CODE_GENERATION,
+            status=StageStatus.FAILED,
+            artifacts=tuple(artifacts),
+            evidence_refs=tuple(f"stage-10/{a}" for a in artifacts),
+            error=f"Generated experiment did not run (exit={_rc}): {_tail[:300]}",
         )
 
     return StageResult(

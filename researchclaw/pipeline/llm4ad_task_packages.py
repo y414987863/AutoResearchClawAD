@@ -52,6 +52,18 @@ class PackageManifest:
 # injects at runtime (which the runner would then not supply).
 _EXCLUDED_ROOT_MODULES = frozenset({"main.py", "run_single.py"})
 
+# Marker prefixing run_single.py's JSON line so the evaluator can find it even
+# when stdout carries other output.
+#
+# ``evaluate_instance`` is SHARED with main.py, and main.py is required to print
+# the metric, so a generated evaluator that also logs per-seed progress is
+# idiomatic — nothing in the contract forbids it. Parsing the whole of stdout as
+# JSON therefore failed on perfectly correct experiments with
+# "Invalid JSON from run_single: condition=? seed=0 ...", and every individual
+# scored as a failure. Keying on this marker makes the result independent of
+# whatever else the experiment decides to print.
+_RESULT_MARKER = "@@LLM4AD_RESULT@@"
+
 
 def _discover_shared_modules(exp_dir: Path) -> list[Path]:
     """Root-level ``*.py`` the package must ship alongside the algorithm."""
@@ -173,10 +185,22 @@ def _discover_algorithms(exp_dir: Path) -> list[tuple[str, Path]]:
 
 
 def _discover_instances(exp_dir: Path) -> list[Path]:
+    """Every instance file under ``data/``, whatever its extension.
+
+    Restricting this to ``*.json`` silently shipped zero instances for any task
+    whose instances use a standard non-JSON format — TSPLIB ``.tsp``, ``.mps``
+    for linear programs, ``.npz`` for large matrices, ``.csv``. LLM4AD then had
+    nothing to iterate and the package looked built but evaluated nothing.
+    Which formats an experiment uses is its own business; parsing them is
+    ``evaluator.load_instance``'s job (see :func:`_write_run_single`).
+    """
     data_dir = exp_dir / "data"
     if not data_dir.is_dir():
         return []
-    return sorted(data_dir.glob("*.json"))
+    return sorted(
+        p for p in data_dir.iterdir()
+        if p.is_file() and not p.name.startswith(".")
+    )
 
 
 def _algo_class_name(algo: str) -> str:
@@ -213,7 +237,30 @@ def _write_run_single(algo: str, package: Path, primary_metric: str) -> None:
         "# is the number the paper reports.\n"
         "from evaluator import PRIMARY_METRIC, evaluate_instance\n"
         "\n"
+        "# Optional hook: how to turn an instance FILE into the object\n"
+        "# evaluate_instance expects. Parsing is problem-specific (TSPLIB, .mps,\n"
+        "# .npz, .csv are all normal in this domain), so the experiment owns it,\n"
+        "# exactly as it owns seeds, budget and aggregation. JSON is the default\n"
+        "# only because it is the common case, not because it is required.\n"
+        "try:\n"
+        "    from evaluator import load_instance as _load_instance\n"
+        "except ImportError:\n"
+        "    _load_instance = None\n"
+        "\n"
         f'ALGO = "{algo}"\n'
+        f'MARKER = "{_RESULT_MARKER}"\n'
+        "\n"
+        "\n"
+        "def _read_instance(path):\n"
+        "    if _load_instance is not None:\n"
+        "        return _load_instance(path)\n"
+        '    if path.suffix.lower() == ".json":\n'
+        '        with open(path, "r", encoding="utf-8") as f:\n'
+        "            return json.load(f)\n"
+        "    raise RuntimeError(\n"
+        '        f"{path.name} is not JSON and evaluator.py defines no "\n'
+        '        "load_instance(path); add it so the runner can read this format"\n'
+        "    )\n"
         "\n"
         "\n"
         "def _load_optimize(path):\n"
@@ -236,8 +283,7 @@ def _write_run_single(algo: str, package: Path, primary_metric: str) -> None:
         "    inst_path = Path(sys.argv[1])\n"
         "    if not inst_path.is_absolute():\n"
         "        inst_path = (Path.cwd() / inst_path).resolve()\n"
-        '    with open(inst_path, "r", encoding="utf-8") as f:\n'
-        "        instance = json.load(f)\n"
+        "    instance = _read_instance(inst_path)\n"
         "\n"
         "    algo_path = Path(sys.argv[2]).resolve()\n"
         "    if not algo_path.is_file():\n"
@@ -249,7 +295,9 @@ def _write_run_single(algo: str, package: Path, primary_metric: str) -> None:
         '            "evaluate_instance must return a metrics dict, got %s"\n'
         "            % type(metrics).__name__\n"
         "        )\n"
-        '    print(json.dumps({"primary_metric": PRIMARY_METRIC, "metrics": metrics}))\n'
+        "    # Marker-prefixed so the evaluator can pick this line out of stdout:\n"
+        "    # evaluate_instance is shared with main.py and may legitimately log.\n"
+        '    print(MARKER + json.dumps({"primary_metric": PRIMARY_METRIC, "metrics": metrics}))\n'
         "\n"
         "\n"
         'if __name__ == "__main__":\n'
@@ -267,6 +315,7 @@ def _write_evaluator(
     text = (
         "import asyncio\n"
         "import json\n"
+        "import os\n"
         "import sys\n"
         "import time\n"
         "from pathlib import Path\n"
@@ -282,6 +331,16 @@ def _write_evaluator(
         "\n"
         f'PRIMARY_METRIC = "{primary_metric}"\n'
         f'ALGO = "{algo}"\n'
+        f'MARKER = "{_RESULT_MARKER}"\n'
+        "\n"
+        "# Force UTF-8 on the child's stdout. Writing to a pipe, Python encodes\n"
+        "# with the locale codepage, so a progress line containing a character\n"
+        "# outside it (checkmarks and bullets are what models reach for) raises\n"
+        "# UnicodeEncodeError and kills the run — the evaluation then fails for a\n"
+        "# reason that has nothing to do with the algorithm. We decode as UTF-8\n"
+        "# below, so this also makes the two ends agree.\n"
+        "_CHILD_ENV = dict(os.environ)\n"
+        '_CHILD_ENV["PYTHONIOENCODING"] = "utf-8"\n'
         "\n"
         "# This file, run_single.py and every fixed module live at the package\n"
         "# root, which is NOT under version_control.local_path. Resolving them\n"
@@ -350,6 +409,7 @@ def _write_evaluator(
         "                cwd=str(PACKAGE_ROOT),\n"
         "                stdout=asyncio.subprocess.PIPE,\n"
         "                stderr=asyncio.subprocess.PIPE,\n"
+        "                env=_CHILD_ENV,\n"
         "            )\n"
         "            stdout_bytes, stderr_bytes = await asyncio.wait_for(\n"
         "                proc.communicate(), timeout=cfg.timeout or 60.0)\n"
@@ -370,12 +430,36 @@ def _write_evaluator(
         f'                error_message=f"run_single failed: {{stderr.strip()}}",\n'
         "                duration_ms=duration_ms,\n"
         "            )\n"
-        "        try:\n"
-        "            payload = json.loads(stdout.strip())\n"
-        "        except json.JSONDecodeError:\n"
+        "        # Pull the result line out of stdout rather than parsing all of it.\n"
+        "        # evaluate_instance is shared with main.py, which is required to\n"
+        "        # print its metric, so per-seed logging on stdout is normal and\n"
+        "        # must not be read as a malformed result.\n"
+        "        payload = None\n"
+        "        for line in reversed(stdout.splitlines()):\n"
+        "            idx = line.find(MARKER)\n"
+        "            if idx == -1:\n"
+        "                continue\n"
+        "            try:\n"
+        "                payload = json.loads(line[idx + len(MARKER):].strip())\n"
+        "            except json.JSONDecodeError:\n"
+        "                payload = None\n"
+        "            break\n"
+        "        if payload is None:\n"
+        "            # Fall back to the last JSON-looking line, so a package built\n"
+        "            # before the marker existed still evaluates.\n"
+        "            for line in reversed(stdout.splitlines()):\n"
+        "                line = line.strip()\n"
+        "                if not line.startswith(\"{\"):\n"
+        "                    continue\n"
+        "                try:\n"
+        "                    payload = json.loads(line)\n"
+        "                except json.JSONDecodeError:\n"
+        "                    continue\n"
+        "                break\n"
+        "        if not isinstance(payload, dict):\n"
         "            return EvaluationResult(\n"
         "                score=0.0, metrics={}, success=False,\n"
-        f'                error_message=f"Invalid JSON from run_single: {{stdout[:200]}}",\n'
+        f'                error_message=f"No result line from run_single: {{stdout[-200:]}}",\n'
         "                duration_ms=duration_ms,\n"
         "            )\n"
         "        metrics = payload.get(\"metrics\", {})\n"
@@ -454,11 +538,19 @@ def _write_config(
     resources: dict[str, Any] | None = None,
     description: str = "",
     background: str = "",
+    base_dir: str = "./runs",
+    run_id: str = "",
 ) -> None:
     """Write the LLM4AD config.yaml for a self-contained task package.
 
     ``evolution`` and ``resources`` come from ``config.experiment.llm4ad_boost``
     so the user-edited yaml actually drives the run (previously hard-coded).
+    ``base_dir`` is where llm4ad writes its per-run worktrees. Callers running
+    evolution may hand in a directory outside the package (see
+    :func:`run_evolution_on_packages`): the package path can exceed Windows'
+    260-char limit under a long artifact tree, and llm4ad then dies with
+    ``fatal: '$GIT_DIR' too big``, so the git worktree root is moved somewhere
+    short, and the run artifacts are collected back afterwards.
     """
     import yaml as _yaml
 
@@ -509,7 +601,11 @@ def _write_config(
         "\n"
         "description_en: \"{desc_en}\"\n"
         "{bg_block}\n"
-        "base_dir: \"./runs\"\n"
+        "base_dir: \"{base_dir}\"\n"
+        # Pin run_id so each invocation gets a fresh {base}/{project}/{run_id}
+        # workspace; left to llm4ad it is a random uuid, which does not isolate
+        # across pipeline runs.
+        "run_id: \"{run_id}\"\n"
         "random_seed: 42\n"
         "\n"
         "providers:\n"
@@ -602,6 +698,8 @@ def _write_config(
         eval_timeout=eval_timeout,
         parallel=parallel,
         desc_en=desc_en,
+        base_dir=base_dir,
+        run_id=run_id,
         bg_block=bg_block,
     )
     (package / "config.yaml").write_text(config, encoding="utf-8")
@@ -617,6 +715,8 @@ def generate_task_packages(
     *,
     background: str = "",
     metric_direction: str = "",
+    runs_base_dir: Path | None = None,
+    run_id: str = "",
 ) -> list[PackageManifest]:
     """Generate one self-contained LLM4AD task package per algorithm.
 
@@ -639,10 +739,13 @@ def generate_task_packages(
             case-insensitive) from ``config.experiment.metric_direction``. Takes
             precedence over name-based inference; empty uses
             :func:`infer_metric_direction`.
+        runs_base_dir: Optional directory outside the packages where llm4ad's
+            git worktrees live. Under a deep artifact tree this keeps paths under
+            Windows' 260-char limit; when omitted each package uses its own
+            ``./runs``.
 
     Returns:
-        A list of PackageManifest describing each generated package.
-    """
+        A list of PackageManifest describing each generated package."""
     exp_dir = Path(exp_dir)
     out_dir = Path(out_dir)
     primary_metric = _read_primary_metric(exp_dir)
@@ -696,11 +799,22 @@ def generate_task_packages(
         # 5. Write the custom evaluator.
         _write_evaluator(algo, package, primary_metric, metric_direction)
 
-        # 6. Write config.yaml.
+        # 6. Write config.yaml. When a short run root was supplied, point
+        # base_dir at it (each package gets its own subdir so parallel runs do
+        # not collide) — see run_evolution_on_packages for why.
+        _base_dir = str(package / "runs")
+        if runs_base_dir is not None:
+            # POSIX separators: a Windows path with backslashes lands inside a
+            # YAML double-quoted scalar, where ``\U``/``\T`` are read as escapes
+            # and the plan fails to parse. Windows accepts forward slashes, and
+            # as_posix() keeps the path valid YAML on any platform.
+            _base_dir = (runs_base_dir / algo).resolve().as_posix()
         _write_config(
             algo, package, primary_metric, providers_yaml, evolution, resources,
             description=background,
             background=background,
+            base_dir=_base_dir,
+            run_id=run_id,
         )
 
         files = sorted(p.relative_to(package).as_posix() for p in package.rglob("*") if p.is_file())
@@ -775,7 +889,7 @@ def _read_best_metadata(best_dir: Path) -> tuple[float | None, dict[str, float]]
 
 
 def _resolve_run_best(
-    package_dir: Path, algo: str = ""
+    package_dir: Path, algo: str = "", runs_root: Path | None = None
 ) -> tuple[str | None, str | None, float | None, dict[str, float]]:
     """Locate the best/ snapshot or the evolved algorithm code from a run.
 
@@ -787,8 +901,13 @@ def _resolve_run_best(
 
     ``run_id`` is the run directory name (the child of ``runs/`` on the path to
     the chosen directory); score/metrics are only available via route 1.
+
+    ``runs_root`` is the directory the run actually wrote to. It is usually
+    ``package_dir / "runs"``, but :func:`run_evolution_on_packages` moves it
+    outside the package (short temp path) to stay under Windows' path limit, in
+    which case the caller passes that root here.
     """
-    runs_root = package_dir / "runs"
+    runs_root = Path(runs_root) if runs_root is not None else package_dir / "runs"
     if not runs_root.is_dir():
         return None, None, None, {}
 
@@ -868,16 +987,42 @@ def run_evolution_on_packages(
     base_env = dict(_os.environ)
     if env:
         base_env.update({str(k): str(v) for k, v in env.items()})
+    # We decode this process's output as UTF-8, so tell it to encode as UTF-8.
+    # Writing to a pipe it would otherwise use the locale codepage, and llm4ad's
+    # progress lines carry characters (emoji, box-drawing) that a non-UTF-8
+    # codepage cannot represent — the console sink then drops them, leaving
+    # ``log_tail`` incomplete exactly when it is needed to diagnose a failure.
+    base_env.setdefault("PYTHONIOENCODING", "utf-8")
 
     results: list[EvolutionResult] = []
     packages_dir = Path(packages_dir)
     if not packages_dir.is_dir():
         return results
 
+    # Run outside the package. Under a long artifact tree (repo root + run/ +
+    # stage/ + task_packages/ + <algo>_task/ + gen dirs) a worktree path can
+    # exceed Windows' 260-char limit before gen 2; llm4ad then fails every
+    # worktree with "fatal: '$GIT_DIR' too big" and the run stalls with 0
+    # individuals. ``generate_task_packages`` writes an absolute temp ``base_dir``
+    # into each config.yaml for exactly this reason, so we read it back PER
+    # PACKAGE — using a single shared root here made every algorithm resolve
+    # against the first alphabetically, so all six reported the same best.
     configs = sorted(packages_dir.glob("*/config.yaml"))
     for cfg_path in configs:
         package_dir = cfg_path.parent
         algo = package_dir.name
+        import yaml as _yw
+        try:
+            _bs = (_yw.safe_load(cfg_path.read_text(encoding="utf-8")) or {}).get("base_dir") or ""
+        except (OSError, ValueError):
+            _bs = ""
+        # Absolute (temp) base_dir wins; otherwise fall back to the package's
+        # own ./runs for packages built by older code.
+        if _bs and not _bs.startswith("./") and not _bs.startswith(".\\"):
+            _runs_root = Path(_bs).resolve()
+        else:
+            _runs_root = package_dir / "runs"
+        _runs_root.mkdir(parents=True, exist_ok=True)
         try:
             proc = _sp.run(
                 [llm4ad_cmd, "run", "config.yaml"],
@@ -906,7 +1051,7 @@ def run_evolution_on_packages(
                 )
                 continue
             best_dir, run_id, best_score, best_metrics = _resolve_run_best(
-                package_dir, algo
+                package_dir, algo, runs_root=_runs_root
             )
             results.append(
                 EvolutionResult(

@@ -6,7 +6,9 @@ import json
 import logging
 import math
 import re
+import tempfile
 import time as _time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,11 @@ from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
+
+# Each invocation gets a unique temp workspace. run_dir.name is stable across
+# repeated --from-stage runs, so without this the temp dir accumulates worktrees
+# and _resolve_run_best (which rglob-scans the run root) reads a STALE best.
+_LLM4AD_RUN_TOKEN = uuid.uuid4().hex[:8]
 
 
 def _execute_resource_planning(
@@ -650,6 +657,10 @@ def _generate_llm4ad_task_packages(
         _manifests = generate_task_packages(
             Path(_tp_exp), _tp_out, _llm_config, _evo_cfg, _res_cfg,
             background=_topic, metric_direction=_direction,
+            # Worktrees live under the temp dir (not task_packages/, whose deep
+            # path hits Windows' 260-char limit), scoped to this invocation.
+            runs_base_dir=Path(tempfile.gettempdir()) / "rc_llm4ad" / run_dir.name / f"run_{_LLM4AD_RUN_TOKEN}",
+            run_id=_LLM4AD_RUN_TOKEN,
         )
         logger.info(
             "Stage 13: generated %d LLM4AD task package(s) under %s",
@@ -819,12 +830,18 @@ def _run_llm4ad_evolution(
     for r in ok:
         if r.best_score is None:
             continue
-        _raw = (r.best_metrics or {}).get("mean_best_objective_value")
+        # Log whatever metrics the evaluator reported rather than looking up one
+        # hard-coded key: the metric name is the generated experiment's choice
+        # (`tour_length`, `accuracy`, …), so naming one here printed "n/a" for
+        # every task that is not continuous box-constrained optimisation.
+        _raw = ", ".join(
+            f"{k}={v:.6g}" for k, v in sorted((r.best_metrics or {}).items())
+        )
         logger.info(
-            "Stage 13: %s best_score=%.6g (raw metric=%s, configured direction=%s) — "
-            "MINIMIZE expects best_score <= 0 (raw objective >= 0, negated)",
+            "Stage 13: %s best_score=%.6g (metrics: %s; configured direction=%s) — "
+            "MINIMIZE negates the metric, so best_score <= 0 is expected there",
             r.algo, r.best_score,
-            f"{_raw:.6g}" if _raw is not None else "n/a",
+            _raw or "none reported",
             _direction_cfg or "inferred",
         )
     log["evolution"] = {
@@ -876,6 +893,10 @@ def _run_llm4ad_evolution(
     # Materialise best evolved code to a stable evolution_results/ dir.
     evo_out = stage_dir / "evolution_results"
     evo_out.mkdir(parents=True, exist_ok=True)
+    # Copy the winning individual's CODE only: the source worktree may sit
+    # under a runs/ tree carrying .git and the run history, none of which
+    # belongs in the deliverable — and neither does __pycache__.
+    _tree_ignore = shutil.ignore_patterns(".git", "runs", "best", "__pycache__", "*.pyc")
     for r in results:
         if not r.success or not r.best_code_dir:
             continue
@@ -885,7 +906,7 @@ def _run_llm4ad_evolution(
         dst = evo_out / r.algo
         if dst.exists():
             shutil.rmtree(dst)
-        shutil.copytree(src, dst)
+        shutil.copytree(src, dst, ignore=_tree_ignore)
     log["evolution"]["results_dir"] = str(evo_out)
     logger.info(
         "Stage 13: LLM4AD evolution succeeded for %d/package(s); results under %s",
