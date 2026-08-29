@@ -2,12 +2,15 @@
 
 Turns a stage-10 ``experiment/`` directory into one self-contained LLM4AD
 task package per algorithm. Each package copies the fixed evaluation modules,
-flattens the evolvable algorithm module to the package root, and ships a
-custom evaluator + ``config.yaml`` wired to LLM4AD's ``local_path="."``.
+embeds the evolvable algorithm at ``algorithms/<algo>/<algo>.py`` (mirroring
+the stage-10 layout), and ships a custom evaluator + ``config.yaml`` wired to
+LLM4AD's ``local_path="."``.
 
 Design decisions (verified against LLM4AD_Next/src/llm4ad):
-- ``local_path`` must be the package root (the algorithm module imports the
-  shared modules at the same level; a subdir-only worktree would break imports).
+- ``local_path`` is the package root: the algorithm module imports the shared
+  modules (benchmarks/evaluator/stats_utils) at the same level, and the
+  evaluator's ``project_root`` is the whole worktree, so a subdir-only worktree
+  would break both imports and instance access.
 - ``main.py`` hard-codes one smoke instance, so it is NOT used. Each package
   gets ``run_single.py`` that reads any instance file from ``EvalContext.data_path``.
 - The evaluator reports per-instance metrics; LLM4AD aggregates across instances.
@@ -155,11 +158,12 @@ def _algo_class_name(algo: str) -> str:
 def _write_run_single(algo: str, package: Path, primary_metric: str) -> None:
     """Write the single-instance entry point `run_single.py`.
 
-    It loads the evolvable algorithm module, realises the seeds/starts loop, and
-    delegates the instance-level metric to the shared ``evaluator.py`` (via
-    ``prepare_start``/``evaluate_instance``/``PRIMARY_METRIC``). Because the
-    package runner and ``main.py`` call the SAME evaluator helpers, the number
-    LLM4AD optimises equals the number the paper reports.
+    It loads the evolvable algorithm module (at ``algorithms/<algo>/<algo>.py``),
+    realises the seeds/starts loop, and delegates the instance-level metric to the
+    shared ``evaluator.py`` (via ``prepare_start``/``evaluate_instance``/
+    ``PRIMARY_METRIC``). Because the package runner and ``main.py`` call the SAME
+    evaluator helpers, the number LLM4AD optimises equals the number the paper
+    reports.
     """
     text = (
         "import json\n"
@@ -192,7 +196,7 @@ def _write_run_single(algo: str, package: Path, primary_metric: str) -> None:
         "        instance = json.load(f)\n"
         "\n"
         "    import importlib\n"
-        "    alg_mod = importlib.import_module(ALGO)\n"
+        "    alg_mod = importlib.import_module(f\"algorithms.{ALGO}\")\n"
         "    optimize = getattr(alg_mod, \"optimize\", None)\n"
         "    if optimize is None:\n"
         '        raise RuntimeError(f"{ALGO}.py has no optimize(instance, seed) function")\n'
@@ -491,20 +495,23 @@ def _write_config(
         "  provider: \"default\"\n"
         "  prompt_template: |\n"
         "    Rewrite ONLY the function body of `optimize(instance, seed)` in\n"
-        "    {algo}.py between the `# EVOLVE_START` and `# EVOLVE_END` markers.\n"
+        "    algorithms/{algo}/{algo}.py between the `# EVOLVE_START` and\n"
+        "    `# EVOLVE_END` markers.\n"
         "    The instance dict carries function/dimension/seed/lb/ub/max_evals/x0.\n{max_evals_line}"
         "    Return a dict with best_f (finite) and n_evals (<= max_evals).\n"
         "\n"
         "    OUTPUT FORMAT (STRICT): return EXACTLY ONE fenced code block with a\n"
-        "    `python:{algo}.py` header, containing the FULL {algo}.py file. The\n"
-        "    block header and closing fence must be the first and last lines.\n"
+        "    `python:algorithms/{algo}/{algo}.py` header, containing the FULL\n"
+        "    {algo}.py file. The block header and closing fence must be the first\n"
+        "    and last lines.\n"
         "    Keep imports and module-level constants outside the EVOLVE markers.\n"
         "    Output NOTHING outside the fence - no prose, no explanation, no\n"
         "    other markdown blocks, no sample outputs. In particular do not\n"
-        "    output a JSON block or a `python` block without the `:{algo}.py`\n"
-        "    suffix, or the response will be rejected.\n"
+        "    output a JSON block or a `python` block without the\n"
+        "    `:algorithms/{algo}/{algo}.py` suffix, or the response will be\n"
+        "    rejected.\n"
         "\n"
-        "    ```python:{algo}.py\n"
+        "    ```python:algorithms/{algo}/{algo}.py\n"
         "    <full file: imports, constants, then optimize() with the evolved\n"
         "     body between # EVOLVE_START and # EVOLVE_END>\n"
         "    ```\n"
@@ -627,6 +634,11 @@ def generate_task_packages(
             if shared_src.is_file():
                 shutil.copy2(shared_src, package / mod)
 
+        # 1b. `algorithms/` is a real package so run_single.py can import
+        #     algorithms.<algo> without a namespace-package lookup.
+        (package / "algorithms").mkdir(parents=True, exist_ok=True)
+        (package / "algorithms" / "__init__.py").write_text("", encoding="utf-8")
+
         # 2. Copy instance data (optionally overriding the eval budget).
         if instances:
             (package / "data").mkdir(parents=True, exist_ok=True)
@@ -636,8 +648,13 @@ def generate_task_packages(
             else:
                 shutil.copy2(inst, package / "data" / inst.name)
 
-        # 3. Flatten the evolvable algorithm to the package root.
-        shutil.copy2(src, package / (algo + ".py"))
+        # 3. Embed the evolvable algorithm at algorithms/<algo>/<algo>.py,
+        #    mirroring the stage-10 experiment layout and the LLM4AD task-package
+        #    structure. `local_path="."` keeps the worktree rooted at the package
+        #    root so the algorithm can still import the fixed modules
+        #    (benchmarks/evaluator/stats_utils) that live at the same level.
+        (package / "algorithms" / algo).mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, package / "algorithms" / algo / (algo + ".py"))
 
         # 4. Write the single-instance entry point.
         _write_run_single(algo, package, primary_metric)

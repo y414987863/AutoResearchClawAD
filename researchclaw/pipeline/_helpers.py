@@ -579,6 +579,102 @@ def _extract_yaml_block(text: str) -> str:
     return text.strip()
 
 
+_YAML_BLOCK_HEADER_RE = re.compile(r"^[|>][+-]?\d*\s*$")
+_YAML_KEY_SEP_RE = re.compile(r":(?:\s|$)")
+
+
+def _repair_yaml_line(line: str) -> str | None:
+    """Quote the scalar value on ``line`` so PyYAML stops rejecting it.
+
+    Models routinely emit values that open with a YAML indicator character —
+    ``||x - x*||_2`` (a norm), ``**bold**``, ``*.py``, ``> 0.5`` — or that
+    carry a bare ``:`` inside the value.  Wrapping the value in double quotes
+    makes it a plain string without changing what it says.
+
+    Returns None when there is nothing safe to rewrite, which tells the caller
+    to give up rather than risk corrupting the document.
+    """
+    stripped = line.lstrip()
+    if not stripped or stripped.startswith(("#", "---", "...")):
+        return None
+    indent = line[: len(line) - len(stripped)]
+
+    prefix = ""
+    inner = stripped
+    while inner.startswith("- "):
+        prefix += "- "
+        inner = inner[2:]
+    if not inner:
+        return None
+
+    match = _YAML_KEY_SEP_RE.search(inner)
+    if match and inner[0] not in "'\"":
+        key = inner[: match.start() + 1]
+        value = inner[match.end():].strip()
+    else:
+        # A bare list item (``- ||x||``): the whole entry is the value.  A
+        # quoted scalar is left alone — any ``:`` inside it is part of the
+        # string, not a key separator.
+        if not prefix or inner[0] in "'\"":
+            return None
+        key = ""
+        value = inner
+
+    # Leave real block scalars (``key: |``) and flow collections
+    # (``[a, b]`` / ``{lr: 0.01}``) alone — those are valid structure.
+    if not value or _YAML_BLOCK_HEADER_RE.match(value) or value[0] in "{[":
+        return None
+
+    cleaned = value.strip("\"'").replace("\\", "\\\\").replace('"', '\\"')
+    if not cleaned:
+        return None
+    separator = f"{key} " if key else ""
+    return f'{indent}{prefix}{separator}"{cleaned}"'
+
+
+def _safe_load_yaml(text: str, max_repairs: int = 12) -> Any:
+    """Parse YAML, repairing only the lines the parser actually rejects.
+
+    ``yaml.safe_load`` is all-or-nothing: one bad scalar discards an otherwise
+    complete document.  For LLM output that means a well-formed experiment plan
+    can be thrown away over a single character, and the caller silently falls
+    back to a generic template.
+
+    Repairs are driven by the parser's own error position, so valid content is
+    never rewritten — whole-document rewriting is not safe here, because it
+    mistakes multi-line quoted scalars for unterminated quotes.  Returns None
+    when the document cannot be recovered.
+    """
+    if not text or not text.strip():
+        return None
+    try:
+        return yaml.safe_load(text)
+    except yaml.YAMLError:
+        pass
+
+    # Tabs are never legal YAML indentation, but models emit them anyway.
+    lines = [
+        re.sub(r"^\t+", lambda m: "  " * len(m.group()), ln)
+        for ln in text.split("\n")
+    ]
+    repaired: set[int] = set()
+    for _ in range(max_repairs):
+        try:
+            return yaml.safe_load("\n".join(lines))
+        except yaml.YAMLError as exc:
+            mark = getattr(exc, "problem_mark", None) or getattr(
+                exc, "context_mark", None
+            )
+            if mark is None or mark.line >= len(lines) or mark.line in repaired:
+                return None
+            repaired.add(mark.line)
+            fixed = _repair_yaml_line(lines[mark.line])
+            if fixed is None or fixed == lines[mark.line]:
+                return None
+            lines[mark.line] = fixed
+    return None
+
+
 def _safe_json_loads(text: str, default: Any) -> Any:
     """Parse JSON from text, handling noisy ACP output.
 

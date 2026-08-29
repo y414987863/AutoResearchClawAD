@@ -22,12 +22,40 @@ from researchclaw.pipeline._helpers import (
     _load_hardware_profile,
     _read_prior_artifact,
     _safe_json_loads,
+    _safe_load_yaml,
     _utcnow_iso,
 )
 from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
+
+# Container keys models wrap the plan in even when asked for a flat mapping.
+# The plan itself never uses these as content keys, so unwrapping is safe.
+_PLAN_WRAPPER_KEYS = frozenset(
+    {"experiment_plan", "plan", "experiment", "experiment_design", "design"}
+)
+
+
+def _unwrap_plan(parsed: Any) -> Any:
+    """Unwrap a plan nested under a single container key.
+
+    ``experiment_plan:\\n  baselines: ...`` parses fine but leaves every
+    required key one level down, so the schema-deficit guard reads the plan as
+    empty and pauses the pipeline on a plan that is actually complete.
+
+    Only a lone, known wrapper key is unwrapped — a single-key mapping that
+    isn't a recognised wrapper is left as-is.
+    """
+    if isinstance(parsed, dict) and len(parsed) == 1:
+        key, value = next(iter(parsed.items()))
+        if isinstance(key, str) and key.lower() in _PLAN_WRAPPER_KEYS:
+            if isinstance(value, dict):
+                logger.info(
+                    "Stage 09: plan was wrapped in '%s' — unwrapping", key
+                )
+                return value
+    return parsed
 
 
 def _normalize_plan_field(value: Any) -> list:
@@ -220,17 +248,11 @@ def _execute_experiment_design(
             max_tokens=sp.max_tokens,
         )
         raw_yaml = _extract_yaml_block(resp.content)
-        try:
-            parsed = yaml.safe_load(raw_yaml)
-        except yaml.YAMLError:
-            parsed = None
+        parsed = _unwrap_plan(_safe_load_yaml(raw_yaml))
         # Fallback: reasoning models sometimes emit the YAML without fences
         # or wrapped in prose. Try parsing the whole response as YAML.
         if not isinstance(parsed, dict):
-            try:
-                parsed = yaml.safe_load(resp.content)
-            except yaml.YAMLError:
-                pass
+            parsed = _unwrap_plan(_safe_load_yaml(resp.content))
         # Last fallback: try to find any YAML-like dict in the response
         if not isinstance(parsed, dict):
             import re as _re_yaml
@@ -252,10 +274,7 @@ def _execute_experiment_design(
                         continue
                     _yaml_lines.append(line)
             if _yaml_lines:
-                try:
-                    parsed = yaml.safe_load("\n".join(_yaml_lines))
-                except yaml.YAMLError:
-                    pass
+                parsed = _unwrap_plan(_safe_load_yaml("\n".join(_yaml_lines)))
         if isinstance(parsed, dict):
             plan = parsed
         else:
@@ -283,13 +302,15 @@ def _execute_experiment_design(
                     _retry_prompt,
                     max_tokens=4096,
                 )
-                try:
-                    _retry_parsed = yaml.safe_load(_retry_resp.content)
-                    if isinstance(_retry_parsed, dict):
-                        plan = _retry_parsed
-                        logger.info("Stage 09: Strict YAML retry succeeded.")
-                except yaml.YAMLError:
-                    pass
+                # Strip fences even though the prompt forbids them — models
+                # routinely fence output they were told to emit bare, and this
+                # is the last LLM attempt before template fallbacks.
+                _retry_parsed = _unwrap_plan(
+                    _safe_load_yaml(_extract_yaml_block(_retry_resp.content))
+                )
+                if isinstance(_retry_parsed, dict):
+                    plan = _retry_parsed
+                    logger.info("Stage 09: Strict YAML retry succeeded.")
 
     # BUG-12: Fallback 4 — extract method/baseline names from Stage 8 hypotheses
     if plan is None:
@@ -558,12 +579,9 @@ def _execute_experiment_design(
                     max_tokens=4096,
                 )
                 updated = _extract_yaml_block(resp.content)
-                try:
-                    parsed_update = yaml.safe_load(updated)
-                    if isinstance(parsed_update, dict):
-                        plan = parsed_update
-                except yaml.YAMLError:
-                    pass
+                parsed_update = _unwrap_plan(_safe_load_yaml(updated))
+                if isinstance(parsed_update, dict):
+                    plan = parsed_update
         except Exception:
             logger.debug("HITL guidance application failed (non-blocking)")
 

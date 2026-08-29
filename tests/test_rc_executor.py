@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import yaml
 
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
@@ -1400,6 +1401,87 @@ class TestExperimentDesignGuard:
         assert set(meta["missing_required_keys"]) == {
             "baselines", "proposed_methods", "ablations",
         }
+
+
+class TestYamlRecovery:
+    """Stage 9 threw away complete plans over a single bad scalar.
+
+    `yaml.safe_load` is all-or-nothing, so one unquotable value (a math norm,
+    a markdown bold, a bare `:`) discarded the whole plan and the stage fell
+    back to a generic template — silently, with only a warning logged.
+    """
+
+    def test_recovers_norm_notation(self) -> None:
+        # `||x||` opens with the YAML block-scalar indicator and is the exact
+        # failure seen in a real stage-09 plan.
+        from researchclaw.pipeline._helpers import _safe_load_yaml
+        text = "metrics:\n  - distance: ||x_best - x*||_2\n"
+        assert _safe_load_yaml(text) == {
+            "metrics": [{"distance": "||x_best - x*||_2"}]
+        }
+
+    def test_recovers_bare_list_item(self) -> None:
+        from researchclaw.pipeline._helpers import _safe_load_yaml
+        assert _safe_load_yaml("metrics:\n  - ||x - x*||_2\n") == {
+            "metrics": ["||x - x*||_2"]
+        }
+
+    def test_preserves_valid_yaml_untouched(self) -> None:
+        # The repair must never rewrite a document that already parses —
+        # block scalars, flow collections and multi-line quoted scalars are
+        # all valid structure that a whole-document rewrite would corrupt.
+        from researchclaw.pipeline._helpers import _safe_load_yaml
+        text = (
+            "desc: |\n  line one\n  line two\n"
+            "keys: [a, b]\n"
+            "hp: {lr: 0.01}\n"
+            "note: 'starts here\n  and continues.'\n"
+        )
+        assert _safe_load_yaml(text) == yaml.safe_load(text)
+
+    def test_unrecoverable_returns_none(self) -> None:
+        from researchclaw.pipeline._helpers import _safe_load_yaml
+        assert _safe_load_yaml("") is None
+
+    def test_unwraps_container_key(self) -> None:
+        # Models wrap the plan in `experiment_plan:` even when asked for a
+        # flat mapping; that pushed every required key one level down and
+        # paused the pipeline on a plan that was actually complete.
+        from researchclaw.pipeline.stage_impls._experiment_design import _unwrap_plan
+        wrapped = {"experiment_plan": {"baselines": ["nm"], "ablations": ["a"]}}
+        assert _unwrap_plan(wrapped) == {"baselines": ["nm"], "ablations": ["a"]}
+
+    def test_does_not_unwrap_unknown_single_key(self) -> None:
+        from researchclaw.pipeline.stage_impls._experiment_design import _unwrap_plan
+        plan = {"baselines": ["nm"]}
+        assert _unwrap_plan(plan) == plan
+
+    def test_wrapped_plan_no_longer_pauses(
+        self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle
+    ) -> None:
+        # End-to-end: a fenced, wrapped plan carrying a norm value used to
+        # pause the stage as schema-deficient. It must now produce a plan.
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        stage_dir = run_dir / "stage-09"
+        stage_dir.mkdir(parents=True)
+        _write_prior_artifact(run_dir, 8, "hypotheses.md", "# Hypotheses\n")
+        fake_llm = FakeLLMClient(
+            "```yaml\n"
+            "experiment_plan:\n"
+            "  baselines:\n    - nelder_mead\n"
+            "  proposed_methods:\n    - aada\n"
+            "  ablations:\n    - no_priors\n"
+            "  metrics:\n    - dist: ||x_best - x*||_2\n"
+            "```"
+        )
+        result = rc_executor._execute_experiment_design(
+            stage_dir, run_dir, rc_config, adapters, llm=fake_llm
+        )
+        assert result.status == StageStatus.DONE
+        plan = yaml.safe_load((stage_dir / "exp_plan.yaml").read_text(encoding="utf-8"))
+        assert plan["baselines"] == ["nelder_mead"]
+        assert plan["proposed_methods"] == ["aada"]
 
 
 class TestResourcePlanningFallback:

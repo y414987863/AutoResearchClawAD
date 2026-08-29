@@ -906,12 +906,13 @@ def _promote_llm4ad_to_experiment_final(
     """Overlay evolved algorithm modules onto a clean project directory.
 
     Each ``evolution_results/<algo>/`` is an LLM4AD task package
-    (``<algo>.py`` next to run_single.py / evaluator.py / config.yaml / runs/ /
-    .git/), but downstream stages consume ``experiment_final/`` as a top-level
-    project (``main.py`` + ``algorithms/<algo>/<algo>.py`` + ``data/*.json``).
-    Copying the package wholesale would push llm4ad's scaffolding into the
-    artifact, so we rebuild ``final_dir`` from ``base_exp_dir`` (the clean
-    stage-10 code) and overlay ONLY ``algorithms/<algo>/<algo>.py``.
+    (``algorithms/<algo>/<algo>.py`` next to run_single.py / evaluator.py /
+    config.yaml / runs/ / .git/), but downstream stages consume
+    ``experiment_final/`` as a top-level project (``main.py`` +
+    ``algorithms/<algo>/<algo>.py`` + ``data/*.json``). Copying the package
+    wholesale would push llm4ad's scaffolding into the artifact, so we rebuild
+    ``final_dir`` from ``base_exp_dir`` (the clean stage-10 code) and overlay
+    ONLY ``algorithms/<algo>/<algo>.py``.
 
     Returns the number of algorithm modules overlaid (0 means nothing promoted).
     """
@@ -936,9 +937,11 @@ def _promote_llm4ad_to_experiment_final(
         if not algo_pkg.is_dir():
             continue
         algo_name = algo_pkg.name
-        # The evolved algorithm module sits at the package root as
-        # evolution_results/<algo>/<algo>.py.
-        evolved_src = algo_pkg / f"{algo_name}.py"
+        # The evolved algorithm module is nested at
+        # evolution_results/<algo>/algorithms/<algo>/<algo>.py so the package
+        # root can still host the fixed modules (benchmarks/evaluator/stats_utils)
+        # that the algorithm imports.
+        evolved_src = algo_pkg / "algorithms" / algo_name / f"{algo_name}.py"
         if not evolved_src.is_file():
             continue
         # Map back to the original layout: algorithms/<algo>/<algo>.py.
