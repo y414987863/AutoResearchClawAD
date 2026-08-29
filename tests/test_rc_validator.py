@@ -10,6 +10,7 @@ from researchclaw.experiment.validator import (
     CodeValidation,
     ValidationIssue,
     auto_fix_unbound_locals,
+    check_api_correctness,
     check_filename_collisions,
     extract_imports,
     format_issues_for_llm,
@@ -438,3 +439,167 @@ def test_auto_fix_still_seeds_genuine_if_only_var():
     fixed, n = auto_fix_unbound_locals(code)
     assert n >= 1
     assert "result = None" in fixed
+
+
+# ---------------------------------------------------------------------------
+# check_api_correctness — NumPy 2.0 / pandas 2.0 removed APIs
+# ---------------------------------------------------------------------------
+
+def test_api_correctness_flags_removed_numpy_trapz():
+    warnings = check_api_correctness("x = np.trapz(y, dx=0.1)\n", "m.py")
+    assert any("np.trapz" in w and "np.trapezoid" in w for w in warnings)
+
+
+def test_api_correctness_flags_removed_numpy_names():
+    cases = [
+        ("np.product", "np.prod"),
+        ("np.in1d", "np.isin"),
+        ("np.row_stack", "np.vstack"),
+        ("np.cumproduct", "np.cumprod"),
+        ("np.round_", "np.round"),
+        ("np.alltrue", "np.all"),
+        ("np.sometrue", "np.any"),
+        ("np.NaN", "np.nan"),
+        ("np.Inf", "np.inf"),
+    ]
+    for removed, replacement in cases:
+        warnings = check_api_correctness(f"v = {removed}\n", "m.py")
+        assert any(removed in w and replacement in w for w in warnings), (
+            f"expected {removed} -> {replacement} to be flagged"
+        )
+
+
+def test_api_correctness_does_not_flag_live_numpy_aliases():
+    code = (
+        "import numpy as np\n"
+        "a = np.float_(1.0)\n"
+        "b = np.int_(2)\n"
+        "c = np.complex_(3j)\n"
+        "d = np.float64(4.0)\n"
+        "e = np.float32(5.0)\n"
+        "f = np.mat([[1, 2], [3, 4]])\n"
+    )
+    warnings = check_api_correctness(code, "m.py")
+    # None of these live aliases should be reported as removed-in-2.0.
+    assert not any("was removed in NumPy 2.0" in w for w in warnings)
+
+
+def test_api_correctness_flags_pandas_removals():
+    code = (
+        "import pandas as pd\n"
+        "df = df.append(other)\n"
+        "row = df.ix[0]\n"
+        "for k, v in series.iteritems():\n"
+        "    pass\n"
+    )
+    warnings = check_api_correctness(code, "m.py")
+    assert any("DataFrame/Series.append() was removed in pandas 2.0" in w for w in warnings)
+    assert any("`.ix[]` was removed in pandas 2.0" in w for w in warnings)
+    assert any("`.iteritems()` was removed in pandas 2.0" in w for w in warnings)
+
+
+def test_api_correctness_does_not_flag_list_append_when_no_pandas():
+    # A pure-python list.append is legal and must not be flagged.
+    code = "xs = []\nfor i in range(3):\n    xs.append(i)\n"
+    warnings = check_api_correctness(code, "m.py")
+    assert not any("DataFrame/Series.append() was removed in pandas 2.0" in w for w in warnings)
+
+
+# ---------------------------------------------------------------------------
+# code-generation helpers — llm4ad constraint text + degenerate-instance scan
+# ---------------------------------------------------------------------------
+
+class _Attr:
+    """Minimal attribute holder so a plain config object can be faked."""
+
+    def __init__(self, **kw):
+        self._kw = kw
+
+    def __getattr__(self, name):
+        try:
+            return self._kw[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+class _Cfg:
+    """Config whose .experiment may be absent or a plain object."""
+
+    def __init__(self, experiment=None):
+        self.experiment = experiment
+
+
+def test_llm4ad_constraint_text_empty_when_disabled():
+    from researchclaw.pipeline.stage_impls import _code_generation as cg
+
+    assert cg._llm4ad_constraint_text(_Cfg(experiment=None)) == ""
+    assert cg._llm4ad_constraint_text(
+        _Cfg(experiment=_Attr(llm4ad_boost=_Attr(enabled=False)))
+    ) == ""
+
+
+def test_llm4ad_constraint_text_populated_when_enabled():
+    from researchclaw.pipeline.stage_impls import _code_generation as cg
+
+    text = cg._llm4ad_constraint_text(
+        _Cfg(experiment=_Attr(llm4ad_boost=_Attr(enabled=True)))
+    )
+    assert "EVOLVE_START" in text
+    assert "PRESERVE these markers" in text
+
+
+def test_warn_degenerate_instances(tmp_path):
+    from researchclaw.pipeline.stage_impls import _code_generation as cg
+
+    results = {
+        "by_phase": {
+            "A": {
+                "by_instance": {
+                    "Masked_d10": {
+                        "algorithms": [
+                            {"algo": "x", "n_total": 5, "n_valid": 0},
+                            {"algo": "y", "n_total": 5, "n_valid": 0},
+                        ]
+                    },
+                    "Healthy_d5": {
+                        "algorithms": [
+                            {"algo": "x", "n_total": 5, "n_valid": 3},
+                        ]
+                    },
+                }
+            }
+        }
+    }
+    (tmp_path / "results.json").write_text(
+        __import__("json").dumps(results), encoding="utf-8"
+    )
+    warnings = cg._warn_degenerate_instances(tmp_path)
+    assert any("Masked_d10" in w for w in warnings)
+    assert not any("Healthy_d5" in w for w in warnings)
+
+
+def test_revert_marker_dropped_files_keeps_neutral_fix():
+    """A repair that strips EVOLVE markers is reverted; a neutral fix is kept."""
+    from researchclaw.pipeline.stage_impls import _code_generation as cg
+
+    original = {
+        "algorithms/a/a.py": "def optimize(i, s):\n    # EVOLVE_START\n    x = i\n    # EVOLVE_END\n    return x\n",
+        "algorithms/b/b.py": "def optimize(i, s):\n    return i\n",
+    }
+    applied = {
+        "algorithms/a/a.py": "def optimize(i, s):\n    x = i\n    return x\n",  # dropped markers
+        "algorithms/b/b.py": "def optimize(i, s):\n    return i*2\n",          # never had markers
+    }
+
+    files = dict(original)
+    prev = dict(files)
+    files, app = cg._merge_repaired_files(files, applied, label="test")
+    reverted = cg._revert_marker_dropped_files(prev, app, label="test")
+
+    # a dropped its markers -> must be reverted to the original
+    assert reverted == ["algorithms/a/a.py"]
+    for fname in reverted:
+        files[fname] = prev[fname]
+    assert "EVOLVE_START" in files["algorithms/a/a.py"]
+    # b never had markers -> the neutral fix is preserved
+    assert "i*2" in files["algorithms/b/b.py"]

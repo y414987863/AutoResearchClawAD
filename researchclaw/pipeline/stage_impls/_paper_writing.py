@@ -120,6 +120,7 @@ def _execute_paper_outline(
             sp.user,
             json_mode=sp.json_mode,
             max_tokens=sp.max_tokens,
+            reasoning=sp.reasoning,
         )
         outline = resp.content
         # Reasoning models may consume all tokens on CoT — retry with more
@@ -131,6 +132,7 @@ def _execute_paper_outline(
                 sp.user,
                 json_mode=sp.json_mode,
                 max_tokens=sp.max_tokens * 2,
+                reasoning=sp.reasoning,
             )
             outline = resp.content
         if not outline.strip():

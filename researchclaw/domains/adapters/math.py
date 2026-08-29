@@ -32,15 +32,40 @@ class MathPromptAdapter(PromptAdapter):
         )
 
     def get_experiment_design_blocks(self, context: dict[str, Any]) -> PromptBlocks:
-        return PromptBlocks(
-            experiment_design_context=(
-                f"This is a **{self.domain.display_name}** experiment.\n"
+        domain = self.domain
+
+        # Specialized guidance for optimization domains
+        if domain.domain_id in ("mathematics_optimization", "mathematics_numerical"):
+            design_context = (
+                f"This is a **{domain.display_name}** experiment.\n\n"
+                "## Optimization Algorithm Runtime Estimation\n"
+                "- A single optimization run (1 seed × 1 test function × 1 algorithm) with budget B evaluations "
+                "typically takes **B/100 to B/50 seconds** (depending on function complexity)\n"
+                "- Example: B=2000 (200*d for d=10) takes ~20-40 seconds per run\n"
+                "- Example: B=4000 (200*d for d=20) takes ~40-80 seconds per run\n"
+                "- **CRITICAL**: Keep scale small to fit time budget:\n"
+                "  * Use 2-3 seeds (not 5-10) for tight budgets\n"
+                "  * Use 2-4 test functions (not 8-10)\n"
+                "  * Use 3-5 optimizers total (baselines + proposed + ablations)\n"
+                "  * Total runs should be ≤ time_budget_sec / 30\n\n"
+                "Focus on:\n"
+                "1. Correctness (verify against known optima)\n"
+                "2. Convergence quality (final objective value)\n"
+                "3. Efficiency (wall time, overhead fraction)\n"
+                "4. Test functions: Use standard benchmarks (Rosenbrock, Rastrigin, Ackley, Sphere)\n"
+            )
+        else:
+            design_context = (
+                f"This is a **{domain.display_name}** experiment.\n"
                 "Focus on:\n"
                 "1. Correctness (verify against known solutions)\n"
                 "2. Convergence order (expected vs observed)\n"
                 "3. Efficiency (operations count, wall time)\n"
-            ),
-            statistical_test_guidance="Use convergence order fitting for accuracy analysis.",
+            )
+
+        return PromptBlocks(
+            experiment_design_context=design_context,
+            statistical_test_guidance="Use paired statistical tests (Wilcoxon or t-test) for optimizer comparison across seeds.",
         )
 
     def get_result_analysis_blocks(self, context: dict[str, Any]) -> PromptBlocks:

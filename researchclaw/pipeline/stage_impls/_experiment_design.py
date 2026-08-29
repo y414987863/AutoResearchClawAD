@@ -17,17 +17,81 @@ from researchclaw.pipeline._helpers import (
     StageResult,
     _build_context_preamble,
     _chat_with_prompt,
+    _describe_yaml_failure,
     _extract_yaml_block,
     _get_evolution_overlay,
     _load_hardware_profile,
     _read_prior_artifact,
     _safe_json_loads,
+    _safe_load_yaml,
     _utcnow_iso,
 )
 from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
+
+# Container keys models wrap the plan in even when asked for a flat mapping.
+# The plan itself never uses these as content keys, so unwrapping is safe.
+_PLAN_WRAPPER_KEYS = frozenset(
+    {"experiment_plan", "plan", "experiment", "experiment_design", "design"}
+)
+
+
+def _unwrap_plan(parsed: Any) -> Any:
+    """Unwrap a plan nested under a single container key.
+
+    ``experiment_plan:\\n  baselines: ...`` parses fine but leaves every
+    required key one level down, so the schema-deficit guard reads the plan as
+    empty and pauses the pipeline on a plan that is actually complete.
+
+    Only a lone, known wrapper key is unwrapped — a single-key mapping that
+    isn't a recognised wrapper is left as-is.
+    """
+    if isinstance(parsed, dict) and len(parsed) == 1:
+        key, value = next(iter(parsed.items()))
+        if isinstance(key, str) and key.lower() in _PLAN_WRAPPER_KEYS:
+            if isinstance(value, dict):
+                logger.info(
+                    "Stage 09: plan was wrapped in '%s' — unwrapping", key
+                )
+                return value
+    return parsed
+
+
+_PLAN_KEY_RE = re.compile(
+    r"^(baselines|proposed_methods|ablations|datasets|"
+    r"metrics|objectives|risks|compute_budget)\s*:"
+)
+
+
+def _parse_plan_response(content: str) -> dict | None:
+    """Pull a plan mapping out of an LLM response, three ways.
+
+    Tried in order: the fenced block, the whole response (models drop the
+    fences when told to emit bare YAML), then a scan that keeps only the lines
+    from the first recognised plan key onward (models wrap the plan in prose).
+    Returns None when none of the three yields a mapping.
+    """
+    for candidate in (_extract_yaml_block(content), content):
+        parsed = _unwrap_plan(_safe_load_yaml(candidate))
+        if isinstance(parsed, dict):
+            return parsed
+
+    lines: list[str] = []
+    capturing = False
+    for line in content.splitlines():
+        if _PLAN_KEY_RE.match(line):
+            capturing = True
+        if capturing:
+            if not line.strip() or line.startswith(("```", "#", "**")):
+                continue
+            lines.append(line)
+    if lines:
+        parsed = _unwrap_plan(_safe_load_yaml("\n".join(lines)))
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
 def _normalize_plan_field(value: Any) -> list:
@@ -218,57 +282,75 @@ def _execute_experiment_design(
             sp.user,
             json_mode=sp.json_mode,
             max_tokens=sp.max_tokens,
+            reasoning=sp.reasoning,
         )
         raw_yaml = _extract_yaml_block(resp.content)
-        try:
-            parsed = yaml.safe_load(raw_yaml)
-        except yaml.YAMLError:
-            parsed = None
-        # Fallback: reasoning models sometimes emit the YAML without fences
-        # or wrapped in prose. Try parsing the whole response as YAML.
-        if not isinstance(parsed, dict):
-            try:
-                parsed = yaml.safe_load(resp.content)
-            except yaml.YAMLError:
-                pass
-        # Last fallback: try to find any YAML-like dict in the response
-        if not isinstance(parsed, dict):
-            import re as _re_yaml
-
-            # Look for lines starting with known keys
-            _yaml_lines = []
-            _capturing = False
-            for line in resp.content.splitlines():
-                if _re_yaml.match(
-                    r"^(baselines|proposed_methods|ablations|datasets|"
-                    r"metrics|objectives|risks|compute_budget)\s*:",
-                    line,
-                ):
-                    _capturing = True
-                if _capturing:
-                    if line.strip() == "" or line.startswith("```"):
-                        continue
-                    if line.startswith("#") or line.startswith("**"):
-                        continue
-                    _yaml_lines.append(line)
-            if _yaml_lines:
-                try:
-                    parsed = yaml.safe_load("\n".join(_yaml_lines))
-                except yaml.YAMLError:
-                    pass
+        parsed = _parse_plan_response(resp.content)
         if isinstance(parsed, dict):
             plan = parsed
         else:
+            _diagnosis = _describe_yaml_failure(raw_yaml or resp.content)
             logger.warning(
-                "Stage 09: LLM response could not be parsed as YAML "
-                "(len=%d, first 200 chars: %s). Content extraction method "
-                "returned: %s",
+                "Stage 09: LLM response did not yield a plan mapping (len=%d). "
+                "Extracted block: %s | whole response: %s. First 200 chars of "
+                "extracted block: %s",
                 len(resp.content),
-                resp.content[:200],
+                _describe_yaml_failure(raw_yaml),
+                _describe_yaml_failure(resp.content),
                 raw_yaml[:200] if raw_yaml else "<empty>",
             )
+
+            # Re-ask the *same* prompt before anything that sheds context.
+            # A parse failure usually means the plan was fine and only its
+            # syntax was not: an observed response was 10614 chars, complete
+            # and on-topic, and failed solely because the model wrote markdown
+            # numbered lists under a key. Sampling is stochastic, so a second
+            # draw of the identical prompt normally comes back clean — and it
+            # keeps the hypotheses, the literature and the real compute budget
+            # that the strict prompt below throws away. The parser's own
+            # diagnosis is handed back so the retry is corrective, not blind.
+            if llm is not None and resp.content.strip():
+                logger.info(
+                    "Stage 09: re-asking the full prompt with the parse error "
+                    "(%s).", _diagnosis,
+                )
+                try:
+                    _reask_resp = _chat_with_prompt(
+                        llm,
+                        sp.system,
+                        f"{sp.user}\n\n---\n"
+                        "Your previous answer could not be parsed as YAML: "
+                        f"{_diagnosis}\n"
+                        "Return the same plan again, as valid YAML. Two things "
+                        "break it most often: a value containing an unquoted "
+                        "':' (wrap the value in double quotes), and a numbered "
+                        "list written as markdown under a key (write '- ' "
+                        "sequence items instead).",
+                        json_mode=sp.json_mode,
+                        max_tokens=sp.max_tokens,
+                        reasoning=sp.reasoning,
+                    )
+                except Exception as _reask_exc:  # noqa: BLE001
+                    logger.warning(
+                        "Stage 09: full-prompt re-ask could not complete (%s); "
+                        "falling through to the strict prompt.", _reask_exc,
+                    )
+                else:
+                    _reask_parsed = _parse_plan_response(_reask_resp.content)
+                    if isinstance(_reask_parsed, dict):
+                        plan = _reask_parsed
+                        logger.info(
+                            "Stage 09: full-prompt re-ask succeeded — plan "
+                            "keeps its original context."
+                        )
+                    else:
+                        logger.warning(
+                            "Stage 09: full-prompt re-ask also unparseable: %s",
+                            _describe_yaml_failure(_reask_resp.content),
+                        )
+
             # BUG-12: Retry with a stricter, shorter prompt
-            if llm is not None:
+            if plan is None and llm is not None:
                 logger.info("Stage 09: Retrying with strict YAML-only prompt...")
                 _retry_prompt = (
                     "Output ONLY valid YAML. No prose, no markdown fences, no explanation.\n"
@@ -277,19 +359,40 @@ def _execute_experiment_design(
                     "datasets, metrics, objectives, risks, compute_budget.\n"
                     "Each key maps to a list of strings."
                 )
-                _retry_resp = _chat_with_prompt(
-                    llm,
-                    "You output ONLY valid YAML. Nothing else.",
-                    _retry_prompt,
-                    max_tokens=4096,
-                )
                 try:
-                    _retry_parsed = yaml.safe_load(_retry_resp.content)
+                    _retry_resp = _chat_with_prompt(
+                        llm,
+                        "You output ONLY valid YAML. Nothing else.",
+                        _retry_prompt,
+                        # The strict prompt is tiny, but a reasoning model
+                        # spends its budget before emitting anything — the
+                        # 4096 this used to pass was consumed by reasoning and
+                        # returned an empty body. Keep headroom.
+                        max_tokens=8192,
+                    )
+                except Exception as _retry_exc:  # noqa: BLE001
+                    # This retry is best-effort salvage. A transport failure here
+                    # (IncompleteRead, timeout, "all models failed") must not turn
+                    # a recoverable parse failure into a dead stage — the
+                    # hypothesis-extraction and template fallbacks below still
+                    # produce a usable plan.
+                    logger.warning(
+                        "Stage 09: strict YAML retry could not complete (%s); "
+                        "continuing to the offline fallbacks.", _retry_exc,
+                    )
+                else:
+                    # Strip fences even though the prompt forbids them — models
+                    # routinely fence output they were told to emit bare, and this
+                    # is the last LLM attempt before template fallbacks.
+                    _retry_parsed = _parse_plan_response(_retry_resp.content)
                     if isinstance(_retry_parsed, dict):
                         plan = _retry_parsed
                         logger.info("Stage 09: Strict YAML retry succeeded.")
-                except yaml.YAMLError:
-                    pass
+                    else:
+                        logger.warning(
+                            "Stage 09: strict YAML retry also unparseable: %s",
+                            _describe_yaml_failure(_retry_resp.content),
+                        )
 
     # BUG-12: Fallback 4 — extract method/baseline names from Stage 8 hypotheses
     if plan is None:
@@ -517,7 +620,11 @@ def _execute_experiment_design(
         # Keep all proposed methods (up to max), trim baselines and ablations
         _proposed_count = min(len(_proposed), max(1, _max_conditions - 4))
         _remaining = max(0, _max_conditions - _proposed_count)
-        _baseline_budget = max(1, _remaining // 2)
+        # Round the split up, not down, so the odd slot goes to baselines.
+        # Floor division gave more ablations than baselines (5 → 2 + 3), which
+        # is backwards for a paper: baselines are the comparison a reviewer
+        # reads, ablations are self-analysis. Even splits are unaffected.
+        _baseline_budget = max(1, (_remaining + 1) // 2)
         _ablation_budget = max(0, _remaining - _baseline_budget)
         if len(_proposed) > _proposed_count:
             plan["proposed_methods"] = _proposed[:_proposed_count]
@@ -558,12 +665,9 @@ def _execute_experiment_design(
                     max_tokens=4096,
                 )
                 updated = _extract_yaml_block(resp.content)
-                try:
-                    parsed_update = yaml.safe_load(updated)
-                    if isinstance(parsed_update, dict):
-                        plan = parsed_update
-                except yaml.YAMLError:
-                    pass
+                parsed_update = _unwrap_plan(_safe_load_yaml(updated))
+                if isinstance(parsed_update, dict):
+                    plan = parsed_update
         except Exception:
             logger.debug("HITL guidance application failed (non-blocking)")
 

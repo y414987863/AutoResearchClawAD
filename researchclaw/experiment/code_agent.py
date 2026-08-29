@@ -354,7 +354,9 @@ class LlmCodeAgent:
                 issues_text=issues,
                 all_files_ctx=all_files_ctx,
             )
-            resp = _chat_with_prompt(self._llm, rp.system, rp.user)
+            resp = _chat_with_prompt(
+                self._llm, rp.system, rp.user, max_tokens=rp.max_tokens
+            )
             # Try multi-file extraction first, then single-block
             repaired = _extract_multi_file_blocks(resp.content)
             if not repaired:

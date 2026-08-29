@@ -682,6 +682,7 @@ def _repair_via_opencode(
             timeout_sec=getattr(_oc_cfg, "timeout_sec", 600),
             max_retries=getattr(_oc_cfg, "max_retries", 1),
             workspace_cleanup=getattr(_oc_cfg, "workspace_cleanup", True),
+            debug=getattr(_oc_cfg, "debug", False),
         )
         workspace = run_dir / f"_repair_opencode_v{cycle}"
         workspace.mkdir(parents=True, exist_ok=True)

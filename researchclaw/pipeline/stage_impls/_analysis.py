@@ -738,6 +738,7 @@ Generated: {_utcnow_iso()}
                 run_dir,
                 _charts_dir,
                 metric_key=config.experiment.metric_key,
+                metric_direction=config.experiment.metric_direction,
             )
             if _early_charts:
                 for _cp in _early_charts:

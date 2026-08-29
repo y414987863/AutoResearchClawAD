@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -203,6 +206,47 @@ Save all figures to output/figures/ in PDF and PNG format.
 """
 
 
+def _is_llm4ad_enabled(config: Any) -> bool:
+    """Safely check if LLM4AD mode is enabled."""
+    try:
+        exp = getattr(config, "experiment", None)
+        if not exp:
+            return False
+        l4b = getattr(exp, "llm4ad_boost", None)
+        if not l4b:
+            return False
+        return getattr(l4b, "enabled", False)
+    except Exception:
+        return False
+
+
+def _llm4ad_constraint_text(config: Any) -> str:
+    """LLM4AD structure-constraint snippet, single source of truth.
+
+    Returns ``""`` when LLM4AD is disabled.
+
+    Every call site used to ``getattr(config.experiment, "llm4ad_boost", None)``
+    inline and only then assign it to a local ``_l4b_constraint``, and the smoke
+    repair loop read ``_l4b_constraint`` in the OpenCode branch *before* the LLM
+    branch had assigned it — because the assignment sat later in the same loop,
+    Python treated ``_l4b_constraint`` as function-local and raised
+    ``UnboundLocalError`` on the very first OpenCode repair, so OpenCode repair
+    never ran. A pure helper removes the shared-name + ordering hazard entirely.
+    """
+    l4b = getattr(getattr(config, "experiment", None), "llm4ad_boost", None)
+    if l4b is None or not getattr(l4b, "enabled", False):
+        return ""
+    return (
+        "\n\nCRITICAL LLM4AD CONSTRAINT:\n"
+        "- Files with # EVOLVE_START / # EVOLVE_END markers are algorithm files\n"
+        "- PRESERVE these markers EXACTLY\n"
+        "- ALL algorithm logic MUST stay between the markers\n"
+        "- DO NOT simplify by extracting to external functions\n"
+        "- DO NOT replace complex logic with configuration dicts\n"
+        "- Fix the runtime error WITHOUT changing the algorithm structure\n"
+    )
+
+
 def _check_rl_compatibility(code: str) -> list[str]:
     """Detect DQN + continuous-action environment mismatches.
 
@@ -224,6 +268,262 @@ def _check_rl_compatibility(code: str) -> list[str]:
     return errors
 
 
+def _hard_indexed_instance_keys(code: str) -> set[str]:
+    """Keys an algorithm reads as ``instance["k"]`` with no fallback.
+
+    Derived from the source rather than from a fixed list, so this stays valid for
+    any problem family: whatever the generated code decides an instance looks
+    like, that is what the data files must provide.
+
+    Tracks the first parameter of ``optimize`` plus locals aliased directly from
+    it (``inst = dict(instance)``), which is how generated algorithms normally
+    copy before mutating. Keys the code also probes defensively
+    (``instance.get("k", ...)`` or ``"k" in instance``) are treated as optional
+    and excluded — a guarded read cannot raise ``KeyError``.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return set()
+
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "optimize":
+            # Positional-only params come FIRST in the signature, so they must be
+            # concatenated, not used as a fallback: `def optimize(instance, /, seed)`
+            # has posonlyargs=[instance] and args=[seed], and picking `args` there
+            # tracked `seed` and silently disabled this whole check.
+            args = node.args.posonlyargs + node.args.args or node.args.kwonlyargs
+            if args:
+                aliases.add(args[0].arg)
+    if not aliases:
+        return set()
+
+    # `inst = instance` / `inst = dict(instance)` / `inst = {**instance}`.
+    for _ in range(3):  # transitive, but generated code never nests deeply
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            src = node.value
+            if isinstance(src, ast.Call) and src.args:
+                src = src.args[0]
+            elif isinstance(src, ast.Dict) and len(src.keys) == 1 and src.keys[0] is None:
+                src = src.values[0]
+            if isinstance(src, ast.Name) and src.id in aliases:
+                aliases.add(target.id)
+
+    keys: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Subscript) or not isinstance(node.ctx, ast.Load):
+            continue
+        if not (isinstance(node.value, ast.Name) and node.value.id in aliases):
+            continue
+        sl = node.slice
+        if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
+            keys.add(sl.value)
+
+    optional = set()
+    for key in keys:
+        if f'.get("{key}"' in code or f".get('{key}'" in code:
+            optional.add(key)
+        elif f'"{key}" in ' in code or f"'{key}' in " in code:
+            optional.add(key)
+    return keys - optional
+
+
+def _injected_instance_keys(code: str) -> set[str]:
+    """Keys the evaluator supplies to the algorithm on top of the instance file.
+
+    Recognises the three ways generated evaluators build an augmented instance:
+
+    - a dict literal, usually ``{**instance, "x0": ..., "_objective": ...}``
+      passed straight into the call. This is the idiomatic form because it does
+      not mutate the caller's dict, and it is exactly what the deficiency
+      message recommends, so missing it flagged correct code as broken.
+    - ``dict(instance, x0=...)`` keyword form.
+    - ``<name>["k"] = ...`` subscript assignment.
+    - ``<name>.setdefault("k", ...)``, which injects a key without overwriting.
+
+    Deliberately generous: the point is to avoid false positives in the
+    data-field check, and an over-broad exemption only weakens that check rather
+    than blocking a valid experiment.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return set()
+    keys: set[str] = set()
+    for node in ast.walk(tree):
+        # {"k": v} / {**instance, "k": v}
+        if isinstance(node, ast.Dict):
+            for k in node.keys:
+                if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                    keys.add(k.value)
+        # dict(instance, k=v)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "dict"
+        ):
+            keys.update(kw.arg for kw in node.keywords if kw.arg)
+        # d.setdefault("k", v)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "setdefault"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            keys.add(node.args[0].value)
+        # d["k"] = v
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        for t in targets:
+            if isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant):
+                if isinstance(t.slice.value, str):
+                    keys.add(t.slice.value)
+    return keys
+
+
+def _evolve_block_problems(path: str, code: str) -> list[str]:
+    """Check that the EVOLVE region actually contains the algorithm.
+
+    A block that merely constructs a module-level helper class and calls one of
+    its methods leaves the real algorithm outside the evolvable surface, so
+    evolution can do nothing but retune constructor arguments. Both checks are
+    purely structural — they say nothing about what the algorithm computes.
+    """
+    lines = code.splitlines()
+    starts = [i + 1 for i, ln in enumerate(lines) if "EVOLVE_START" in ln]
+    ends = [i + 1 for i, ln in enumerate(lines) if "EVOLVE_END" in ln]
+    if not starts or not ends:
+        return []  # already reported by the marker check
+    start_line, end_line = starts[0], ends[-1]
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []  # already reported by the syntax check
+
+    fn = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "optimize"),
+        None,
+    )
+    if fn is None:
+        return []  # already reported by the `def optimize(` check
+
+    body = list(fn.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]  # a leading docstring may sit above EVOLVE_START
+
+    problems: list[str] = []
+
+    outside = [
+        s for s in body
+        if s.lineno < start_line or (s.end_lineno or s.lineno) > end_line
+    ]
+    if outside:
+        problems.append(
+            f"LLM4AD_STRUCTURE: `{path}` — the EVOLVE markers cover only part of "
+            f"`optimize` ({len(outside)} of {len(body)} statements are outside, "
+            f"first at line {outside[0].lineno}). Move EVOLVE_START to the line "
+            "ABOVE `def optimize` and EVOLVE_END below the final `return` so the "
+            "whole function is the evolvable unit."
+        )
+
+    helpers = {
+        n.name for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and n.name != "optimize"
+    }
+    if helpers:
+        # A name bound inside `optimize` is a LOCAL that shadows the module-level
+        # helper, not a call to it (`tour_length = 0.0` beside `def tour_length`
+        # is not delegation). Reading the local afterwards is also a Load, so
+        # every locally-bound name is excluded outright. ast.arg covers nested
+        # closure params too. Erring generous only weakens this advisory check;
+        # a false positive would accuse correct code of hiding the algorithm.
+        local_names = {
+            a.arg for a in ast.walk(fn) if isinstance(a, ast.arg)
+        } | {
+            n.id for n in ast.walk(fn)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+        }
+        used = sorted(
+            n.id for n in ast.walk(fn)
+            if isinstance(n, ast.Name)
+            and isinstance(n.ctx, ast.Load)
+            and n.id in helpers
+            and n.id not in local_names
+            and start_line <= n.lineno <= end_line
+        )
+        if used:
+            problems.append(
+                f"LLM4AD_STRUCTURE: `{path}` — the EVOLVE block delegates to "
+                f"{', '.join(f'`{u}`' for u in dict.fromkeys(used))} defined in the "
+                "same file outside the markers, so the algorithm itself is not "
+                "evolvable. Inline that logic into `optimize` between the markers; "
+                "if it is genuinely shared across algorithms, move it to a module at "
+                "the experiment root and import it."
+            )
+
+    return problems
+
+
+def _validate_generation_completeness(files: dict[str, str]) -> list[str]:
+    """Validate that all critical files were generated BEFORE writing to disk.
+
+    This is a pre-flight check that catches missing files early, so we can
+    regenerate rather than attempting to repair a fundamentally incomplete generation.
+
+    Returns BLOCKING problems that require full regeneration (not repair).
+    """
+    problems: list[str] = []
+
+    # 1. Core files
+    if "main.py" not in files:
+        problems.append("BLOCKING: main.py not generated")
+    if "evaluator.py" not in files:
+        problems.append("BLOCKING: evaluator.py not generated")
+
+    # 2. Data files - CRITICAL
+    data_files = [k for k in files if k.startswith("data/") and k.endswith(".json")]
+    if not data_files:
+        problems.append(
+            "BLOCKING: No data/*.json files generated (minimum 3 required). "
+            "LLM4AD evolution cannot run without instance files."
+        )
+    elif len(data_files) < 3:
+        problems.append(
+            f"WARNING: Only {len(data_files)} data file(s) generated "
+            "(minimum 3 recommended for meaningful evaluation)"
+        )
+
+    # 3. Algorithm files
+    algo_files = [
+        k for k in files
+        if k.startswith("algorithms/") and k.endswith(".py")
+        and not Path(k).name.startswith("__")
+    ]
+    if not algo_files:
+        problems.append("BLOCKING: No algorithm files generated")
+
+    return problems
+
+
 def _check_llm4ad_structure(files: dict[str, str]) -> list[str]:
     """Validate that generated files satisfy the LLM4AD task-package layout.
 
@@ -235,7 +535,13 @@ def _check_llm4ad_structure(files: dict[str, str]) -> list[str]:
 
     algo_files = [
         k for k in files
-        if k.startswith("algorithms/") and k.endswith(".py")
+        if k.startswith("algorithms/")
+        and k.endswith(".py")
+        # `__init__.py` / `__main__.py` are package machinery, not algorithms —
+        # the packager only picks `algorithms/<algo>/<algo>.py`, and the nested
+        # layout needs an `__init__.py` in every dir, so this fired on every run.
+        # A non-dunder module with a mismatched name is still reported below.
+        and not Path(k).name.startswith("__")
     ]
     if not algo_files:
         problems.append(
@@ -259,12 +565,31 @@ def _check_llm4ad_structure(files: dict[str, str]) -> list[str]:
             problems.append(
                 f"LLM4AD_STRUCTURE: `{k}` missing `def optimize(instance, seed)`."
             )
+        problems.extend(_evolve_block_problems(k, code))
 
-    if not any(k.startswith("data/") and k.endswith(".json") for k in files):
+    # Any extension counts. Instance formats in this domain are not all JSON
+    # (TSPLIB, .mps, .npz, .csv), and the runner delegates parsing to
+    # `evaluator.load_instance`, so demanding `.json` here would reject valid
+    # experiments. What matters is that instances are shipped as static files.
+    _instance_names = [
+        k for k in files
+        if k.startswith("data/") and "/" not in k[len("data/"):]
+    ]
+    if not _instance_names:
         problems.append(
-            "LLM4AD_STRUCTURE: no `data/*.json` instance files — static "
+            "LLM4AD_STRUCTURE: no instance files under `data/` — static "
             "instances must be generated once and shipped with the code."
         )
+    else:
+        # A non-JSON instance is fine, but only if the experiment says how to
+        # read it: run_single.py falls back to json.load and raises otherwise.
+        _non_json = [k for k in _instance_names if not k.endswith(".json")]
+        if _non_json and "def load_instance(" not in files.get("evaluator.py", ""):
+            problems.append(
+                f"LLM4AD_STRUCTURE: `{_non_json[0]}` is not JSON, but evaluator.py "
+                "defines no `load_instance(path)`. Add it so the package runner "
+                "can read this format (it only falls back to json.load)."
+            )
 
     main_code = files.get("main.py", "")
     if not main_code:
@@ -280,20 +605,22 @@ def _check_llm4ad_structure(files: dict[str, str]) -> list[str]:
         ):
             if needle not in main_code:
                 problems.append(
-                    f"LLM4AD_STRUCTURE: main.py missing {label}."
+                    f"LLM4AD_STRUCTURE: `main.py` missing {label}."
                 )
 
-    # Stage-13 imports these symbols BY NAME; a missing export fails every
-    # algorithm at package-build time (after Stage 10). Check the code text
-    # rather than execute it — importing would run arbitrary generated code.
+    # Stage-13's package runner imports these two symbols BY NAME and nothing
+    # else; a missing export fails every algorithm at package-build time (after
+    # Stage 10). Check the code text rather than execute it — importing would run
+    # arbitrary generated code.
+    #
+    # Deliberately only `evaluator.py`: everything domain-specific (seeds,
+    # budgets, bounds, how to read the algorithm's return value) is that module's
+    # private business. Requiring named helpers in `benchmarks.py`/`stats_utils.py`
+    # would hard-wire one problem family — continuous box-constrained
+    # optimisation — into a profile that must cover the whole domain.
     for mod, needles, label in (
-        ("benchmarks.py", ("def get_bounds(",), "`get_bounds(func_name, dim)`"),
-        ("stats_utils.py", ("SEEDS", "mean_std", "rng_from_instance"),
-         "`SEEDS`, `mean_std`, `rng_from_instance`"),
-        # evaluator.py is the shared instance-level metric used by BOTH main.py
-        # and the package runner; without these the runner cannot aggregate.
-        ("evaluator.py", ("PRIMARY_METRIC", "prepare_start", "evaluate_instance"),
-         "`PRIMARY_METRIC`, `prepare_start`, `evaluate_instance`"),
+        ("evaluator.py", ("PRIMARY_METRIC", "evaluate_instance"),
+         "`PRIMARY_METRIC`, `evaluate_instance(instance, solve)`"),
     ):
         code = files.get(mod, "")
         # ``needles`` holds only the symbols/text that must appear in the module;
@@ -301,11 +628,1078 @@ def _check_llm4ad_structure(files: dict[str, str]) -> list[str]:
         missing = [n for n in needles if n not in code]
         if missing:
             problems.append(
-                f"LLM4AD_STRUCTURE: {mod} missing {label} — "
+                f"LLM4AD_STRUCTURE: `{mod}` missing {label} — "
                 f"the task-package runner imports it by name."
             )
 
+    # DIRECTION CONTRACT: evaluator.py must declare, statically and
+    # unambiguously, which way its primary metric is judged. Downstream stages
+    # (13's promote/evolve, 14's analysis, 17's paper tables) read this ONE
+    # declaration as the authoritative direction, instead of each independently
+    # guessing from the metric name (which mis-read ``valid_prediction_time`` as
+    # lower-is-better and promoted a regression as an "improvement"). Without a
+    # declaration the pipeline falls back to config, which is hard-coded
+    # ``minimize`` and openly conflicts with a maximise metric.
+    #
+    # Require the static dict form — a runtime ``print`` line is parseable from
+    # stdout but the *evaluator* often never runs at structure-check time, and a
+    # bare MetricType import couples the module to a class it may not need.
+    _eval_dir_code = files.get("evaluator.py", "")
+    if "evaluate_instance" in _eval_dir_code and "PRIMARY_METRIC" in _eval_dir_code:
+        if not re.search(
+            r'METRIC_DEF\s*=\s*\{[^}]*"direction"\s*:\s*"(minimize|maximize)"',
+            _eval_dir_code,
+        ):
+            problems.append(
+                "LLM4AD_STRUCTURE: `evaluator.py` must define a static direction "
+                "declaration so downstream stages agree on which way is better. "
+                "Add a module-level constant, e.g.\n"
+                '    METRIC_DEF = {"primary_metric": PRIMARY_METRIC, '
+                '"direction": "maximize"}   # "maximize" when larger is better, '
+                '"minimize" when smaller is better\n'
+                "and set \"direction\" to match how PRIMARY_METRIC is actually "
+                "computed (read the comment describing the metric — e.g. "
+                "\"larger = better correction\" means \"maximize\")."
+            )
+
+    # A name check cannot tell the required `evaluate_instance(instance, solve)`
+    # apart from an aggregate-only helper such as `evaluate_instance(per_seed)`,
+    # and the difference is fatal: the runner passes the algorithm callable in.
+    _eval_code = files.get("evaluator.py", "")
+    if "evaluate_instance" in _eval_code:
+        try:
+            _tree = ast.parse(_eval_code)
+        except SyntaxError:
+            _tree = None
+        if _tree is not None:
+            for node in ast.walk(_tree):
+                if not isinstance(node, ast.FunctionDef) or node.name != "evaluate_instance":
+                    continue
+                n_pos = len(node.args.posonlyargs) + len(node.args.args)
+                if n_pos < 2:
+                    problems.append(
+                        "LLM4AD_STRUCTURE: `evaluator.py` — `evaluate_instance` takes "
+                        f"{n_pos} positional argument(s); the runner calls "
+                        "`evaluate_instance(instance, solve)` where `solve` is the "
+                        "algorithm's `optimize`. Move the seeds/repeats loop inside "
+                        "this function so the runner stays problem-agnostic."
+                    )
+                break
+
+    # Every key an algorithm indexes unconditionally must exist in every instance
+    # file, or that algorithm dies with a KeyError the moment LLM4AD evaluates it.
+    # Stage 12 can mask this (main.py may inject values at runtime), so it only
+    # surfaces during evolution, where every individual scores -inf and the run
+    # looks like a modelling failure rather than a contract violation.
+    #
+    # The required keys come from the source, not from a hardcoded list, so this
+    # check makes no assumption about the problem family.
+    instance_files = {
+        k: v for k, v in files.items()
+        if k.startswith("data/") and k.endswith(".json")
+    }
+    if instance_files and algo_files:
+        injected = _injected_instance_keys(files.get("evaluator.py", ""))
+        parsed: dict[str, set[str]] = {}
+        for name, raw in instance_files.items():
+            try:
+                obj = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                problems.append(
+                    f"LLM4AD_STRUCTURE: `{name}` is not valid JSON — instance "
+                    "files must be machine-readable."
+                )
+                continue
+            if isinstance(obj, dict):
+                parsed[name] = set(obj)
+        for k in sorted(algo_files):
+            required = _hard_indexed_instance_keys(files[k]) - injected
+            for key in sorted(required):
+                lacking = sorted(n for n, present in parsed.items() if key not in present)
+                if not lacking:
+                    continue
+                shown = ", ".join(lacking[:3])
+                more = f" (+{len(lacking) - 3} more)" if len(lacking) > 3 else ""
+                problems.append(
+                    f"LLM4AD_STRUCTURE: `{k}` reads `instance[\"{key}\"]` "
+                    f"unconditionally, but {shown}{more} lack that key. Add it to "
+                    "every instance file, inject it in `evaluate_instance` before "
+                    "calling the algorithm, or read it with a default via "
+                    f"`instance.get(\"{key}\", ...)`."
+                )
+
     return problems
+
+
+def _repair_llm4ad_structure(
+    files: dict[str, str],
+    problems: list[str],
+    *,
+    llm: Any,
+    _pm: Any,
+    max_repair: int,
+) -> tuple[dict[str, str], list[str], int]:
+    """Round-trip LLM4AD structure deficiencies through the audit repair loop.
+
+    ``_check_llm4ad_structure`` flags defects (partial EVOLVE coverage, an
+    algorithm delegating to a module-level helper, a missing marker, etc.) but
+    those run in a separate channel from ``validate_code``, so the stage
+    repaired syntax/import errors and then reported the structure issues as
+    "FAILED after 0 total repair attempt(s)" — a false negative that read as a
+    generation failure and leaked into the paper. This routine re-uses the same
+    single-file ``code_repair`` prompt the syntax loop does, so the LLM gets ONE
+    consistent shot at each flagged file, and the structure check is re-run
+    afterwards so a fix actually has to make the check pass.
+
+    Only issues bound to a file that already exists in ``files`` are repaired.
+    Global deficiencies ("no ``data/``", "missing ``main.py``") cannot be fixed
+    by editing an existing file, and handing them to a single-file repair prompt
+    invites the LLM to invent unrelated code, so they are left for the caller to
+    report.
+
+    Returns ``(new_files, remaining_problems, repair_attempts)``.
+    """
+    import re as _re
+
+    # Group the flagged issues by the file they name. A problem string carries
+    # its path inside backticks (e.g. ``algorithms/x/x.py``); problems without
+    # a resolvable, existing file are held back.
+    targeted: dict[str, list[str]] = {}
+    leftover: list[str] = []
+    for prob in problems:
+        _m = _re.search(r"`([^`]+\.py)`", prob)
+        if _m is None:
+            leftover.append(prob)
+            continue
+        path = _m.group(1)
+        if path not in files:
+            leftover.append(prob)
+            continue
+        targeted.setdefault(path, []).append(prob)
+
+    rp_attempts = 0
+    for fname, file_problems in targeted.items():
+        issues_text = "\n".join(f"- {p}" for p in file_problems)
+        # Scope the context to the file being repaired and its imports instead
+        # of every generated file — the full dump pushed single requests past
+        # the model's tolerance and produced 504/429 failures that aborted the
+        # stage after Beast mode had already succeeded.
+        all_files_ctx = _scoped_files_ctx(files, fname)
+        rp = _pm.sub_prompt(
+            "code_repair",
+            fname=fname,
+            issues_text=issues_text,
+            all_files_ctx=all_files_ctx,
+        )
+        resp = _chat_with_prompt(llm, rp.system, rp.user, max_tokens=rp.max_tokens)
+        _fixed = _extract_code_block(resp.content)
+        rp_attempts += 1
+        if not _fixed.strip():
+            logger.warning(
+                "LLM4AD structure repair for %s returned empty code, keeping original",
+                fname,
+            )
+            continue
+        if validate_code(_fixed).ok:
+            files[fname] = _fixed
+            logger.info(
+                "LLM4AD structure repair fixed %s (%d issue(s))",
+                fname, len(file_problems),
+            )
+        else:
+            logger.warning(
+                "LLM4AD structure repair for %s produced code that fails "
+                "validation; keeping original (%d issue(s) remain)",
+                fname, len(file_problems),
+            )
+
+    remaining = _check_llm4ad_structure(files)
+    return files, remaining, rp_attempts
+
+
+def _scoped_files_ctx(files: dict[str, str], target: str) -> str:
+    """Build a code_repair context scoped to ``target`` and its local imports.
+
+    The old ``all_files_ctx`` dumped EVERY file the experiment generated into
+    each repair prompt. A stage-10 codebase has a dozen+ modules and several of
+    them are large (a neural-net algorithm, an evaluator, a data generator), so
+    the single ``code_repair`` request routinely ran into the hundreds of KB of
+    input, and the upstream model answered with 504 Gateway Time-out / 429 —
+    the repair loop then burned all retries and failed the STAGE even though the
+    code had already been generated (Beast mode had succeeded).
+
+    For fixing ONE file we only need that file plus the sibling modules it
+    imports. Sending a data generator and every algorithm alongside an ESN is
+    noise that inflates the request for no benefit. Top-level imports are read
+    statically (AST); transitive closures are deliberately NOT followed, because
+    a single repair should be minimal and the re-validation after the prompt
+    re-checks the whole project anyway.
+
+    Per-file size is capped at 20KB (consistent with Stage 13's
+    _CONTEXT_FILE_MAX_CHARS) to prevent timeout on large generated modules.
+    Smart truncation preserves both head (imports, classes) and tail (main,
+    helpers) instead of just cutting at 20KB, ensuring critical code at the
+    file end remains visible.
+    """
+    # Per-file size limit (same as Stage 13 iterative refinement)
+    _MAX_FILE_CHARS = 20_000
+
+    deps: set[str] = set()
+    content = files.get(target, "")
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        tree = None
+    if tree is not None:
+        for node in ast.walk(tree):
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module.split(".")[0]]
+            for name in names:
+                if f"{name}.py" in files:
+                    deps.add(f"{name}.py")
+    ordered = [target] + sorted(deps)
+
+    # Build context with smart truncation (head + tail)
+    def smart_truncate(code: str) -> str:
+        """Keep head 65% + tail 35% to preserve both structure and main()."""
+        if len(code) <= _MAX_FILE_CHARS:
+            return code
+        head_size = int(_MAX_FILE_CHARS * 0.65)
+        tail_size = _MAX_FILE_CHARS - head_size
+        head = code[:head_size]
+        tail = code[-tail_size:]
+        middle_size = len(code) - head_size - tail_size
+        middle_lines = code[head_size:-tail_size].count('\n')
+        return (
+            head
+            + f"\n\n# ... [truncated {middle_size} chars (~{middle_lines} lines)] ...\n\n"
+            + tail
+        )
+
+    parts = []
+    for f in ordered:
+        if f not in files:
+            continue
+        code = smart_truncate(files[f])
+        parts.append(f"```filename:{f}\n{code}\n```")
+
+    return "\n\n".join(parts)
+
+
+def _summarize_files_ctx(
+    files: dict[str, str],
+    entry_hint: str = "main.py",
+    full_files: tuple[str, ...] = (),
+) -> str:
+    """Render the project as a bounded context for CROSS-FILE repairs.
+
+    ``_scoped_files_ctx`` is for fixing ONE file in isolation. But ``deep
+    repair`` and ``ablation repair`` ask the model to touch MULTIPLE files
+    (rewriting an ablation class, renaming a config that shadows a stdlib
+    package), so the model must see the whole project — scoping it to one file
+    would make it rewrite a class without knowing the siblings it must stay
+    consistent with, and degrade the result.
+
+    The problem is the same as ``code_repair`` had: dumping every file verbatim
+    into a single request can reach hundreds of KB and 504/429. The fix used by
+    the alignment check is better than a flat truncation: keep the ENTRY point
+    in full (capped), and summarize the rest as imports + signatures. That keeps
+    the cross-file structure visible while bounding the request. Truncating
+    blindly was tried before (BUG-171) and produced false "incomplete" reads,
+    hence the summary, not a ``[:N]`` cap.
+
+    ``full_files`` is the exception to the summary: a repair that must see a
+    method BODY (deep validation reports "identical AST" / "copy-paste
+    ablation", which cannot be judged from a signature alone) passes the files
+    it needs verbatim so the model can actually fix them. Everything else stays
+    summarized to keep the request bounded.
+    """
+    entry = entry_hint if entry_hint in files else "main.py"
+    # Prefer the real entry point: a file with a __main__ guard, main.py first.
+    if entry == "main.py" and "main.py" in files:
+        for _fn, _cd in files.items():
+            if _fn != "main.py" and 'if __name__' in _cd and '__main__' in _cd:
+                if _cd.count("\n") > files["main.py"].count("\n") * 1.5:
+                    entry = _fn
+                    break
+
+    def _sig_preview(fname: str, code: str) -> str:
+        sig_lines = [
+            l for l in code.split("\n")
+            if l.strip().startswith(("def ", "class ", "async def ", "import ", "from "))
+        ]
+        if sig_lines:
+            return f"# --- {fname} (imports + signatures) ---\n" + "\n".join(sig_lines)
+        prev = code[:800]
+        if len(code) > 800:
+            prev += f"\n... [{len(code) - 800} more chars]"
+        return f"# --- {fname} (preview) ---\n{prev}"
+
+    parts: list[str] = []
+    for fname, code in sorted(files.items()):
+        if fname in full_files:
+            block = f"# --- {fname} (FULL) ---\n{code}"
+            if len(block) > 20000:
+                block = block[:20000] + "\n... [truncated at 20000 chars]"
+            parts.append(block)
+        elif fname == entry:
+            block = f"# --- {fname} (FULL entry point) ---\n{code}"
+            if len(block) > 12000:
+                block = block[:12000] + "\n... [entry truncated at 12000 chars]"
+            parts.append(block)
+        else:
+            parts.append(_sig_preview(fname, code))
+    out = "\n\n".join(parts)
+    if len(out) > 30000:
+        out = out[:30000] + "\n... [project truncated]"
+    return out
+
+
+def _dangling_local_imports(files: dict[str, str]) -> list[tuple[str, str]]:
+    """Report imports nothing can satisfy — informational only, never a gate.
+
+    A real judgment on whether the package runs belongs to the smoke run; this
+    only surfaces candidates when a generated file imports a name that is
+    neither a generated module nor importable here.
+    """
+    import importlib.util as _ilu
+
+    known = {
+        Path(f).stem for f in files if f.endswith(".py")
+    } | {
+        f[: -len(".py")].replace("/", ".") for f in files if f.endswith(".py")
+    }
+
+    _installed: dict[str, bool] = {}
+
+    def _is_installed(mod: str) -> bool:
+        if mod not in _installed:
+            try:
+                _installed[mod] = _ilu.find_spec(mod) is not None
+            except (ImportError, ValueError, AttributeError):
+                # A parent package that refuses to load tells us nothing about
+                # whether the name resolves at runtime; assume it does rather
+                # than raise a false alarm.
+                _installed[mod] = True
+        return _installed[mod]
+
+    out: list[tuple[str, str]] = []
+    for fname, code in files.items():
+        if not fname.endswith(".py"):
+            continue
+        for mod in re.findall(
+            r"^\s*(?:from|import)\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+            code, re.MULTILINE,
+        ):
+            if mod in known or mod.startswith("_"):
+                continue
+            if not _is_installed(mod):
+                out.append((fname, mod))
+    return out
+
+
+def _merge_repaired_files(
+    files: dict[str, str], repaired: dict[str, str] | None, *, label: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Merge a repair reply into ``files``, accepting all new files.
+
+    A repair reply contains only the files it changed, so requiring ``main.py``
+    would discard targeted fixes. New files are accepted wholesale — a rename
+    arrives as a NEW module plus edits to its importers. Whether the merge is
+    sane is the smoke run's job; guessing here mis-classifies.
+    """
+    repaired = repaired or {}
+    known = {k: v for k, v in repaired.items() if k in files}
+    new = {k: v for k, v in repaired.items() if k not in files}
+    if new:
+        logger.info("Stage 10: %s added new file(s) %s", label, ", ".join(sorted(new)))
+    applied = {**known, **new}
+    return {**files, **applied}, applied
+
+
+def _revert_marker_dropped_files(
+    originals: dict[str, str], applied: dict[str, str], *, label: str
+) -> list[str]:
+    """Find files a repair stripped EVOLVE markers from.
+
+    A smoke-run repair usually fixes a crash, but nothing stops it from also
+    rewriting an algorithm and stripping the ``# EVOLVE_START`` / ``# EVOLVE_END``
+    markers that LLM4AD evolution (Stage 13) relies on. The static validation
+    channel already reverts such a repair; this is the same guard for the smoke
+    loop, which bypasses that channel.
+
+    ``originals`` is the PRE-repair content (must be captured before the repair
+    is merged in) — it is the only place the "had markers" state survives, since
+    the merged dict already contains the marker-stripped version. ``applied`` is
+    the repaired content. A file that never had markers is left untouched
+    (reverting it would undo a legitimate fix).
+
+    Returns the list of filenames to revert. Pure: does not mutate either dict;
+    the caller restores ``files[fname] = originals[fname]`` for each returned
+    name so the on-disk copy matches.
+    """
+    reverted: list[str] = []
+    for fname, code in applied.items():
+        prior = originals.get(fname)
+        if prior is None:
+            continue
+        had = ("EVOLVE_START" in prior and "EVOLVE_END" in prior)
+        has = ("EVOLVE_START" in code and "EVOLVE_END" in code)
+        if had and not has:
+            reverted.append(fname)
+            logger.error(
+                "Stage 10: %s dropped EVOLVE markers from %s — reverting that file",
+                label, fname,
+            )
+    return reverted
+
+
+def _warn_degenerate_instances(exp_dir: Path) -> list[str]:
+    """Flag instance files whose algorithms produced no valid evaluations.
+
+    A generated data/ instance can be degenerate (e.g. a masked region that
+    covers the whole search space), in which case every algorithm reports
+    ``n_valid == 0`` and every metric is NaN. That is not a runtime crash — the
+    run completes and ``results.json`` is written — so none of the gates catch
+    it, and the all-NaN instance silently pollutes Stage 12/13 aggregation.
+    This surfaces it as a warning; it never fails the stage.
+
+    Returns a list of human-readable warnings (possibly empty).
+    """
+    results_path = Path(exp_dir) / "results.json"
+    if not results_path.is_file():
+        return []
+    try:
+        data = json.loads(results_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, ValueError, OSError):
+        return []
+
+    warnings: list[str] = []
+    # results.json is schema-flexible downstream, so walk it generically:
+    # by_phase.<phase>.by_instance.<name>.algorithms is the shape the generator
+    # emits, but we only require that we can find per-instance algorithm dicts
+    # that expose n_total/n_valid.
+    def _walk(obj: Any, instance_name: str) -> None:
+        if isinstance(obj, dict):
+            algos = obj.get("algorithms")
+            if isinstance(algos, list) and algos:
+                n_total = [a.get("n_total") for a in algos if isinstance(a, dict)]
+                n_valid = [a.get("n_valid") for a in algos if isinstance(a, dict)]
+                if n_valid and all(v == 0 for v in n_valid):
+                    warnings.append(
+                        f"DEGENERATE INSTANCE: `{instance_name}` produced 0 valid "
+                        f"evaluations for every algorithm (n_total={n_total}, "
+                        f"n_valid=0) — all metrics are NaN. The instance is "
+                        f"effectively empty; it will pollute downstream aggregation. "
+                        f"Check the data generator / evaluator for this instance."
+                    )
+                return
+            for k, v in obj.items():
+                if k == "by_instance" and isinstance(v, dict):
+                    for inst, inst_obj in v.items():
+                        _walk(inst_obj, inst)
+                else:
+                    _walk(v, instance_name)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk(item, instance_name)
+
+    _walk(data, "?")
+    return warnings
+
+
+def _try_smoke_run(exp_dir: Path, config: Any) -> tuple[int, str, bool] | None:
+    """Run the DEFAULT entry point once; None on success.
+
+    Stage 12 runs ``main.py`` with no flags, so a crash on that path (an
+    ablation assert, a full-comparison check) must be caught here — running
+    ``--algorithm`` would bypass it.
+
+    Returns ``None`` when the run succeeded (returncode 0, no timeout). On
+    failure returns ``(returncode, tail, timed_out)`` where ``timed_out``
+    distinguishes a killed-over-budget run (started, possibly hang) from a
+    genuine crash; the caller treats the former as repairable-but-not-fatal
+    rather than silently accepting it, so a hang is surfaced instead of being
+    mistaken for success.
+    """
+    import subprocess as _sp
+
+    py = getattr(getattr(config, "experiment", None), "sandbox", None)
+    py_path = getattr(py, "python_path", "") or ""
+
+    # Resolve to absolute paths. run_dir (and thus exp_dir/main_py) is built
+    # from the user's `--output`, which may be relative — passing a relative
+    # main_py with cwd=exp_dir makes Python resolve the path against cwd again,
+    # producing ".../experiment/artifacts/.../experiment/main.py" (duplicated)
+    # and "can't open file" even though main.py exists.
+    exp_dir = Path(exp_dir).resolve()
+    main_py = exp_dir / "main.py"
+    if not main_py.is_file():
+        # No entry point — the stage's own main.py check reports that.
+        return None
+
+    try:
+        proc = _sp.run(
+            [py_path or sys.executable, str(main_py)],
+            cwd=str(exp_dir),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+    except _sp.TimeoutExpired:
+        # A slow-but-legal run is not a launch failure: it started and is
+        # simply past the budget. OpenCode is expected to ship a seconds-scale
+        # demo config; if it did not, that is a warning, not a reason to kill
+        # the stage. Still report it explicitly (timed_out=True) so the repair
+        # loop can nag about a hang instead of treating it as clean success.
+        logger.warning(
+            "Stage 10: smoke run exceeded 120s — experiment started but did not "
+            "finish within the smoke budget; reporting as timed-out (not a crash)"
+        )
+        return (0, "smoke run exceeded 120s budget (possible hang)", True)
+    except Exception as exc:  # noqa: BLE001
+        return (1, f"failed to launch: {exc}", False)
+    if proc.returncode == 0:
+        return None
+    tail = (proc.stderr or "")[-1500:] or (proc.stdout or "")[-1500:]
+    return (proc.returncode, tail, False)
+
+
+def _should_repair_with_opencode(error_output: str) -> bool:
+    """Determine if an error is worth repairing with OpenCode.
+
+    OpenCode is expensive (~30s+ per invocation), so only use it for errors
+    that are clearly code bugs that an AI agent can fix. Environmental errors
+    (missing packages, file permissions) should fail fast.
+    """
+    # Repairable errors: logic bugs that OpenCode can fix
+    _REPAIRABLE_ERRORS = (
+        "NameError",
+        "AttributeError",
+        "TypeError",
+        "ValueError",
+        "IndexError",
+        "KeyError",
+        "ZeroDivisionError",
+        "AssertionError",
+        "RuntimeError",  # Often algorithm bugs
+    )
+
+    # Non-repairable: environmental issues
+    _NON_REPAIRABLE_ERRORS = (
+        "ModuleNotFoundError",
+        "ImportError",
+        "FileNotFoundError",
+        "PermissionError",
+        "OSError",
+        "MemoryError",
+        "TimeoutError",
+    )
+
+    # Check for non-repairable errors first (highest priority)
+    if any(err in error_output for err in _NON_REPAIRABLE_ERRORS):
+        return False
+
+    # Check for repairable errors
+    if any(err in error_output for err in _REPAIRABLE_ERRORS):
+        return True
+
+    # Unknown error type: default to not using OpenCode (conservative)
+    return False
+
+
+def _build_opencode_repair_guidance(
+    error_code: int,
+    error_output: str,
+    attempt: int,
+    l4b_constraint: str = "",
+) -> str:
+    """Build repair-focused guidance for OpenCode.
+
+    This is appended to the normal GUIDANCE.md to provide context about
+    the error that needs fixing.
+    """
+    # Extract the most relevant part of the error
+    error_lines = error_output.strip().split("\n")
+
+    # Find the actual error message (usually at the end)
+    error_summary = ""
+    for line in reversed(error_lines[-10:]):  # Last 10 lines
+        if any(err in line for err in ["Error:", "Exception:", "Traceback"]):
+            error_summary = line.strip()
+            break
+
+    # Find the file and line number
+    error_location = ""
+    for line in reversed(error_lines):
+        if 'File "' in line and 'line' in line:
+            error_location = line.strip()
+            break
+
+    repair_guidance = f"""
+
+## ⚠️ REPAIR MODE — PREVIOUS ATTEMPT FAILED ⚠️
+
+This is repair attempt #{attempt}. The code generated in the previous attempt
+crashed with a runtime error. Your task is to FIX the error, not regenerate
+from scratch.
+
+### Error Information
+
+**Exit code**: {error_code}
+
+**Error summary**: {error_summary or "See full output below"}
+
+**Error location**: {error_location or "Unknown"}
+
+**Full error output** (last 50 lines):
+```
+{chr(10).join(error_lines[-50:])}
+```
+
+### Repair Instructions
+
+1. **Read the existing code first** — use the Read tool to examine the files
+   mentioned in the error traceback.
+
+2. **Identify the root cause** — understand why the error occurred:
+   - Array dimension mismatches? (e.g., `shapes (5,1) and (4,10)`)
+   - Variable name errors? (typos, wrong scope)
+   - Logic errors? (division by zero, index out of bounds)
+   - Type mismatches? (expecting float, got string)
+
+3. **Fix ONLY the broken parts** — do not regenerate entire files. Edit only
+   the specific functions/sections that are broken.
+
+4. **Test the fix** — after editing, run `main.py` again to verify the error
+   is resolved. If you see a new error, fix that too. Keep iterating until
+   `main.py` runs successfully.
+
+5. **Preserve structure** — do NOT refactor working code, remove features, or
+   change the overall design. Your job is surgical repair, not redesign.
+{l4b_constraint}
+
+### Debugging Tips
+
+- For array shape errors: print the shapes before the failing operation
+- For name errors: check spelling and variable scope
+- For type errors: add type conversions (int(), float(), str())
+- For index errors: check array lengths and loop bounds
+
+### Success Criteria
+
+The repair is successful when:
+- `main.py` runs without crashing (exit code 0)
+- The primary metric is printed
+- No Python exceptions are raised
+
+Remember: You are FIXING existing code, not generating from scratch. Be precise
+and surgical.
+"""
+    return repair_guidance
+
+
+def _normalize_plan_items(value: Any) -> list[str]:
+    """Flatten a plan field (list[str] / list[dict] / dict[str, str]) to names.
+
+    S9 plans do not share a fixed schema for how methods/baselines/ablations are
+    declared: a value can be a list of strings, a list of dicts (each with
+    ``name``/``class_name``/``citation``/``description``), a dict keyed by names,
+    or a prose string. We only need a bag of name candidates, so any string leaf
+    is kept and the original structure is discarded deliberately (classification
+    is per-algorithm, not per-plan-row).
+    """
+    out: list[str] = []
+    # English prose stopwords: a description like "pointwise_linear is the
+    # primary baseline" would otherwise leak "is"/"the"/"primary" into the name
+    # bag and the LLM prompt. Only applied to the prose branch below, never to a
+    # name in a list/dict key or value, so real algorithm names are never
+    # filtered out.
+    _STOPWORDS = {
+        "a", "an", "and", "as", "at", "be", "by", "for", "from", "in", "is",
+        "it", "of", "on", "or", "that", "the", "this", "to", "with", "we",
+        "our", "method", "methods", "baseline", "baselines", "primary",
+        "main", "proposed", "ablation", "ablations",
+    }
+    if value is None:
+        return out
+    if isinstance(value, str):
+        # A description phrase ("pointwise_linear is the primary baseline") is
+        # not a name; keep only plausible identifier-like tokens so the LLM and
+        # the fallback matcher are not flooded with prose.
+        for tok in re.split(r"[\s,;:()\"']+", value):
+            tok = tok.strip()
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.\-]*", tok) and tok.lower() not in _STOPWORDS:
+                out.append(tok)
+        return out
+    if isinstance(value, list):
+        for item in value:
+            out.extend(_normalize_plan_items(item))
+        return out
+    if isinstance(value, dict):
+        for k, v in value.items():
+            out.append(str(k))
+            out.extend(_normalize_plan_items(v))
+        return out
+    out.append(str(value))
+    return out
+
+
+def _plan_field_category(key: str) -> str | None:
+    """Classify a plan key to {proposed,baseline,ablation} by semantic prefix.
+
+    The stage-9 generator does not emit a fixed schema: the split may be
+    ``proposed_methods`` / ``baselines`` / ``ablations``, or ``conditions``,
+    ``method``, ``baseline_1`` / ``baseline_2``, or a topic-specific spelling.
+    Rather than enumerate keys, we match on a stable prefix so any spelling a
+    future prompt produces is still sorted into the right bag. The priority
+    (baseline over ablation over proposed) is applied later in the classifier;
+    here we only decide which bag a key feeds.
+    """
+    k = (key or "").strip().lower()
+    if not k:
+        return None
+    if k.startswith("baseline") or k.startswith("base_"):
+        return "baseline"
+    if k.startswith("ablat"):
+        return "ablation"
+    if (
+        k.startswith("propos")
+        or k.startswith("method")
+        or k.startswith("condition")
+        or k in ("ours", "main")
+    ):
+        return "proposed"
+    return None
+
+
+def _is_algorithm_row(value: Any) -> bool:
+    """True when a dict is an experiment row, not a nested config/prose group.
+
+    The S9 generator models each method/baseline/ablation as a dict carrying a
+    ``name`` (or ``class_name``) plus prose fields like ``description`` /
+    ``implementation_spec`` / ``expected_effect``. That dict is a *row*, and only
+    its ``name``/``class_name`` are algorithm names worth extracting; recursing
+    into the prose would flood the name bag with natural-language tokens. A dict
+    without either field (e.g. ``compute_budget``, ``metrics``, a keyed-by-name
+    map) is not a row and is flattened normally.
+    """
+    if not isinstance(value, dict):
+        return False
+    return "name" in value or "class_name" in value
+
+
+def _collect_plan_names(value: Any) -> list[str]:
+    """Flatten a plan field value into a list of name-candidate strings.
+
+    ``value`` may be a list[str], list[dict], dict[str, ...], str, None, or a
+    nested mix of these. Recursion flattens whatever the plan puts under a given
+    key, except that a dict *row* (a method/baseline/ablation declaration) only
+    contributes its ``name``/``class_name`` — its prose fields are not names.
+    Callers decide which bag the result feeds by the key it was found under.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return _normalize_plan_items(value)
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            out.extend(_collect_plan_names(item))
+        return out
+    if isinstance(value, dict):
+        if _is_algorithm_row(value):
+            row = [value.get("name"), value.get("class_name")]
+            return [n for n in row if isinstance(n, str) and n.strip()]
+        out = []
+        for k, v in value.items():
+            # For a row {'name': 'cma_es_default'} the key is a field name, not an
+            # algorithm name — do not add it. A dict keyed BY algorithm name
+            # ({'cma_es_default': {...}}) should contribute that key; we cannot
+            # tell the two apart without knowing the schema, and adding an extra
+            # candidate is harmless because the classifier only keeps names that
+            # match a real algorithm dir.
+            out.append(str(k))
+            out.extend(_collect_plan_names(v))
+        return out
+    return [str(value)]
+
+
+def _extract_plan_names(exp_plan: Any) -> tuple[list[str], list[str], list[str]]:
+    """Return (proposed, baselines, ablations) name bags from the S9 plan.
+
+    ``exp_plan`` is the parsed YAML dict (or str). We do NOT assume any fixed
+    set of keys: the whole plan tree is walked, and every key is routed into a
+    bag by the semantic prefix of its name (see :func:`_plan_field_category`).
+    Anything under a key that looks like a baseline is a baseline, etc. This
+    makes the classifier tolerant of every schema the generator has produced
+    (proposed_methods / conditions / method / baseline_1 ...) and of future
+    paraphrases, instead of failing when it meets a key it never saw.
+    """
+    if isinstance(exp_plan, str):
+        if not exp_plan.strip():
+            return [], [], []
+        parsed = None
+        try:
+            import yaml as _yaml
+            parsed = _yaml.safe_load(exp_plan)
+        except Exception:  # noqa: BLE001 - prose plan, not YAML
+            parsed = None
+        if not isinstance(parsed, dict):
+            return [], [], []
+    elif isinstance(exp_plan, dict):
+        parsed = exp_plan
+    else:
+        return [], [], []
+
+    proposed: list[str] = []
+    baselines: list[str] = []
+    ablations: list[str] = []
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, val in node.items():
+                cat = _plan_field_category(key)
+                if cat is None:
+                    # Unclassified key (e.g. metadata, datasets, metrics): drill
+                    # into it so any nested algorithm names still surface, but
+                    # contribute nothing itself.
+                    _walk(val)
+                    continue
+                # The top-level key is authoritative for its value's category,
+                # e.g. ``proposed_methods:`` makes every row below it proposed.
+                # Do not recurse: the value's inner field keys (``name``,
+                # ``description`` ...) are not themselves category keys, and
+                # recursing would re-read their values into the wrong bag.
+                bag = proposed if cat == "proposed" else baselines if cat == "baseline" else ablations
+                bag.extend(_collect_plan_names(val))
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(parsed)
+    return proposed, baselines, ablations
+
+
+def _classify_algorithms_with_fallback(
+    algo_names: list[str],
+    exp_plan: Any,
+) -> dict[str, str]:
+    """Deterministic classification used when the LLM is unavailable or fails.
+
+    Exact name match is authoritative (a name listed under ``proposed_methods``
+    is proposed). Substring match (an ``esn_N200`` grid entry inside ``esn``)
+    falls back to that name's category, with ties resolved by a stable
+    ``proposed > baseline > ablation`` priority so the outcome does not depend
+    on dict iteration order.
+
+    An algorithm that matches no declared baseline or ablation is **proposed**,
+    not "unknown": the stage-9 plan models the experiment as ``conditions:``
+    (the methods being tested) plus separately-declared baselines, so anything
+    that is not a baseline is by construction the method under test. This is
+    what keeps a ``{categories: [proposed]}`` scope from silently shrinking to
+    zero packages on a topic that never declared ``proposed_methods``.
+    """
+    if not algo_names:
+        return {}
+    proposed, baselines, ablations = _extract_plan_names(exp_plan)
+
+    def _cat_for(name: str) -> str | None:
+        # baselines/ablations are the stricter label: a method can appear under
+        # ``conditions:`` (which we fold into proposed) AND be named as a
+        # baseline in prose ("pointwise_linear is the primary baseline"). A name
+        # explicitly declared a baseline must stay a baseline, so check those
+        # before the proposed bag.
+        if name in baselines:
+            return "baseline"
+        if name in ablations:
+            return "ablation"
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.\-]*", name or "") and name in proposed:
+            return "proposed"
+        return None
+
+    result: dict[str, str] = {}
+    for name in algo_names:
+        cat = _cat_for(name)
+        if cat is None:
+            # Substring candidates: match the algorithm's stem against any plan
+            # name. ``esn`` matches ``esn_N200``; stem is the directory name.
+            stem = re.sub(r"[\d_.\-]+$", "", name).strip("_")
+            cand_names = [n for n in proposed + baselines + ablations if stem and stem in n]
+            if cand_names:
+                # Same baseline > ablation > proposed priority as exact match.
+                if any(n in baselines for n in cand_names):
+                    cat = "baseline"
+                elif any(n in ablations for n in cand_names):
+                    cat = "ablation"
+                elif any(n in proposed for n in cand_names):
+                    cat = "proposed"
+            if cat is None:
+                cat = "proposed"
+        result[name] = cat
+    return result
+
+
+def _classify_algorithms(
+    exp_dir: Path,
+    exp_plan: Any,
+    llm: LLMClient | None,
+    *,
+    max_attempts: int = 2,
+) -> dict[str, str]:
+    """Classify the generated algorithm tree as proposed/baseline/ablation.
+
+    The plan's split keys and the directory names do not correspond one-to-one
+    (a topic may list ``conditions:`` or grid entries, or omit a split entirely)
+    so the classifier operates on *actual* algorithm names and asks the LLM to
+    decide, then falls back to a deterministic matcher when the LLM call fails
+    or returns nothing usable. Never raises: classification is advisory and a
+    missing/partial result only degrades evolve_scope filtering.
+    """
+    try:
+        from researchclaw.pipeline.llm4ad_task_packages import _discover_algorithms
+        discovered = _discover_algorithms(exp_dir)
+        algo_names = [a for a, _ in discovered]
+    except Exception:  # noqa: BLE001
+        algo_names = []
+    if not algo_names:
+        return {}
+
+    fallback = _classify_algorithms_with_fallback(algo_names, exp_plan)
+
+    if llm is None:
+        logger.info("Stage 10: no LLM — classifying algorithms by plan-name fallback")
+        return fallback
+
+    # Build the prompt from plan names and the *actual* tree, so we never ask
+    # the model to imagine algorithms that are not in the directory.
+    proposed, baselines, ablations = _extract_plan_names(exp_plan)
+    _plan_section = (
+        f"proposed_methods: {proposed or '(<not declared>)'}\n"
+        f"baselines: {baselines or '(<not declared> or free-form prose in plan>)'}\n"
+        f"ablations: {ablations or '(<not declared>)'}\n"
+    )
+    _algo_section = "\n".join(f"- {a}" for a in algo_names)
+
+    user_prompt = (
+        "The following experimental algorithms were generated in the pipeline.\n\n"
+        "PLAN (from the experiment design stage):\n"
+        f"{_plan_section}\n\n"
+        "ACTUAL ALGORITHM DIRECTORIES (names are authoritative):\n"
+        f"{_algo_section}\n\n"
+        "For EACH actual algorithm, decide whether it is the PROPOSED method, a "
+        "BASELINE, or an ABLATION, using your judgment and the plan above. The plan "
+        "may not declare all categories or the names may differ from the directory "
+        "names; use code/libary knowledge to decide. Do NOT invent algorithms. If a "
+        "category is not declared, still classify by the nature of the algorithm.\n"
+        "Return ONLY JSON of shape "
+        '{"classification": {"<algo_name>": "proposed"|"baseline"|"ablation"}}, '
+        "with every actual algorithm from the list above and no others.\n"
+    )
+    system_prompt = (
+        "You classify machine-learning / optimization experiment algorithms."
+    )
+
+    for attempt in range(max_attempts):
+        try:
+            resp = _chat_with_prompt(llm, system_prompt, user_prompt, max_tokens=2048)
+            raw = resp.content or ""
+            parsed = None
+            _yaml_block = _extract_yaml_block(raw)
+            for candidate in (raw, _yaml_block):
+                if not candidate or not candidate.strip():
+                    continue
+                try:
+                    candidate_parsed = _safe_json_loads(candidate, None)
+                except Exception:  # noqa: BLE001
+                    candidate_parsed = None
+                if isinstance(candidate_parsed, dict):
+                    parsed = candidate_parsed
+                    break
+            mapping = parsed.get("classification", {}) if isinstance(parsed, dict) else {}
+            if isinstance(mapping, dict) and mapping:
+                result = {
+                    a: str(mapping.get(a, fallback.get(a, "proposed")))
+                    for a in algo_names
+                }
+                # Keep any algorithm the model skipped as the fallback guess;
+                # an algorithm the model labels "unknown" is kept as-is.
+                for a in algo_names:
+                    if a not in result:
+                        result[a] = fallback.get(a, "proposed")
+                logger.info(
+                    "Stage 10: LLM classified %d algorithm(s): %s",
+                    len(algo_names), result,
+                )
+                return result
+            logger.warning(
+                "Stage 10: algorithm classification attempt %d returned no usable "
+                "JSON (got %r) — %s", attempt + 1, raw[:200], "retrying" if attempt + 1 < max_attempts else "falling back",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Stage 10: algorithm classification call %d raised %s — %s",
+                attempt + 1, exc,
+                "retrying" if attempt + 1 < max_attempts else "falling back",
+            )
+        if attempt + 1 < max_attempts:
+            time.sleep(2 * (attempt + 1))
+    return fallback
+
+
+def _maybe_classify_algorithms(
+    exp_dir: Path,
+    exp_plan_text: str,
+    config: Any,
+    llm: LLMClient | None,
+) -> None:
+    """Best-effort write of ``experiment/algorithms_classification.json``.
+
+    Runs only when LLM4AD boost is enabled — the file is only consumed by the
+    evolution scoping filter, so without boost it would be dead output. Does
+    not raise; an absent file means the stage-13 filter treats evolution scope
+    as "everything".
+    """
+    _l4b = getattr(getattr(config, "experiment", None), "llm4ad_boost", None)
+    if _l4b is None or not getattr(_l4b, "enabled", False):
+        return
+    _evo = getattr(_l4b, "evolution", None)
+    _scope = getattr(_evo, "evolve_scope", None) if _evo is not None else None
+    if not _scope or not isinstance(_scope, dict):
+        # No category filtering requested — no need to burn an LLM call.
+        return
+
+    try:
+        if exp_plan_text and not exp_plan_text.strip():
+            plan = None
+        elif exp_plan_text:
+            try:
+                import yaml as _yaml
+                plan = _yaml.safe_load(exp_plan_text)
+            except Exception:  # noqa: BLE001
+                plan = exp_plan_text
+        else:
+            plan = None
+        result = _classify_algorithms(exp_dir, plan, llm)
+        payload = {
+            "generated": _utcnow_iso(),
+            "source": "stage-10 llm" if llm is not None else "stage-10 plan fallback",
+            "classification": result,
+        }
+        (exp_dir / "algorithms_classification.json").write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.info("Stage 10: wrote algorithms_classification.json (n=%d)", len(result))
+    except Exception as exc:  # noqa: BLE001 - advisory, never fail the stage
+        logger.warning(
+            "Stage 10: algorithm classification skipped (non-fatal): %s", exc,
+        )
 
 
 def _execute_code_generation(
@@ -573,12 +1967,8 @@ def _execute_code_generation(
     # --- LLM4AD task-package structure guidance (all channels) -----------
     # Injected before the Beast/CodeAgent/Legacy dispatch so every channel
     # that consumes extra_guidance carries the LLM4AD structure requirement.
-    _l4b = getattr(config.experiment, "llm4ad_boost", None)
-    if (
-        _l4b is not None
-        and getattr(_l4b, "enabled", False)
-        and config.experiment.mode in ("sandbox", "docker")
-    ):
+    if (_is_llm4ad_enabled(config)
+            and config.experiment.mode in ("sandbox", "docker")):
         try:
             extra_guidance += _pm.block("llm4ad_task_package_guidance")
         except Exception:  # noqa: BLE001
@@ -591,6 +1981,7 @@ def _execute_code_generation(
     _code_agent_active = False
     _beast_mode_used = False
     _code_max_tokens = 8192
+    _bridge = None  # OpenCode bridge for both generation and repair
 
     # ── Beast Mode: OpenCode external agent (optional) ─────────────────
     _oc_cfg = config.experiment.opencode
@@ -659,6 +2050,10 @@ def _execute_code_generation(
                     timeout_sec=_oc_cfg.timeout_sec,
                     max_retries=_oc_cfg.max_retries,
                     workspace_cleanup=_oc_cfg.workspace_cleanup,
+                    debug=_oc_cfg.debug,
+                    # Verify with the interpreter the sandbox will actually use,
+                    # so "it ran for the agent" means it runs in Stage 12 too.
+                    python_path=config.experiment.sandbox.python_path,
                 )
 
                 logger.info(
@@ -948,6 +2343,74 @@ def _execute_code_generation(
                 resp.content[:300],
             )
 
+    # --- Pre-flight completeness check (before writing to disk) ---
+    # Check if critical files are missing BEFORE we start the repair loop.
+    # Missing files need REGENERATION, not REPAIR.
+    if files and _is_llm4ad_enabled(config):
+        _completeness_problems = _validate_generation_completeness(files)
+        if _completeness_problems:
+            _blocking = [p for p in _completeness_problems if p.startswith("BLOCKING:")]
+            for _prob in _completeness_problems:
+                logger.warning("Stage 10: %s", _prob)
+                validation_log.append(_prob)
+
+            # If we have BLOCKING issues and an LLM, try regeneration (not repair)
+            if _blocking and llm is not None and not _code_agent_active:
+                _regen_attempt = 0
+                _max_regen = 2  # Limited regeneration attempts
+
+                while _blocking and _regen_attempt < _max_regen:
+                    _regen_attempt += 1
+                    logger.info(
+                        "Stage 10: Generation incomplete (attempt %d/%d). Regenerating with explicit requirements.",
+                        _regen_attempt, _max_regen,
+                    )
+
+                    # Build explicit regeneration prompt
+                    _missing_summary = "\n".join(f"  - {p}" for p in _blocking)
+                    _regen_prompt = (
+                        f"Your previous generation was INCOMPLETE. Missing critical files:\n"
+                        f"{_missing_summary}\n\n"
+                        f"You MUST regenerate the ENTIRE experiment including ALL required files.\n"
+                        f"Pay special attention to:\n"
+                        f"1. Generate at least 3 data/*.json files with problem instances\n"
+                        f"2. Ensure main.py exists and is runnable\n"
+                        f"3. Ensure evaluator.py exists with PRIMARY_METRIC, METRIC_DEF, evaluate_instance\n"
+                        f"4. Generate algorithm files in algorithms/<algo>/<algo>.py\n\n"
+                        f"ORIGINAL TOPIC: {config.research.topic}\n"
+                        f"PLAN:\n{exp_plan}\n\n"
+                        f"Return ALL files using ```filename:xxx format."
+                    )
+
+                    _regen_resp = _chat_with_prompt(
+                        llm,
+                        system=_pm.system("code_generation"),
+                        user=_regen_prompt,
+                        max_tokens=_code_max_tokens,
+                    )
+                    _regen_files = _extract_multi_file_blocks(_regen_resp.content)
+
+                    if _regen_files:
+                        files = _regen_files
+                        # Re-check completeness
+                        _completeness_problems = _validate_generation_completeness(files)
+                        _blocking = [p for p in _completeness_problems if p.startswith("BLOCKING:")]
+
+                        if not _blocking:
+                            logger.info("Stage 10: Regeneration successful, all critical files present")
+                            break
+                    else:
+                        logger.warning("Stage 10: Regeneration attempt %d produced no files", _regen_attempt)
+
+                # Log final status
+                if _blocking:
+                    logger.error(
+                        "Stage 10: Failed to generate complete experiment after %d regeneration attempts. "
+                        "Missing: %s",
+                        _regen_attempt,
+                        ", ".join(_blocking),
+                    )
+
     # --- Fallback: generic numerical experiment ---
     if not files:
         files = {
@@ -981,17 +2444,37 @@ def _execute_code_generation(
 
     # --- Validate each file + auto-repair loop ---
     all_valid = True
+    attempt = 0
 
     # --- LLM4AD task-package structure validation (all channels) ---
-    _l4b_v = getattr(config.experiment, "llm4ad_boost", None)
-    if _l4b_v is not None and getattr(_l4b_v, "enabled", False):
+    # Structure defects (partial EVOLVE coverage, an algorithm calling a module-
+    # level helper) used to flip `all_valid` without being fed back to the LLM,
+    # so a syntactically-fine but un-evolvable package died with "FAILED after 0
+    # repair attempt(s)". Route them through the same repair channel as syntax
+    # defects, re-check after each pass, and only give up at `max_repair`.
+    if _is_llm4ad_enabled(config):
         _l4b_problems = _check_llm4ad_structure(files)
         for _prob in _l4b_problems:
             logger.warning("Stage 10: %s", _prob)
             validation_log.append(_prob)
+        if _l4b_problems and llm is not None:
+            _l4b_round = 0
+            while _l4b_problems and _l4b_round < max_repair:
+                _l4b_round += 1
+                logger.info(
+                    "LLM4AD structure repair round %d/%d (%d issue(s))",
+                    _l4b_round, max_repair, len(_l4b_problems),
+                )
+                files, _l4b_problems, _l4b_attempts = _repair_llm4ad_structure(
+                    files, _l4b_problems, llm=llm, _pm=_pm, max_repair=max_repair,
+                )
+                attempt += _l4b_attempts
+                for _prob in _l4b_problems:
+                    logger.warning("Stage 10: %s", _prob)
+                    validation_log.append(_prob)
         if _l4b_problems:
             all_valid = False
-    attempt = 0
+
     for fname, code in list(files.items()):
         # Skip non-Python files (requirements.txt, setup.py, etc.)
         if not fname.endswith(".py"):
@@ -1017,19 +2500,39 @@ def _execute_code_generation(
                 max_repair,
                 validation.summary(),
             )
-            all_files_ctx = "\n\n".join(
-                f"```filename:{f}\n{c}\n```" for f, c in files.items()
-            )
+            all_files_ctx = _scoped_files_ctx(files, fname)
+
+            # Choose prompt based on whether file has EVOLVE markers
+            _prompt_type = "code_repair"
+            _l4b_v = getattr(getattr(config, "experiment", None), "llm4ad_boost", None)
+            if (_l4b_v and getattr(_l4b_v, "enabled", False)
+                    and "EVOLVE_START" in code and "EVOLVE_END" in code):
+                _prompt_type = "code_repair_llm4ad"
+                logger.debug("Using LLM4AD-aware repair prompt for %s", fname)
+
             rp = _pm.sub_prompt(
-                "code_repair",
+                _prompt_type,
                 fname=fname,
                 issues_text=issues_text,
                 all_files_ctx=all_files_ctx,
             )
-            resp = _chat_with_prompt(llm, rp.system, rp.user)
+            resp = _chat_with_prompt(llm, rp.system, rp.user, max_tokens=rp.max_tokens)
             _repaired = _extract_code_block(resp.content)
             if _repaired.strip():
-                files[fname] = _repaired
+                # Post-repair validation: check EVOLVE markers
+                _had_evolve = "EVOLVE_START" in code and "EVOLVE_END" in code
+                _has_evolve = "EVOLVE_START" in _repaired and "EVOLVE_END" in _repaired
+                if _had_evolve and not _has_evolve:
+                    logger.error(
+                        "Repair removed EVOLVE markers from %s — reverting to original",
+                        fname,
+                    )
+                    validation_log.append(
+                        f"REPAIR_FAILED: {fname} — EVOLVE markers were removed, kept original"
+                    )
+                    # Keep original code
+                else:
+                    files[fname] = _repaired
             else:
                 logger.warning("Repair attempt returned empty code, keeping original")
             validation = validate_code(files[fname])
@@ -1056,6 +2559,13 @@ def _execute_code_generation(
     if not all_valid:
         _has_critical = False
         for fname, code in files.items():
+            # Only Python files. `validate_code` parses its input as Python, so
+            # a README.md reports a "syntax" error and blocks the whole stage —
+            # the per-file loop above skips non-.py for exactly this reason, and
+            # this loop must agree. Any check that flips `all_valid` (including
+            # the LLM4AD structure checks) otherwise fails the stage on prose.
+            if not fname.endswith(".py"):
+                continue
             _v = validate_code(code)
             if not _v.ok:
                 for issue in _v.issues:
@@ -1085,39 +2595,12 @@ def _execute_code_generation(
     # local module that doesn't exist in the files dict.  This catches the
     # case where Beast Mode/CodeAgent produced an intermediate file that
     # got lost during repair iterations.
-    # Both the bare module name and the full relative path are known, so a
-    # nested file like algorithms/nm/nm.py satisfies `import nm` (which is how
-    # main.py's importlib loader reaches it) without a false positive.
-    _known_modules = {
-        Path(f).stem for f in files if f.endswith(".py")
-    } | {
-        f[: -len(".py")].replace("/", ".") for f in files if f.endswith(".py")
-    }
-    _stdlib_and_common = {
-        "os", "sys", "json", "math", "time", "copy", "re", "random",
-        "pathlib", "argparse", "logging", "collections", "functools",
-        "itertools", "abc", "typing", "dataclasses", "enum", "io",
-        "csv", "pickle", "glob", "shutil", "subprocess", "datetime",
-        "numpy", "np", "torch", "torchvision", "gymnasium", "gym",
-        "sklearn", "scipy", "pandas", "matplotlib", "PIL", "tqdm",
-        "einops", "timm", "transformers", "datasets", "peft",
-        "stable_baselines3",
-    }
-    for fname, code in list(files.items()):
-        if not fname.endswith(".py"):
-            continue
-        for _m in re.findall(
-            r"^(?:from|import)\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-            code, re.MULTILINE,
-        ):
-            if (_m not in _known_modules
-                    and _m not in _stdlib_and_common
-                    and not _m.startswith("_")):
-                logger.warning(
-                    "BUG-184: %s imports '%s' which is not in generated "
-                    "files — experiment may crash on import",
-                    fname, _m,
-                )
+    for _f, _m in _dangling_local_imports(files):
+        logger.warning(
+            "BUG-184: %s imports '%s' which is not in generated "
+            "files — experiment may crash on import",
+            _f, _m,
+        )
 
     # --- Write experiment directory ---
     exp_dir = stage_dir / "experiment"
@@ -1197,14 +2680,36 @@ def _execute_code_generation(
             len(critical_deep),
         )
         repair_issues = "\n".join(f"- {w}" for w in critical_deep)
-        all_code_ctx = "\n\n".join(
-            f"```filename:{f}\n{c}\n```" for f, c in files.items()
-        )
+        # A deep issue (identical AST, copy-paste ablation, shadows stdlib) can
+        # only be fixed by reading the METHOD BODY, not a signature — so pass
+        # the files those warnings name verbatim via ``full_files``, and
+        # summarize the rest. Names carry the file as ``[<file>[:line]]``.
+        _crit_files = sorted({
+            m.group(1) for w in critical_deep
+            for m in [re.match(r"\[([^:\]]+)", w)]
+            if m and m.group(1) in files
+        })
+        # Cross-file repair (it may rewrite several classes/imports), so the
+        # model must see the whole project — but summarized, not dumped in full.
+        all_code_ctx = _summarize_files_ctx(files, full_files=tuple(_crit_files))
+
+        # Add LLM4AD constraint if enabled
+        _l4b_rules = ""
+        _l4b_v = getattr(config.experiment, "llm4ad_boost", None)
+        if _l4b_v is not None and getattr(_l4b_v, "enabled", False):
+            _l4b_rules = (
+                f"- LLM4AD STRUCTURE: Files with # EVOLVE_START / # EVOLVE_END markers "
+                f"contain evolvable algorithm logic. PRESERVE these markers. ALL "
+                f"algorithm logic must stay between them. DO NOT extract to helper "
+                f"functions outside the EVOLVE block.\n"
+            )
+
         repair_prompt = (
             f"CRITICAL CODE QUALITY ISSUES FOUND:\n{repair_issues}\n\n"
             f"Fix ALL these issues in the code below. Return the complete "
             f"corrected files using ```filename:xxx.py format.\n\n"
             f"RULES:\n"
+            f"{_l4b_rules}"
             f"- nn.Linear/nn.Conv must be created in __init__(), not forward()\n"
             f"- Variables used after if/else must be defined before the branch\n"
             f"- Use scipy.special.erf, not np.erf\n"
@@ -1237,19 +2742,10 @@ def _execute_code_generation(
                 max_tokens=_code_max_tokens,
             )
             repaired = _extract_multi_file_blocks(repair_resp.content)
-            # A repair reply legitimately contains only the files it changed —
-            # requiring main.py here would discard every targeted fix. Accept
-            # any subset whose names we already know, and merge rather than
-            # replace so untouched modules survive (cf. BUG-106 in Stage 13).
-            _known = {k: v for k, v in (repaired or {}).items() if k in files}
-            _unknown = sorted(set(repaired or {}) - set(files))
-            if _unknown:
-                logger.warning(
-                    "Stage 10: deep repair returned unknown file(s) %s — ignored",
-                    ", ".join(_unknown),
-                )
+            files, _known = _merge_repaired_files(
+                files, repaired, label="deep repair"
+            )
             if _known:
-                files = {**files, **_known}
                 for fname, code in _known.items():
                     _wp = exp_dir / fname
                     _wp.parent.mkdir(parents=True, exist_ok=True)
@@ -1368,11 +2864,23 @@ def _execute_code_generation(
                         f"{i.get('fix', 'no fix suggested')}"
                         for i in critical_issues
                     )
+
+                    # Add LLM4AD constraint if enabled
+                    _l4b_note = ""
+                    _l4b_v = getattr(config.experiment, "llm4ad_boost", None)
+                    if _l4b_v is not None and getattr(_l4b_v, "enabled", False):
+                        _l4b_note = (
+                            "\n\nIMPORTANT: Files with # EVOLVE_START / # EVOLVE_END "
+                            "markers are LLM4AD algorithm files. PRESERVE the markers "
+                            "and keep ALL algorithm logic between them. DO NOT extract "
+                            "to external functions.\n"
+                        )
+
                     fix_prompt = (
                         f"Code review found {len(critical_issues)} CRITICAL issues "
                         f"(score: {review_score}/10):\n{fix_descriptions}\n\n"
                         f"Fix ALL critical issues. Return complete corrected files "
-                        f"using ```filename:xxx.py format.\n\n"
+                        f"using ```filename:xxx.py format.{_l4b_note}\n\n"
                         f"Current code:\n"
                         + "\n\n".join(
                             f"```filename:{f}\n{c}\n```" for f, c in files.items()
@@ -1387,19 +2895,10 @@ def _execute_code_generation(
                         )
                         fixed_files = _extract_multi_file_blocks(fix_resp.content)
                         # Partial reply is normal — see deep-repair note above.
-                        _fx = {
-                            k: v for k, v in (fixed_files or {}).items()
-                            if k in files
-                        }
-                        _fx_unknown = sorted(set(fixed_files or {}) - set(files))
-                        if _fx_unknown:
-                            logger.warning(
-                                "Stage 10: review-fix returned unknown file(s) "
-                                "%s — ignored",
-                                ", ".join(_fx_unknown),
-                            )
+                        files, _fx = _merge_repaired_files(
+                            files, fixed_files, label="review-fix"
+                        )
                         if _fx:
-                            files = {**files, **_fx}
                             for fname, code in _fx.items():
                                 _wp = exp_dir / fname
                                 _wp.parent.mkdir(parents=True, exist_ok=True)
@@ -1421,7 +2920,9 @@ def _execute_code_generation(
     # includes file inventory + full main.py + per-file function/class headers.
     alignment_ok = True
     alignment_note = ""
-    if llm is not None:
+    if config.experiment.skip_alignment_check:
+        logger.info("Stage 10: Skipping alignment check (config.experiment.skip_alignment_check=True)")
+    elif llm is not None:
         # Build structured code summary for alignment check
         _file_inventory = []
         for _fn, _cd in files.items():
@@ -1530,6 +3031,33 @@ def _execute_code_generation(
                         "Stage 10: Alignment regen attempt %d/%d",
                         _regen_attempt, _max_regen,
                     )
+
+                    # Add LLM4AD constraint if enabled
+                    _l4b_regen_constraint = ""
+                    _l4b_v = getattr(getattr(config, "experiment", None), "llm4ad_boost", None)
+                    if _l4b_v is not None and getattr(_l4b_v, "enabled", False):
+                        _l4b_regen_constraint = (
+                            f"\n\nLLM4AD STRUCTURE REQUIREMENTS:\n"
+                            f"- Each algorithm file MUST have # EVOLVE_START and # EVOLVE_END markers\n"
+                            f"- ALL algorithm logic (loops, heuristics, computations) MUST be "
+                            f"between these markers\n"
+                            f"- DO NOT extract algorithm logic to external helper functions\n"
+                            f"- DO NOT use configuration-driven patterns like "
+                            f"return {{'method': 'greedy'}}\n"
+                            f"- Algorithm implementations should be substantive (not just wrappers)\n"
+                            f"- Simple algorithms are OK if they genuinely solve the problem\n"
+                            f"- Example structure:\n"
+                            f"  ```python\n"
+                            f"  # EVOLVE_START\n"
+                            f"  def optimize(instance: dict, seed: int) -> dict:\n"
+                            f"      # Complete algorithm logic here\n"
+                            f"      input_data = instance['input']  # use actual keys\n"
+                            f"      result = actual_computation(input_data)\n"
+                            f"      return {{'output': result}}\n"
+                            f"  # EVOLVE_END\n"
+                            f"  ```\n"
+                        )
+
                     regen_prompt = (
                         f"The experiment code you previously generated does NOT align "
                         f"with the research topic.\n\n"
@@ -1545,7 +3073,8 @@ def _execute_code_generation(
                         f"when the topic describes a tabular, bandit, or game-theoretic method.\n"
                         f"- Use ONLY lightweight CPU-friendly libraries (numpy, scipy, "
                         f"sklearn) unless the topic EXPLICITLY requires deep learning.\n"
-                        f"- The experiment must be self-contained and runnable without GPU.\n\n"
+                        f"- The experiment must be self-contained and runnable without GPU.\n"
+                        f"{_l4b_regen_constraint}\n"
                         f"{pkg_hint}\n{compute_budget}\n"
                         f"PLAN:\n{exp_plan}\n\n"
                         f"Return multiple files using ```filename:xxx.py format."
@@ -1649,10 +3178,26 @@ def _execute_code_generation(
                     json.dumps(abl_data, indent=2), encoding="utf-8"
                 )
                 # --- Attempt ablation repair ---
-                all_code_ctx = "\n\n".join(
-                    f"```filename:{f}\n{c}\n```" for f, c in files.items()
-                )
+                # Rewrites condition classes project-wide, so keep the whole
+                # project in view — summarized, not full-dumped.
+                all_code_ctx = _summarize_files_ctx(files)
                 dup_details = abl_data.get("details", "unknown")
+
+                # Add LLM4AD constraint if enabled
+                _l4b_abl_constraint = ""
+                _l4b_v = getattr(config.experiment, "llm4ad_boost", None)
+                if _l4b_v is not None and getattr(_l4b_v, "enabled", False):
+                    _l4b_abl_constraint = (
+                        f"\n\nLLM4AD STRUCTURE CONSTRAINT:\n"
+                        f"- Algorithm files have # EVOLVE_START / # EVOLVE_END markers\n"
+                        f"- PRESERVE these markers EXACTLY as they are\n"
+                        f"- When fixing duplicate ablations, keep ALL logic between the markers\n"
+                        f"- DO NOT extract algorithm logic to external functions\n"
+                        f"- DO NOT simplify algorithms to configuration-only patterns\n"
+                        f"- Example: if ablating attention, override the attention method "
+                        f"INSIDE the EVOLVE block, don't call an external helper\n"
+                    )
+
                 abl_repair_prompt = (
                     f"ABLATION REPAIR REQUIRED — duplicate conditions detected:\n"
                     f"{dup_details}\n\n"
@@ -1661,10 +3206,15 @@ def _execute_code_generation(
                     f"- 'no_<component>': REMOVE the component entirely "
                     f"(e.g., replace attention with mean pooling, remove a loss term)\n"
                     f"- 'reduced_capacity': HALVE hidden dimensions or layers\n"
-                    f"- Different conditions MUST produce different outputs on the "
-                    f"same input. Add a startup assertion that runs one forward pass "
-                    f"per condition on identical input and prints:\n"
-                    f"  ABLATION_CHECK: <cond1> vs <cond2> outputs_differ=True\n\n"
+                    f"- Conditions should differ in CODE, not merely in a label.\n"
+                    f"Do NOT add a startup assertion that raises when two conditions "
+                    f"produce the same numeric output: stochastic optimizers can "
+                    f"coincidentally agree on one input, and a raise at runtime then "
+                    f"kills the whole experiment at Stage 12. Instead, if you want a "
+                    f"self-check, print a diagnostic line (e.g. "
+                    f"\"ABLATION_CHECK: <cond1> vs <cond2> outputs_differ=True/False\") "
+                    f"without ever raising.\n"
+                    f"{_l4b_abl_constraint}\n"
                     f"Return ALL files using ```filename:xxx.py format.\n\n"
                     f"Current code:\n{all_code_ctx}\n"
                 )
@@ -1732,7 +3282,8 @@ Multi-file experiment project with {len(files)} file(s): {file_list}
 
     # BUG-R6-01: Fail stage if alignment check detected persistent mismatch
     # after all regen attempts, instead of silently proceeding.
-    if not alignment_ok:
+    # Can be disabled via config.experiment.skip_alignment_check = true
+    if not alignment_ok and not config.experiment.skip_alignment_check:
         logger.error(
             "Stage 10: Persistent topic-experiment misalignment after all "
             "regen attempts. Failing stage. Reason: %s",
@@ -1745,6 +3296,270 @@ Multi-file experiment project with {len(files)} file(s): {file_list}
             evidence_refs=tuple(f"stage-10/{a}" for a in artifacts),
             error=f"Topic-experiment misalignment: {alignment_note}",
         )
+
+    # --- Real smoke run: the last thing that can go wrong is a runtime crash
+    # the static gates cannot see (e.g. a self-check assert that only raises at
+    # run time). Stage 12 has no retry, so run main.py with the exact sandbox
+    # interpreter and feed any traceback back to the repair loop.
+    _smoke_failures = 0
+    _smoke_max = 10
+    _smoke_timeouts = 0
+    _smoke_timeout_max = 2  # Bound hang-repair spinning; a hang is repairable but unforgiving
+    _opencode_repair_budget = 3  # Use OpenCode for first N attempts
+    while True:
+        _smoke = _try_smoke_run(exp_dir, config)
+        if _smoke is None:
+            break
+        _rc, _tail, _timed_out = _smoke
+        if _timed_out:
+            # Not a crash: the process started and was killed over budget. It is
+            # repairable (a hang/overtime loop), but must not be silently
+            # mistaken for success — surface it and let repair have a shot.
+            _smoke_timeouts += 1
+            logger.warning(
+                "Stage 10: smoke run timed out (attempt %d/%d) — experiment "
+                "started but did not finish in 120s; trying to repair any hang.",
+                _smoke_timeouts, _smoke_timeout_max,
+            )
+            if _smoke_timeouts >= _smoke_timeout_max:
+                logger.warning(
+                    "Stage 10: too many smoke timeouts (%d) — giving up on "
+                    "repairing the hang, shipping as-is with a warning.",
+                    _smoke_timeouts,
+                )
+                break
+            # fall through to repair so a hang gets a fix attempt
+        else:
+            _smoke_failures += 1
+            logger.error(
+                "Stage 10: generated experiment failed to run (attempt %d/%d, exit=%s) — "
+                "feeding traceback back to fix.\n%s",
+                _smoke_failures, _smoke_max, _rc, _tail,
+            )
+            if _smoke_failures >= _smoke_max:
+                logger.error(
+                    "Stage 10: smoke run repair budget exhausted after %d attempts",
+                    _smoke_max,
+                )
+                break
+
+        # Decide repair strategy based on error type and attempt count
+        _use_opencode = (
+            _beast_mode_used  # OpenCode was used for initial generation
+            and _smoke_failures <= _opencode_repair_budget
+            and _should_repair_with_opencode(_tail)
+        )
+
+        if _use_opencode and _bridge is not None:
+            # Strategy: OpenCode repair (high-quality, slower)
+            logger.info(
+                "Stage 10: attempting OpenCode repair (attempt %d/%d)",
+                _smoke_failures,
+                _opencode_repair_budget,
+            )
+            try:
+                # Write current files + error context to a repair workspace
+                _repair_guidance = _build_opencode_repair_guidance(
+                    error_code=_rc,
+                    error_output=_tail,
+                    attempt=_smoke_failures,
+                    l4b_constraint=_llm4ad_constraint_text(config),
+                )
+
+                # Invoke OpenCode with repair-focused prompt
+                _oc_repair_result = _bridge.generate(
+                    stage_dir=stage_dir,
+                    topic=config.research.topic,
+                    exp_plan=exp_plan,
+                    metric=metric,
+                    pkg_hint=pkg_hint + "\n" + compute_budget,
+                    extra_guidance=_repair_guidance,
+                    time_budget_sec=config.experiment.time_budget_sec,
+                )
+
+                if _oc_repair_result.success and _oc_repair_result.files:
+                    logger.info(
+                        "Stage 10: OpenCode repair succeeded — %d files updated",
+                        len(_oc_repair_result.files),
+                    )
+                    # Merge (not replace): OpenCode returns only the files it
+                    # touched, so a wholesale reassignment would drop every
+                    # untouched sibling module. Merge so the package stays whole,
+                    # then write only the changed files — same strategy as the
+                    # LLM repair path below.
+                    _oc_prev = dict(files)  # pre-repair copy (marker provenance)
+                    files, _oc_applied = _merge_repaired_files(
+                        files, _oc_repair_result.files, label="opencode repair"
+                    )
+                    # A repair can strip EVOLVE markers while fixing a crash —
+                    # the static channel guards this, the smoke loop must too.
+                    _oc_reverted = _revert_marker_dropped_files(
+                        _oc_prev, _oc_applied, label="opencode repair"
+                    )
+                    for _fn in _oc_reverted:
+                        files[_fn] = _oc_prev[_fn]  # restore marker-bearing original
+                    # Write every file whose on-disk copy may now differ from
+                    # `files` (applied files + reverted originals).
+                    for _fn in dict.fromkeys(list(_oc_applied) + _oc_reverted):
+                        _wp = exp_dir / _fn
+                        _wp.parent.mkdir(parents=True, exist_ok=True)
+                        _wp.write_text(files[_fn], encoding="utf-8")
+                    # Cheap post-repair re-validation so a bad fix surfaces
+                    # before we burn the next smoke run.
+                    _revalid_ok = True
+                    for _fn, _code in _oc_applied.items():
+                        if _fn.endswith(".py") and not validate_code(_code).ok:
+                            _revalid_ok = False
+                            logger.warning(
+                                "Stage 10: OpenCode repair produced invalid code in %s",
+                                _fn,
+                            )
+                    if _is_llm4ad_enabled(config) and not _check_llm4ad_structure(files):
+                        _revalid_ok = False
+                        logger.warning(
+                            "Stage 10: OpenCode repair violated the LLM4AD structure contract"
+                        )
+                    if not _revalid_ok:
+                        logger.warning(
+                            "Stage 10: OpenCode repair did not validate — smoke run will retry"
+                        )
+                    continue  # Retry smoke run with repaired code
+                else:
+                    logger.warning(
+                        "Stage 10: OpenCode repair failed: %s — falling back to LLM repair",
+                        _oc_repair_result.error or "unknown",
+                    )
+                    # Fall through to LLM repair
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Stage 10: OpenCode repair raised exception: %s — falling back to LLM repair",
+                    exc,
+                )
+                # Fall through to LLM repair
+
+        # Strategy: LLM repair (faster, lower quality) or fallback from OpenCode failure
+        if llm is None:
+            logger.error(
+                "Stage 10: no LLM client available for repair, cannot continue"
+            )
+            break
+
+        logger.info(
+            "Stage 10: attempting LLM repair (attempt %d/%d)",
+            _smoke_failures,
+            _smoke_max,
+        )
+
+        # Ask the LLM to fix the files the runtime crash points at.
+        _ctx = "\n\n".join(
+            f"```filename:{f}\n{c}\n```" for f, c in files.items()
+        )
+
+        # Single source of truth for the LLM4AD structure constraint.
+        _l4b_constraint = _llm4ad_constraint_text(config)
+
+        _fix_prompt = (
+            f"The generated experiment crashed on the DEFAULT entry point "
+            f"(what Stage 12 runs). Fix the runtime error.\n\n"
+            f"RUNTIME ERROR (exit {_rc}):\n```\n{_tail}\n```\n\n"
+            f"Current code:\n{_ctx}\n\n"
+            "Return the FIXED files. Every import the code references MUST resolve "
+            "(the default run loads ALL algorithms; a missing module or a stray "
+            "entry in the algorithm list is a runtime failure). Keep the result "
+            "runnable in a few seconds. Do NOT remove, rename or reselect any "
+            "algorithm or ablation condition that EXPERIMENT_PLAN.yaml lists — your "
+            f"task is to make the existing design run, not to shrink it.{_l4b_constraint}"
+        )
+        try:
+            _fix_resp = _chat_with_prompt(
+                llm, _pm.system("code_generation"), _fix_prompt,
+                max_tokens=_code_max_tokens,
+            )
+            _fixed = _extract_multi_file_blocks(_fix_resp.content)
+            _sm_prev = dict(files)  # pre-repair copy (marker provenance)
+            files, _applied = _merge_repaired_files(files, _fixed, label="smoke fix")
+            # Same marker guard as the OpenCode path — a fix must not strip
+            # EVOLVE markers while repairing a crash.
+            _sm_reverted = _revert_marker_dropped_files(_sm_prev, _applied, label="smoke fix")
+            for _fn in _sm_reverted:
+                files[_fn] = _sm_prev[_fn]  # restore marker-bearing original
+            for _fn in dict.fromkeys(list(_applied) + _sm_reverted):
+                _wp = exp_dir / _fn
+                _wp.parent.mkdir(parents=True, exist_ok=True)
+                _wp.write_text(files[_fn], encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Stage 10: smoke-fix repair failed: %s", exc)
+            break
+
+    if _smoke is not None:
+        _rc, _tail, _timed_out = _smoke
+        if _timed_out:
+            # The last attempt started but never finished in 120s. This is not a
+            # crash — it is a slow/hung run. Refusing to ship would kill a stage
+            # whose experiment is merely over-budget, which is the same false
+            # signal the old code avoided by returning None. Ship it, but make
+            # the condition loud instead of silent.
+            logger.warning(
+                "Stage 10: experiment did not finish within the 120s smoke budget "
+                "after %d attempt(s) — shipping with a warning. It may hang or be "
+                "slow-to-completion in Stage 12 (budget=%ss).",
+                _smoke_failures, config.experiment.time_budget_sec,
+            )
+            (stage_dir / "validation_report.md").write_text(
+                "# Code Validation Report\n\n"
+                "**Status**: PASSED WITH WARNING — experiment did not finish in "
+                "the 120s smoke budget\n\n"
+                f"Attempts: {_smoke_failures}\n\n```\n{_tail}\n```",
+                encoding="utf-8",
+            )
+            if "validation_report.md" not in artifacts:
+                artifacts.append("validation_report.md")
+        else:
+            logger.error(
+                "Stage 10: generated experiment still does not run (exit=%s) after "
+                "%d fix attempt(s) — refusing to ship code that cannot run.\n%s",
+                _rc, _smoke_failures, _tail,
+            )
+            (stage_dir / "validation_report.md").write_text(
+                "# Code Validation Report\n\n"
+                "**Status**: BLOCKED — experiment failed to run\n\n"
+                f"exit code: {_rc}\n\n```\n{_tail}\n```",
+                encoding="utf-8",
+            )
+            if "validation_report.md" not in artifacts:
+                artifacts.append("validation_report.md")
+            return StageResult(
+                stage=Stage.CODE_GENERATION,
+                status=StageStatus.FAILED,
+                artifacts=tuple(artifacts),
+                evidence_refs=tuple(f"stage-10/{a}" for a in artifacts),
+                error=f"Generated experiment did not run (exit={_rc}): {_tail[:300]}",
+            )
+
+    # --- Surface degenerate instances (all-NaN) that the smoke run produced ---
+    # `_smoke is None` means the last run succeeded and results.json is fresh.
+    if _smoke is None:
+        _degenerate = _warn_degenerate_instances(exp_dir)
+        for _w in _degenerate:
+            logger.warning("Stage 10: %s", _w)
+        if _degenerate:
+            (stage_dir / "degenerate_instances.json").write_text(
+                json.dumps({"warnings": _degenerate}, indent=2), encoding="utf-8"
+            )
+            if "degenerate_instances.json" not in artifacts:
+                artifacts.append("degenerate_instances.json")
+
+    # --- LLM4AD evolution scope: classify the final algorithm tree ---
+    # The plan's proposed/baseline/ablation split is authoritative only at S9,
+    # but the stage-10 generator names algorithm directories freely, so the two
+    # drift apart. Classify here (both the plan and the final tree are in scope,
+    # after all fix/regeneration loops have settled) and freeze the result to
+    # algorithms_classification.json, which stage-13 reads to apply
+    # evolution.evolve_scope. Advisory: on failure the file simply is not
+    # written and evolution falls back to evolving everything.
+    _maybe_classify_algorithms(exp_dir, exp_plan, config, llm)
+    if (exp_dir / "algorithms_classification.json").is_file():
+        artifacts.append("experiment/algorithms_classification.json")
 
     return StageResult(
         stage=Stage.CODE_GENERATION,

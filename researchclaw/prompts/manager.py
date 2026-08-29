@@ -64,6 +64,10 @@ class RenderedPrompt:
     user: str
     json_mode: bool = False
     max_tokens: int | None = None
+    # None = leave the provider's reasoning default alone. False = ask it to
+    # skip reasoning, for stages that emit a fixed schema rather than an
+    # argument. See ``LlmConfig.reasoning_off_params``.
+    reasoning: bool | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +245,7 @@ class PromptManager:
             user=user_text,
             json_mode=entry.get("json_mode", False),
             max_tokens=entry.get("max_tokens"),
+            reasoning=entry.get("reasoning"),
         )
 
     def system(self, stage: str) -> str:
@@ -260,6 +265,9 @@ class PromptManager:
     def max_tokens(self, stage: str) -> int | None:
         return self._stages[stage].get("max_tokens")
 
+    def reasoning(self, stage: str) -> bool | None:
+        return self._stages[stage].get("reasoning")
+
     # -- blocks -----------------------------------------------------------
 
     def block(self, name: str, **kwargs: Any) -> str:
@@ -272,12 +280,22 @@ class PromptManager:
     # -- sub-prompts (code repair, etc.) ----------------------------------
 
     def sub_prompt(self, name: str, **kwargs: Any) -> RenderedPrompt:
-        """Return a rendered sub-prompt (e.g. code_repair)."""
+        """Return a rendered sub-prompt (e.g. code_repair).
+
+        Carries ``json_mode``/``max_tokens`` through exactly like
+        :meth:`for_stage`. They used to be dropped here, which silently
+        pinned every sub-prompt to the client's 4096 default no matter what
+        the bank declared — ``code_exec_fix`` asked for 16384 and got 4096,
+        and ``code_reviewer``'s ``json_mode`` never took effect.
+        """
         entry = self._sub_prompts[name]
         kw = {k: str(v) for k, v in kwargs.items()}
         return RenderedPrompt(
             system=_render(entry["system"], kw),
             user=_render(entry["user"], kw),
+            json_mode=entry.get("json_mode", False),
+            max_tokens=entry.get("max_tokens"),
+            reasoning=entry.get("reasoning"),
         )
 
     # -- debate roles (domain-specific) -----------------------------------

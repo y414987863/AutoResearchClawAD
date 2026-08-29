@@ -59,6 +59,7 @@ def _execute_synthesis(
             [{"role": "user", "content": sp.user}],
             system=sp.system,
             max_tokens=sp.max_tokens or 8192,
+            reasoning=sp.reasoning,
         )
         synthesis_md = resp.content
     else:

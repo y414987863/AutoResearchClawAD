@@ -494,6 +494,7 @@ def test_chat_prepends_system_message(monkeypatch: pytest.MonkeyPatch):
         max_tokens: int,
         temperature: float,
         json_mode: bool,
+        reasoning: bool | None = None,
     ) -> LLMResponse:
         captured["messages"] = messages
         return LLMResponse(content="ok", model=model)
@@ -514,8 +515,9 @@ def test_chat_uses_fallback_after_first_model_error(monkeypatch: pytest.MonkeyPa
         max_tokens: int,
         temperature: float,
         json_mode: bool,
+        reasoning: bool | None = None,
     ) -> LLMResponse:
-        _ = (self, messages, max_tokens, temperature, json_mode)
+        _ = (self, messages, max_tokens, temperature, json_mode, reasoning)
         calls.append(model)
         if model == "gpt-5.2":
             raise RuntimeError("first failed")
@@ -734,3 +736,132 @@ class TestStripThinkingIsLosslessOnCleanText:
 
         out = strip_thinking_tags("<think>a</think>\n\n\n\nBody text.\n")
         assert out == "Body text."
+
+
+# ---------------------------------------------------------------------------
+# Reasoning control: extra_body_params / reasoning_off_params
+# ---------------------------------------------------------------------------
+
+
+class TestReasoningControl:
+    """A reasoning model counts hidden reasoning against ``max_tokens``.
+
+    On a long prompt with a tight budget it can hit the ceiling before emitting
+    any visible token, and the provider answers HTTP 200 with an empty body and
+    ``finish_reason="length"`` — not an error, so nothing upstream retries.
+    These pin the two levers that address it.
+    """
+
+    @staticmethod
+    def _body(monkeypatch: pytest.MonkeyPatch, client: LLMClient, **kw) -> dict:
+        captured: dict[str, Any] = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            return _DummyHTTPResponse(
+                {
+                    "model": "glm-5.2",
+                    "choices": [
+                        {"message": {"content": "ok"}, "finish_reason": "stop"}
+                    ],
+                    "usage": {},
+                }
+            )
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        client.chat([{"role": "user", "content": "hi"}], **kw)
+        return captured["body"]
+
+    def _client(self, **cfg) -> LLMClient:
+        return LLMClient(
+            LLMConfig(
+                base_url="https://api.example.com/v1",
+                api_key="k",
+                primary_model="glm-5.2",
+                fallback_models=[],
+                **cfg,
+            )
+        )
+
+    def test_extra_body_params_reach_the_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """These were config-only until now: no code read them, so a user's
+        ``reasoning_effort: none`` was silently dropped on every call."""
+        client = self._client(extra_body_params={"top_p": 0.9})
+        assert self._body(monkeypatch, client)["top_p"] == 0.9
+
+    def test_reasoning_off_params_only_apply_when_asked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        off = {"reasoning_effort": "none", "thinking": {"type": "disabled"}}
+        client = self._client(reasoning_off_params=off)
+
+        default = self._body(monkeypatch, client)
+        assert "reasoning_effort" not in default
+        assert "thinking" not in default
+
+        disabled = self._body(monkeypatch, client, reasoning=False)
+        assert disabled["reasoning_effort"] == "none"
+        assert disabled["thinking"] == {"type": "disabled"}
+
+    def test_reasoning_true_does_not_send_the_off_switches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = self._client(reasoning_off_params={"reasoning_effort": "none"})
+        assert "reasoning_effort" not in self._body(
+            monkeypatch, client, reasoning=True
+        )
+
+
+class TestModelMatching:
+    """Routers expose one model under several aliases.
+
+    ``zai-org/GLM-5.2`` and ``glm-5.2`` hit the same endpoint, but a bare
+    ``startswith`` matched only the second — so the same model got
+    ``max_tokens`` or ``max_completion_tokens`` depending on which spelling the
+    config happened to use.
+
+    These assert the matcher, not the membership of any particular set: which
+    models belong in ``_NEW_PARAM_MODELS`` is a per-provider judgement call that
+    changes, while "an alias must resolve the same way its bare name does" does
+    not.
+    """
+
+    PREFIXES = frozenset({"glm-5.2", "gpt-5"})
+
+    @pytest.mark.parametrize(
+        "alias",
+        ["glm-5.2", "GLM-5.2", "zai-org/GLM-5.2", "zai-org/glm-5.2-air"],
+    )
+    def test_vendor_prefix_and_case_are_ignored(self, alias: str) -> None:
+        from researchclaw.llm.client import _model_matches
+
+        assert _model_matches(alias, self.PREFIXES)
+
+    @pytest.mark.parametrize("alias", ["deepseek-v4-pro", "gpt-4o", "", "claude-3"])
+    def test_unrelated_models_still_do_not_match(self, alias: str) -> None:
+        from researchclaw.llm.client import _model_matches
+
+        assert not _model_matches(alias, self.PREFIXES)
+
+    @pytest.mark.parametrize(
+        "alias", ["gpt-5.2", "openai/gpt-5.2", "o3", "some-vendor/o4-mini"]
+    )
+    def test_the_real_new_param_set_matches_its_own_aliases(self, alias: str) -> None:
+        from researchclaw.llm.client import _model_matches
+
+        assert _model_matches(alias, _NEW_PARAM_MODELS)
+
+    def test_glm_is_not_forced_onto_max_completion_tokens(self) -> None:
+        """GLM's gateway demonstrably honours plain ``max_tokens`` — a live
+        trace capped a call at exactly the 8192 requested. Moving it to
+        ``max_completion_tokens`` would gamble that the gateway knows that key;
+        if it silently ignored it the cap would vanish entirely. GLM's real
+        problem was reasoning eating the budget, which ``reasoning_off_params``
+        addresses without touching the token parameter.
+        """
+        from researchclaw.llm.client import _model_matches
+
+        assert not _model_matches("glm-5.2", _NEW_PARAM_MODELS)
+        assert not _model_matches("zai-org/GLM-5.2", _NEW_PARAM_MODELS)

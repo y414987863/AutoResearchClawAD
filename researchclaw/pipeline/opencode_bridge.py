@@ -29,6 +29,33 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+def _rmtree_force(path: Path) -> None:
+    """Delete ``path`` including read-only files (git worktrees).
+
+    ``shutil.rmtree(..., ignore_errors=True)`` is not enough here: git marks
+    every object under ``.git/objects`` read-only, so on Windows the unlink
+    raises PermissionError and ``ignore_errors`` swallows it — the tree is left
+    half-deleted with the old git history intact. A resurrected history is worse
+    than no cleanup at all: the next run's ``auto_initialize`` sees the previous
+    snapshot as HEAD. Clearing the read-only bit and retrying is the standard
+    way to remove a git tree on Windows.
+    """
+    import stat as _stat
+
+    def _clear_readonly(func, target, _exc):  # noqa: ANN001 - shutil callback shape
+        try:
+            os.chmod(target, _stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass  # genuinely undeletable (locked by another process)
+
+    try:
+        shutil.rmtree(path, onexc=_clear_readonly)
+    except TypeError:  # Python < 3.12 renamed the hook to onexc
+        shutil.rmtree(path, onerror=_clear_readonly)
+
+
 # ---------------------------------------------------------------------------
 # Complexity scoring
 # ---------------------------------------------------------------------------
@@ -261,9 +288,14 @@ _MEGA_PROMPT_TEMPLATE = """\
 Implement the experiment described in this repository. Work autonomously.
 
 Read these workspace files FIRST, in order:
-1. TASK.md — your task, requirements, and constraints (READ THIS FIRST)
-2. EXPERIMENT_PLAN.yaml — the experiment design to implement
-3. GUIDANCE.md — metric, environment, and domain constraints
+1. RESUME.md (if it exists) — shows which files from the previous attempt already exist
+2. TASK.md — your task, requirements, and constraints
+3. EXPERIMENT_PLAN.yaml — the experiment design to implement
+4. GUIDANCE.md — metric, environment, and domain constraints
+
+If RESUME.md exists, you are CONTINUING a previous attempt. Do NOT regenerate
+files that already exist — only create the missing ones. Check existing files
+to understand what was already done, then complete what's missing.
 
 Do NOT ask questions. No human will answer: this session is driven by an
 automated pipeline and any reply that asks a question instead of writing code
@@ -271,8 +303,23 @@ is discarded as a failure. If a detail is unclear, pick a sensible default,
 note it in a comment, and continue.
 
 Your first action must be a tool call that reads TASK.md — never a text reply.
-You are done when main.py and its supporting modules exist and run.
-Writing no files is a failure.
+
+RULE — ONE file per step. Write exactly one file per step, then start the next
+step for the next file. Never emit a whole multi-file project in a single step.
+A single step's output is capped at a hard limit: if a step tries to write more
+than one large file (or one very large file), the tail of that output is
+truncated and you LOSE everything it was writing — the truncated step commits
+no files. This is a requirement, not a suggestion. Keep each step focused,
+small and complete: one file, written and closed, then continue.
+
+If any single file is itself too large to fit in one step (roughly 400+ lines),
+do not write a huge file in one step. Split it: write the smaller modules as
+separate files, or grow a large file across steps by writing the first part
+then appending the rest with a shell redirect (`>>`) in the next step.
+
+You are NOT done when the files exist — you are done when you have RUN them and
+they work. TASK.md tells you which interpreter to use and what to check.
+Writing no files is a failure; so is reporting success for code you never ran.
 """
 
 # Full instructions, written to the workspace as TASK.md. This is read by the
@@ -304,6 +351,18 @@ method or dataset.
 9. If the experiment needs dataset downloads AND `GUIDANCE.md` permits network
    access, write a `setup.py` that handles them. If downloads are forbidden, do
    NOT create `setup.py`.
+10. **CRITICAL (LLM4AD structure)**: If `GUIDANCE.md` contains LLM4AD instructions,
+    you MUST create `evaluator.py` with these THREE exports (validation will FAIL
+    without them):
+    ```python
+    PRIMARY_METRIC = "your_metric_name"  # string constant
+    METRIC_DEF = {"primary_metric": PRIMARY_METRIC, "direction": "maximize"}  # static dict
+    def evaluate_instance(instance: dict, solve) -> dict[str, float]:  # function
+        ...
+    ```
+    Set direction to "maximize" if larger metric values are better, "minimize" if
+    smaller values are better. Stage validation will reject the code if METRIC_DEF
+    is missing — this is NOT optional.
 
 ## Constraints
 
@@ -315,6 +374,53 @@ method or dataset.
 - All results must go to stdout via print statements.
 - Keep the experiment feasible within {time_budget_sec} seconds total.
 
+## Verify before you finish (MANDATORY)
+
+Writing the files is not the end of the task. Code that has never been executed
+is not done — a single bad line (an accumulator reset to `None`, a key that no
+data file carries) is invisible on reading and fatal on running, and nothing
+downstream will fix it for you.
+
+1. Always use this exact interpreter, never a bare `python`. It is the
+   environment the experiment is executed in later, and the only one guaranteed
+   to have the packages `GUIDANCE.md` lists. Keep it quoted — the path may
+   contain spaces:
+
+       "{python}"
+
+2. Run the DEFAULT entry point — this is what the pipeline executes later, so it
+   is the ONLY valid completion check:
+
+       "{python}" main.py
+
+   It must exit 0 and print a finite `{metric}`. A traceback, `nan`/`inf`, or a
+   missing metric means the task is NOT done — no exception.
+
+   If it fails, FIX the code and re-run the default. Keep fixing and re-running
+   until the default passes. This is a loop, not a single try.
+
+   If `GUIDANCE.md` defines a single-unit mode (e.g. an `--algorithm` selector),
+   you may run `"{python}" main.py --algorithm <name>` to LOCATE which algorithm
+   is at fault when the default fails — but a passing single-unit run is NOT a
+   pass. Only the default run (no flags) counts as done.
+
+3. Read the output. It must exit 0 and print a finite `{metric}`. A traceback,
+   a `nan`/`inf`, or a missing metric means the task is NOT done.
+
+4. Fix whatever you find and run it again. Repeat until it passes.
+
+   One exception: if it fails only because a package `GUIDANCE.md` lists as
+   available cannot be imported here, that is an environment gap, not a defect.
+   The experiment may be executed elsewhere (a container) where the package does
+   exist. Note it in a comment and move on — do NOT restructure the code, drop
+   the dependency, or reimplement it by hand to make the import go away.
+
+5. Keep the default configuration small enough that this verification finishes
+   in seconds. Shrink the workload, not the correctness.
+
+Never report success for code you did not run to completion. If it still fails
+after your best effort, say so explicitly and leave the files in place.
+
 ## Working style
 
 - Do not ask clarifying questions; no human is available to answer. Choose a
@@ -324,10 +430,24 @@ method or dataset.
 
 # Prepended to the CLI prompt on a retry. Kept deliberately short for the same
 # command-line length reason; the detail goes in RETRY.md.
+#
+# BUG-OB-X: the retry used to open a FRESH OpenCode session with no task
+# description, so attempt 2+ replied "I don't have the original task description"
+# and wrote nothing. The full task is always on disk in TASK.md (rewritten per
+# attempt), so the retry prompt must point straight at it rather than assume the
+# session carries the prior task context.
 _RETRY_PROMPT_PREFIX = """\
 RETRY: the previous attempt FAILED and produced no usable code.
-Read RETRY.md for what went wrong, then implement the task properly this time.
+Read RETRY.md for what went wrong. This is a brand-new session — it has NOT
+seen the previous attempt or the task. The full task is in TASK.md; read it
+FIRST (tool call, not text) and implement it. Do not reply with a question:
+a text-only reply is itself the failure mode.
+"""
 
+_RESUME_PROMPT_PREFIX = """\
+RESUME: the previous attempt generated some files but did not finish.
+Read RESUME.md FIRST to see what already exists, then read TASK.md.
+DO NOT regenerate existing files — complete the missing ones.
 """
 
 _RETRY_MD_TEMPLATE = """\
@@ -338,10 +458,15 @@ Reason: {reason}
 {no_files_note}Do not repeat the previous mistake. Write the actual files this
 time: create `main.py` and every supporting module with real, runnable code.
 
+Write ONE file per step. Do not emit a whole project in a single step — a step
+is capped and the tail of a big output is truncated. Keep each step small and
+complete, then start the next step for the next file.
+
 The previous attempt's output is in `PREVIOUS_ATTEMPT/` and its log in
 `PREVIOUS_ATTEMPT_ERROR.txt`, for reference only.
 
-Re-read `TASK.md` and follow it.
+This is a brand-new session. Re-read `TASK.md` FIRST and follow it — that is
+the task; do not reply with a question.
 """
 
 _NO_FILES_NOTE = (
@@ -349,6 +474,133 @@ _NO_FILES_NOTE = (
     "question or with commentary instead of calling tools to write files. That "
     "is exactly the failure mode to avoid: ask nothing, write code.\n\n"
 )
+
+# Cap the context handed back to a retry. ``_invoke_opencode`` returns EVERY
+# line opencode prints as a JSON event, and each event embeds whatever file the
+# agent read (TASK.md, GUIDANCE.md, RETRY.md itself, ...) in full. Dumping all
+# of it as the retry ``reason`` blew RETRY.md and PREVIOUS_ATTEMPT_ERROR.txt up
+# to ~72KB each; and because the agent then READS RETRY.md, that content re-entered
+# the event stream and the next retry's dump grew again — a compounding blow-up
+# across retries that also bloated the model context. Only a short diagnostic
+# tail is useful to the next attempt; the verbose event stream stays on disk in
+# opencode_log.txt for humans.
+_RETRY_REASON_MAX_CHARS = 2000
+
+
+def _summarize_log(log: str, *, max_chars: int = _RETRY_REASON_MAX_CHARS) -> str:
+    """Compress an OpenCode event stream into a short retry reason.
+
+    The raw log is one JSON object per line. Most of it is tool-use noise with
+    huge ``output``/``content`` payloads (the agent echoing every file it read),
+    which carries no signal about WHY the attempt failed. This keeps only the
+    diagnostic lines — the trailing failure marker (``TIMEOUT`` / ``error`` /
+    ``exit`` / ``reason``) and the final events — and strips the embedded
+    file-content fields, so a retry sees a compact reason rather than a ~70KB
+    transcript.
+    """
+    if not log:
+        return ""
+    lines = [l.rstrip("\n") for l in log.splitlines()]
+
+    # Best-effort over UNTRUSTED data: an arbitrary opencode event stream may be
+    # truncated mid-JSON or carry circular/unpicklable objects, so json.loads /
+    # json.dumps / _shrink can all throw. A raise here would mask the very error
+    # we are summarising (callers assign ``last_error = _summarize_log(log)`` at
+    # the top of the exception path), so fall back to a plain tail-of-log.
+    try:
+        return _summarize_log_impl(log, lines, max_chars=max_chars)
+    except Exception:  # noqa: BLE001 — log summarisation must never raise
+        fallback = "\n".join(lines[-6:])
+        return fallback[-max_chars:]
+
+
+def _summarize_log_impl(log: str, lines: list[str], *, max_chars: int) -> str:
+    """Actual summarisation; wrapped by :func:`_summarize_log` for safety."""
+    if not lines:
+        return ""
+
+    def _is_signal(line: str) -> bool:
+        # Only a line that is a TOP-LEVEL event object counts. Matching signal
+        # words anywhere is too loose: the agent reads GUIDANCE.md, whose prose
+        # ("no network access", "do NOT use", ...) contains "error"/"failed",
+        # echoed into a read event's content, which then passes the word match
+        # while carrying zero diagnostic signal.
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            # Not JSON — keep only a trailing marker like the TIMEOUT line.
+            return line.startswith("TIMEOUT") or (
+                "timeout" in line.lower() and "after" in line.lower()
+            )
+        if not isinstance(obj, dict):
+            return False
+        # An event declaring a type like "error"/"failure" is a real signal.
+        etype = str(obj.get("type", "")).lower()
+        if any(tok in etype for tok in ("error", "fail", "timeout")):
+            return True
+        # A step that ended for a "length" / "error" / "max_tokens" / "stop"
+        # reason is the failure mechanism (output truncated mid-write).
+        reason = str(obj.get("part", {}).get("reason", "")).lower() if isinstance(
+            obj.get("part"), dict
+        ) else ""
+        return any(tok in reason for tok in ("error", "length", "max_tokens", "stop"))
+
+    # Prefer signal-carrying lines; fall back to the tail when none are present
+    # (e.g. a plain tool-call loop that never raised, which is itself the bug).
+    chosen = [l for l in lines if _is_signal(l)]
+    if not chosen:
+        chosen = lines[-6:]
+
+    # Compress any embedded JSON deep in a line down to its bare text.
+    compact: list[str] = []
+    for line in chosen:
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            compact.append(line)
+            continue
+
+        def _shrink(v: Any) -> Any:
+            if isinstance(v, dict):
+                out = {}
+                for k, val in v.items():
+                    # File-body echoes are the bulk of the transcript; drop them.
+                    if k in ("output", "content", "preview", "text"):
+                        out[k] = _truncate_json_text(val)
+                    else:
+                        out[k] = _shrink(val)
+                return out
+            if isinstance(v, list):
+                return [_shrink(item) for item in v]
+            return v
+
+        obj = _shrink(obj)
+        # Keep the original single-line-per-event style (the ``sep`` output) so a
+        # compacted reason stays one object per line, not pretty-printed.
+        try:
+            compact.append(json.dumps(obj, ensure_ascii=False))
+        except (TypeError, ValueError, RecursionError):
+            # A single un-serialisable line (circular ref, odd provider shape)
+            # must not kill the whole summary — keep the raw line instead.
+            compact.append(line)
+
+    out = "\n".join(compact)
+    return out[-max_chars:]
+
+
+def _truncate_json_text(value: Any, limit: int = 160) -> Any:
+    """Shrink an ``output``/``content``/``preview``/``text`` field.
+
+    These hold the file text the agent read (or the code it wrote) verbatim,
+    which is exactly the bulk that bloats the retry reason. Keep a short
+    head+tail so the *kind* of content is still identifiable.
+    """
+    if not isinstance(value, str):
+        return value
+    if len(value) <= limit:
+        return value
+    return value[:limit] + f"...<+{len(value) - limit} chars truncated>"
+
 
 
 class OpenCodeBridge:
@@ -365,6 +617,8 @@ class OpenCodeBridge:
         timeout_sec: int = 600,
         max_retries: int = 1,
         workspace_cleanup: bool = True,
+        python_path: str = "",
+        debug: bool = False,
     ) -> None:
         self._model = model
         self._llm_base_url = llm_base_url
@@ -374,6 +628,12 @@ class OpenCodeBridge:
         self._timeout_sec = timeout_sec
         self._max_retries = max_retries
         self._workspace_cleanup = workspace_cleanup
+        # Interpreter the generated code will actually be executed with later
+        # (the sandbox's). The agent is told to verify with THIS one, because a
+        # bare `python` on PATH is often a different environment without the
+        # scientific packages, so "it ran for me" would not transfer.
+        self._python_path = python_path
+        self._debug = debug
 
     # -- availability check ---------------------------------------------------
 
@@ -401,84 +661,19 @@ class OpenCodeBridge:
 
     # -- workspace preparation ------------------------------------------------
 
-    def _prepare_workspace(
-        self,
-        stage_dir: Path,
-        topic: str,
-        exp_plan: str,
-        metric: str,
-        pkg_hint: str,
-        extra_guidance: str,
-        time_budget_sec: int,
-        prev_error: str = "",
-        prev_files: dict[str, str] | None = None,
-        retry_note: str = "",
-    ) -> Path:
-        """Create a temporary workspace directory with context files."""
-        # Each attempt needs its OWN workspace. The previous name mixed
-        # time.time() with time.monotonic_ns() % 100000, but the monotonic clock
-        # has ~15.6ms granularity on Windows, so that suffix is frequently 0 and
-        # two attempts in the same second collided — mkdir(exist_ok=True) then
-        # silently reused the directory and the retry inherited the old output.
-        # An explicit counter makes each attempt unique.
+    def _prepare_workspace_once(self, stage_dir: Path) -> Path:
+        """Create workspace directory and initialize git repository.
+
+        This is called ONCE at the start of generate(), before any attempts.
+        All retry attempts work in this same directory.
+        """
+        # Use a simpler name without attempt counter, since all attempts share
+        # this workspace.
         for _n in itertools.count():
             ws = stage_dir / f"opencode_beast_{int(time.time())}_{_n}"
             if not ws.exists():
                 break
         ws.mkdir(parents=True, exist_ok=True)
-
-        # Write the full task instructions. These live here rather than in the
-        # CLI prompt because argv has a hard length limit (32767 on Windows).
-        (ws / "TASK.md").write_text(
-            _TASK_MD_TEMPLATE
-            .replace("{metric}", metric)
-            .replace("{time_budget_sec}", str(time_budget_sec)),
-            encoding="utf-8",
-        )
-
-        # On a retry, spell out what went wrong last time.
-        if retry_note:
-            (ws / "RETRY.md").write_text(retry_note, encoding="utf-8")
-
-        # Write experiment plan
-        (ws / "EXPERIMENT_PLAN.yaml").write_text(
-            exp_plan or "# No experiment plan provided\n",
-            encoding="utf-8",
-        )
-
-        # Seed the retry with the previous attempt's partial output, so a new
-        # session can resume/fix instead of starting from a blank repo.
-        if prev_files:
-            prev_dir = ws / "PREVIOUS_ATTEMPT"
-            prev_dir.mkdir(parents=True, exist_ok=True)
-            for fname, content in prev_files.items():
-                p = prev_dir / fname
-                p.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    p.write_text(content, encoding="utf-8")
-                except OSError as exc:
-                    logger.warning("Beast mode: failed to seed %s: %s", fname, exc)
-
-        # Write the previous attempt's error/log so the retry knows what failed.
-        if prev_error:
-            (ws / "PREVIOUS_ATTEMPT_ERROR.txt").write_text(
-                prev_error, encoding="utf-8",
-            )
-
-        # Write guidance document
-        guidance_parts = [
-            f"# Experiment Guidance\n",
-            f"## Topic\n{topic}\n",
-            f"## Primary Metric\n{metric}\n",
-            f"## Time Budget\n{time_budget_sec} seconds\n",
-        ]
-        if pkg_hint:
-            guidance_parts.append(f"## Environment\n{pkg_hint}\n")
-        if extra_guidance:
-            guidance_parts.append(f"## Additional Guidance\n{extra_guidance}\n")
-        (ws / "GUIDANCE.md").write_text(
-            "\n".join(guidance_parts), encoding="utf-8",
-        )
 
         # Write opencode.json config
         opencode_cfg = self._build_opencode_config()
@@ -505,7 +700,7 @@ class OpenCodeBridge:
             r = subprocess.run(
                 ["git", "-c", "user.email=beast@researchclaw",
                  "-c", "user.name=BeastMode",
-                 "commit", "-m", "init workspace"],
+                 "commit", "-m", "init workspace", "--allow-empty"],
                 cwd=str(ws), capture_output=True, timeout=10,
             )
             if r.returncode != 0:
@@ -513,6 +708,141 @@ class OpenCodeBridge:
         except subprocess.TimeoutExpired as exc:
             raise OSError(f"git workspace init timed out: {exc}") from exc
 
+        return ws
+
+    def _update_workspace_for_retry(
+        self,
+        workspace: Path,
+        topic: str,
+        exp_plan: str,
+        metric: str,
+        pkg_hint: str,
+        extra_guidance: str,
+        time_budget_sec: int,
+        prev_error: str = "",
+        retry_note: str = "",
+    ) -> None:
+        """Update workspace with task files and retry context.
+
+        This is called ONCE per attempt (including attempt 0). It writes/updates
+        TASK.md, GUIDANCE.md, EXPERIMENT_PLAN.yaml, and retry-specific files
+        (RETRY.md, PREVIOUS_ATTEMPT_ERROR.txt).
+
+        Since all attempts share the same workspace, the agent can see files
+        from previous attempts directly — no need to copy to PREVIOUS_ATTEMPT/.
+        """
+        # Write the full task instructions. These live here rather than in the
+        # CLI prompt because argv has a hard length limit (32767 on Windows).
+        #
+        # The interpreter is spelled out so the agent verifies with the SAME
+        # environment the experiment later runs in; falling back to "python"
+        # only when none is configured, which at least keeps the instruction
+        # runnable.
+        _py = self._python_path or "python"
+        try:
+            if self._python_path:
+                # POSIX separators on purpose: the agent runs this through a
+                # shell, and a Windows path like ``D:\4.work\...`` would have
+                # ``\4`` eaten as an escape. Windows accepts forward slashes for
+                # every API we need, so this form is safe on both platforms.
+                #
+                # abspath, NOT resolve(): a venv interpreter is a SYMLINK to the
+                # base interpreter (``/app/backend/.venv/bin/python3`` →
+                # ``/usr/local/bin/python3.12``), and only the venv path puts
+                # ``sys.prefix`` inside the venv — i.e. only it can import the
+                # packages GUIDANCE.md promises. resolve() followed that link and
+                # handed the agent the bare base interpreter, which has no numpy,
+                # so every attempt burned its whole budget re-diagnosing "numpy
+                # is missing" instead of writing code, and the retry loop never
+                # produced a main.py. abspath normalises ``.``/``..`` lexically
+                # without touching symlinks, which is exactly what we want.
+                _py = Path(os.path.abspath(self._python_path)).as_posix()
+        except OSError:
+            pass
+        (workspace / "TASK.md").write_text(
+            _TASK_MD_TEMPLATE
+            .replace("{python}", _py)
+            .replace("{metric}", metric)
+            .replace("{time_budget_sec}", str(time_budget_sec)),
+            encoding="utf-8",
+        )
+
+        # On a retry, spell out what went wrong last time.
+        if retry_note:
+            (workspace / "RETRY.md").write_text(retry_note, encoding="utf-8")
+
+        # Write experiment plan
+        (workspace / "EXPERIMENT_PLAN.yaml").write_text(
+            exp_plan or "# No experiment plan provided\n",
+            encoding="utf-8",
+        )
+
+        # Write the previous attempt's error/log so the retry knows what failed.
+        if prev_error:
+            (workspace / "PREVIOUS_ATTEMPT_ERROR.txt").write_text(
+                prev_error, encoding="utf-8",
+            )
+
+        # Write guidance document
+        guidance_parts = [
+            f"# Experiment Guidance\n",
+            f"## Topic\n{topic}\n",
+            f"## Primary Metric\n{metric}\n",
+            f"## Time Budget\n{time_budget_sec} seconds\n",
+        ]
+        if pkg_hint:
+            guidance_parts.append(f"## Environment\n{pkg_hint}\n")
+        if extra_guidance:
+            guidance_parts.append(f"## Additional Guidance\n{extra_guidance}\n")
+        (workspace / "GUIDANCE.md").write_text(
+            "\n".join(guidance_parts), encoding="utf-8",
+        )
+
+        # Commit the updated task files so git tracks changes across attempts
+        try:
+            subprocess.run(
+                ["git", "add", "-A"],
+                cwd=str(workspace), capture_output=True, timeout=10, check=False,
+            )
+            subprocess.run(
+                ["git", "-c", "user.email=beast@researchclaw",
+                 "-c", "user.name=BeastMode",
+                 "commit", "-m", "update task files", "--allow-empty"],
+                cwd=str(workspace), capture_output=True, timeout=10, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            pass  # Non-fatal if commit fails
+
+    def _prepare_workspace(
+        self,
+        stage_dir: Path,
+        topic: str,
+        exp_plan: str,
+        metric: str,
+        pkg_hint: str,
+        extra_guidance: str,
+        time_budget_sec: int,
+        prev_error: str = "",
+        prev_files: dict[str, str] | None = None,
+        retry_note: str = "",
+    ) -> Path:
+        """Create and prepare workspace (legacy compatibility wrapper).
+
+        DEPRECATED: This method is kept for backward compatibility with tests.
+        New code should use _prepare_workspace_once() + _update_workspace_for_retry().
+        """
+        ws = self._prepare_workspace_once(stage_dir)
+        self._update_workspace_for_retry(
+            workspace=ws,
+            topic=topic,
+            exp_plan=exp_plan,
+            metric=metric,
+            pkg_hint=pkg_hint,
+            extra_guidance=extra_guidance,
+            time_budget_sec=time_budget_sec,
+            prev_error=prev_error,
+            retry_note=retry_note,
+        )
         return ws
 
     def _is_azure(self) -> bool:
@@ -531,6 +861,32 @@ class OpenCodeBridge:
         """
         cfg: dict[str, Any] = {
             "$schema": "https://opencode.ai/config.json",
+            # ``opencode run`` is driven by this pipeline, so there is no human
+            # to answer a permission prompt: anything left at the default "ask"
+            # is auto-REJECTED. That silently broke beast mode — the agent
+            # probed the interpreter's site-packages to find out where numpy
+            # lived, hit ``permission requested: external_directory (...);
+            # auto-rejecting``, and could neither verify the environment nor
+            # finish, so the attempt ended having written no files at all.
+            #
+            # The workspace is a throwaway directory inside an isolated
+            # container, so granting the filesystem/exec tools outright costs
+            # nothing and is the only way the agent can write and RUN the
+            # experiment as TASK.md requires. ``external_directory`` is what
+            # lets it read the venv it must verify against — that venv lives
+            # outside the workspace by design. Network tools (webfetch /
+            # websearch) are deliberately NOT granted: GUIDANCE.md may forbid
+            # network access, and they are not needed to write code.
+            "permission": {
+                "read": "allow",
+                "edit": "allow",
+                "write": "allow",
+                "glob": "allow",
+                "grep": "allow",
+                "list": "allow",
+                "bash": "allow",
+                "external_directory": "allow",
+            },
         }
 
         if self._llm_base_url:
@@ -618,6 +974,7 @@ class OpenCodeBridge:
         self,
         workspace: Path,
         prompt: str,
+        attempt: int = 1,
     ) -> tuple[bool, str, float]:
         """Run ``opencode run`` in the workspace. Returns (success, log, elapsed)."""
         env = os.environ.copy()
@@ -635,7 +992,10 @@ class OpenCodeBridge:
         # Use -m flag to specify model (more reliable than opencode.json)
         resolved_model = self._resolve_opencode_model()
         opencode_cmd = shutil.which("opencode") or "opencode"
-        cmd = self._build_opencode_command(opencode_cmd, resolved_model, prompt)
+        title = f"llm4ad-stage10-attempt-{attempt}"
+        cmd = self._build_opencode_command(
+            opencode_cmd, resolved_model, prompt, title=title, debug=self._debug
+        )
 
         t0 = time.monotonic()
         # Stream live: unlike subprocess.run(capture_output=True), which blocks
@@ -701,7 +1061,11 @@ class OpenCodeBridge:
 
     @staticmethod
     def _build_opencode_command(
-        opencode_cmd: str, resolved_model: str, prompt: str
+        opencode_cmd: str,
+        resolved_model: str,
+        prompt: str,
+        title: str | None = None,
+        debug: bool = False,
     ) -> list[str]:
         """Build the argv for ``opencode run``, wrapping with a pseudo-TTY on Linux.
 
@@ -722,8 +1086,31 @@ class OpenCodeBridge:
         ``script`` implementations are not compatible with it. On non-Linux
         platforms, and when ``script`` is unavailable, we fall back to invoking
         ``opencode`` directly — i.e. the prior behaviour, no regression.
+
+        Args:
+            opencode_cmd: Path to the opencode executable.
+            resolved_model: Model identifier in provider/model format.
+            prompt: The prompt to send to opencode.
+            title: Optional session title for tracking (e.g., "llm4ad-stage10-attempt-3").
+            debug: If True, enable verbose logging (--print-logs --log-level DEBUG).
         """
-        direct = [opencode_cmd, "run", "-m", resolved_model, "--format", "json", prompt]
+        direct = [
+            opencode_cmd,
+            "run",
+            "-m",
+            resolved_model,
+            "--format",
+            "json",
+            "--auto",  # Auto-approve permissions (safe: opencode.json already restricts)
+        ]
+
+        if title:
+            direct.extend(["--title", title])
+
+        if debug:
+            direct.extend(["--print-logs", "--log-level", "DEBUG"])
+
+        direct.append(prompt)
 
         script_path = shutil.which("script")
         if sys.platform.startswith("linux") and script_path:
@@ -740,6 +1127,7 @@ class OpenCodeBridge:
         {
             "TASK.md",
             "RETRY.md",
+            "RESUME.md",
             "GUIDANCE.md",
             "EXPERIMENT_PLAN.yaml",
             "opencode.json",
@@ -762,6 +1150,15 @@ class OpenCodeBridge:
         is excluded — only the agent's own output is returned.
         """
         files: dict[str, str] = {}
+        skipped_reasons: dict[str, list[str]] = {
+            "not_file": [],
+            "pycache_or_dot": [],
+            "dotfile": [],
+            "scaffold_file": [],
+            "scaffold_dir": [],
+            "duplicate": [],
+            "read_error": [],
+        }
         # Sort by depth (fewer parts first) so root-level files take priority.
         all_files = sorted(
             workspace.rglob("*"),
@@ -769,6 +1166,7 @@ class OpenCodeBridge:
         )
         for fpath in all_files:
             if not fpath.is_file():
+                skipped_reasons["not_file"].append(str(fpath.relative_to(workspace)))
                 continue
             try:
                 rel = fpath.relative_to(workspace)
@@ -776,22 +1174,48 @@ class OpenCodeBridge:
                 continue
             parts = rel.parts
             if any(p.startswith("__pycache__") or p.startswith(".") for p in parts):
+                skipped_reasons["pycache_or_dot"].append(rel.as_posix())
                 continue
             # Preserve relative subdirectory paths; skip dotfiles.
             if parts and parts[-1].startswith("."):
+                skipped_reasons["dotfile"].append(rel.as_posix())
                 continue
             # Skip the scaffolding we wrote in as input.
             if len(parts) == 1 and parts[0] in OpenCodeBridge._INPUT_SCAFFOLD_FILES:
+                skipped_reasons["scaffold_file"].append(rel.as_posix())
                 continue
             if parts[0] in OpenCodeBridge._INPUT_SCAFFOLD_DIRS:
+                skipped_reasons["scaffold_dir"].append(rel.as_posix())
                 continue
             key = rel.as_posix()
             if key in files:
+                skipped_reasons["duplicate"].append(rel.as_posix())
                 continue
             try:
                 files[key] = fpath.read_text(encoding="utf-8", errors="replace")
             except OSError as exc:
+                skipped_reasons["read_error"].append(f"{rel.as_posix()} ({exc})")
                 logger.warning("Beast mode: failed to read %s: %s", fpath, exc)
+
+        # Diagnostic logging when collection yields nothing
+        if not files:
+            total_skipped = sum(len(v) for v in skipped_reasons.values())
+            logger.warning(
+                "Beast mode: _collect_files found 0 files (skipped %d): "
+                "pycache/dot=%d, dotfiles=%d, scaffold_files=%d, scaffold_dirs=%d, "
+                "duplicates=%d, read_errors=%d",
+                total_skipped,
+                len(skipped_reasons["pycache_or_dot"]),
+                len(skipped_reasons["dotfile"]),
+                len(skipped_reasons["scaffold_file"]),
+                len(skipped_reasons["scaffold_dir"]),
+                len(skipped_reasons["duplicate"]),
+                len(skipped_reasons["read_error"]),
+            )
+            if skipped_reasons["scaffold_file"]:
+                logger.info("  Skipped scaffold files: %s", skipped_reasons["scaffold_file"][:10])
+            if skipped_reasons["pycache_or_dot"]:
+                logger.info("  Skipped pycache/dot: %s", skipped_reasons["pycache_or_dot"][:10])
 
         return files
 
@@ -948,6 +1372,7 @@ class OpenCodeBridge:
 
         workspace: Path | None = None
         last_error = ""
+        last_log = ""
         files: dict[str, str] = {}
         elapsed = 0.0
         prev_error = ""
@@ -957,29 +1382,27 @@ class OpenCodeBridge:
         # BUG-03: files salvaged from a FAILED attempt are a last resort, not a
         # reason to stop retrying. Stash them and keep going — a later attempt
         # may still succeed cleanly, and it gets the salvaged output as
-        # PREVIOUS_ATTEMPT context. Only if every attempt fails do we return
-        # the stash, flagged via ``recovered_from_failure``.
+        # PREVIOUS_ATTEMPT context. Only if every attempt fails do we return the
+        # stash, flagged via ``recovered_from_failure``.
         salvaged_files: dict[str, str] = {}
         salvaged_error = ""
         salvaged_elapsed = 0.0
-        # BUG-07: keep at most ONE failed workspace on disk for post-mortem.
-        # Retries used to leak every workspace, each nesting the previous
-        # attempt's PREVIOUS_ATTEMPT/ copy inside it.
-        kept_workspace: Path | None = None
 
-        def _retire(ws: Path | None) -> None:
-            """Drop ``ws``, keeping it only if it is the newest failed one."""
-            nonlocal kept_workspace
-            if ws is None:
-                return
-            if kept_workspace is not None and kept_workspace != ws:
-                shutil.rmtree(kept_workspace, ignore_errors=True)
-            kept_workspace = ws
+        # Create workspace ONCE for all attempts — each retry works in the same
+        # directory, so the agent can incrementally fix rather than restart from
+        # scratch. The git history preserves each attempt's changes.
+        try:
+            workspace = self._prepare_workspace_once(stage_dir)
+        except OSError as exc:
+            return OpenCodeResult(
+                success=False,
+                error=f"Failed to create workspace: {exc}",
+            )
 
         for attempt in range(1 + self._max_retries):
-            # On a retry, tell the agent what failed last time. A byte-identical
-            # prompt reliably reproduced the same failure — notably the model
-            # replying with a clarifying question and writing nothing.
+            # On a retry, tell the agent what failed last time — a byte-identical
+            # prompt reliably reproduced the same failure (notably a clarifying
+            # question and no written files).
             retry_note = ""
             if attempt > 0:
                 retry_note = (
@@ -993,10 +1416,10 @@ class OpenCodeBridge:
                     .replace("{reason}", last_error or "unknown")
                 )
 
-            # Prepare workspace
+            # Update workspace with retry context (RETRY.md, PREVIOUS_ATTEMPT_ERROR.txt)
             try:
-                workspace = self._prepare_workspace(
-                    stage_dir=stage_dir,
+                self._update_workspace_for_retry(
+                    workspace=workspace,
                     topic=topic,
                     exp_plan=exp_plan,
                     metric=metric,
@@ -1004,18 +1427,76 @@ class OpenCodeBridge:
                     extra_guidance=extra_guidance,
                     time_budget_sec=time_budget_sec,
                     prev_error=prev_error,
-                    prev_files=prev_files or None,
                     retry_note=retry_note,
                 )
             except OSError as exc:
-                last_error = f"Failed to prepare workspace: {exc}"
+                last_error = f"Failed to update workspace for retry: {exc}"
                 logger.warning("Beast mode: %s", last_error)
                 continue
 
+            # STATE RECOVERY: On retry, check if previous attempt left partial output.
+            # If so, guide the agent to complete the missing files rather than restart.
+            resume_note = ""
+            if attempt > 0:
+                existing = self._collect_files(workspace)
+                if existing:
+                    has_main = "main.py" in existing
+                    py_files = [f for f in existing if f.endswith(".py")]
+                    data_files = [f for f in existing if f.endswith((".json", ".csv", ".txt", ".yaml"))]
+
+                    resume_parts = [
+                        "# Progress from Previous Attempt\n",
+                        f"The previous attempt generated **{len(existing)} files** but did not complete.\n",
+                    ]
+
+                    if has_main:
+                        resume_parts.append("✅ `main.py` exists.\n")
+                    else:
+                        resume_parts.append("❌ **`main.py` is MISSING** — this is required.\n")
+
+                    if py_files:
+                        resume_parts.append(f"\n## Existing Python modules ({len(py_files)}):\n")
+                        for f in sorted(py_files)[:15]:
+                            resume_parts.append(f"- `{f}`\n")
+                        if len(py_files) > 15:
+                            resume_parts.append(f"- ... and {len(py_files) - 15} more\n")
+
+                    if data_files:
+                        resume_parts.append(f"\n## Existing data files ({len(data_files)}):\n")
+                        for f in sorted(data_files)[:10]:
+                            resume_parts.append(f"- `{f}`\n")
+                        if len(data_files) > 10:
+                            resume_parts.append(f"- ... and {len(data_files) - 10} more\n")
+
+                    resume_parts.extend([
+                        "\n## Your Task\n",
+                        "**DO NOT regenerate files that already exist and look correct.**\n",
+                        "Instead:\n",
+                        "1. Read `TASK.md` to understand the full requirements\n",
+                        "2. Check which files from `TASK.md` are still missing\n",
+                        "3. Generate ONLY the missing files\n",
+                        "4. If `main.py` is missing, create it\n",
+                        "5. Run `main.py` to verify it works\n",
+                        "\n",
+                        "The previous attempt was interrupted or failed partway through. ",
+                        "Your job is to **complete** the experiment, not restart it.\n",
+                    ])
+
+                    resume_note = "".join(resume_parts)
+                    try:
+                        (workspace / "RESUME.md").write_text(resume_note, encoding="utf-8")
+                        logger.info(
+                            "Beast mode: wrote RESUME.md with %d existing files "
+                            "(main.py=%s, py=%d, data=%d)",
+                            len(existing), has_main, len(py_files), len(data_files),
+                        )
+                    except OSError as exc:
+                        logger.warning("Beast mode: failed to write RESUME.md: %s", exc)
+
             # Build the CLI prompt. It only points at TASK.md, so it stays well
-            # inside the argv length limit regardless of plan/guidance size.
-            # Use replace instead of .format() to avoid KeyError when the metric
-            # contains curly braces like "F{1}".
+            # inside the argv length limit regardless of plan/guidance size. Use
+            # replace, not .format(), to avoid KeyError when the metric contains
+            # curly braces like "F{1}".
             prompt = _MEGA_PROMPT_TEMPLATE.replace(
                 "{metric}", metric
             ).replace(
@@ -1023,6 +1504,9 @@ class OpenCodeBridge:
             )
             if retry_note:
                 prompt = _RETRY_PROMPT_PREFIX + prompt
+            # If RESUME.md exists, tell the agent to read it FIRST.
+            if resume_note:
+                prompt = _RESUME_PROMPT_PREFIX + prompt
 
             logger.info(
                 "Beast mode: invoking OpenCode (attempt %d/%d, timeout=%ds, "
@@ -1033,18 +1517,35 @@ class OpenCodeBridge:
                 len(prompt),
             )
 
-            success, log, elapsed = self._invoke_opencode(workspace, prompt)
+            success, log, elapsed = self._invoke_opencode(workspace, prompt, attempt=attempt + 1)
+            last_log = log
 
             if success:
+                # Diagnostic: list ALL files in workspace before filtering
+                try:
+                    all_workspace_files = list(workspace.rglob("*"))
+                    all_file_paths = [
+                        str(f.relative_to(workspace))
+                        for f in all_workspace_files
+                        if f.is_file()
+                    ]
+                    logger.info(
+                        "Beast mode: workspace contains %d files (before filtering): %s",
+                        len(all_file_paths),
+                        all_file_paths[:20] if len(all_file_paths) > 20 else all_file_paths,
+                    )
+                except Exception as diag_exc:
+                    logger.warning("Beast mode: failed to list workspace files: %s", diag_exc)
+
                 files = self._collect_files(workspace)
                 if "main.py" not in files:
                     logger.warning(
                         "Beast mode: OpenCode succeeded but no main.py found "
-                        "(files: %s)", list(files.keys()),
+                        "(files after filtering: %s)", list(files.keys()),
                     )
                     # Distinguish "wrote nothing at all" (replied with text
-                    # instead of calling tools) from "wrote code but no
-                    # main.py" — they need different retry guidance.
+                    # instead of calling tools) from "wrote code but no main.py"
+                    # — they need different retry guidance.
                     if not any(f.endswith(".py") for f in files):
                         last_error = (
                             "OpenCode wrote no code files at all — it replied "
@@ -1055,15 +1556,13 @@ class OpenCodeBridge:
                         last_error = "No main.py in OpenCode output"
                         prev_had_no_files = False
                     # Carry this attempt's output + reason to the next retry.
-                    prev_error = log
+                    # Keep the reason COMPACT: a full log here re-enters RETRY.md
+                    # and, once the agent reads RETRY.md, the next attempt's log.
+                    prev_error = _summarize_log(log)
                     prev_files = files
-                    # BUG-07: keep the workspace so partial output can be
-                    # inspected — but only the newest one. This path used to
-                    # skip cleanup entirely and leak one directory per retry.
-                    _retire(workspace)
                     continue
 
-                # BUG-R52-01: Ensure main.py has an entry point
+                # BUG-R52-01: Ensure main.py has an entry point.
                 files = self._ensure_main_entry_point(files)
 
                 # Write log
@@ -1075,13 +1574,9 @@ class OpenCodeBridge:
                     logger.warning("Beast mode: failed to write log: %s", _wexc)
 
                 # Cleanup workspace if configured. A clean success supersedes
-                # every earlier failed attempt, so drop those too.
-                if self._workspace_cleanup:
-                    if workspace.exists():
-                        shutil.rmtree(workspace, ignore_errors=True)
-                    if kept_workspace is not None:
-                        shutil.rmtree(kept_workspace, ignore_errors=True)
-                        kept_workspace = None
+                # every earlier failed attempt.
+                if self._workspace_cleanup and workspace and workspace.exists():
+                    _rmtree_force(workspace)
 
                 return OpenCodeResult(
                     success=True,
@@ -1090,28 +1585,22 @@ class OpenCodeBridge:
                     elapsed_sec=elapsed,
                 )
 
-            last_error = log
+            last_error = _summarize_log(log)
             logger.warning(
                 "Beast mode: OpenCode attempt %d failed (%.1fs): %s",
                 attempt + 1,
                 elapsed,
                 log[:500],
             )
-            # Attempt to recover output even on failure/timeout: opencode may
-            # have written a complete package before the process was killed
-            # (e.g. timed out during the final full-run validation). Prefer
-            # that over discarding it, and only wipe the workspace when there
-            # is nothing useful to keep.
+            # Recover output even on failure/timeout: opencode may have written a
+            # complete package before the process was killed (e.g. timed out
+            # during final full-run validation). Prefer that over discarding it;
+            # only wipe the workspace when there is nothing useful to keep.
             if workspace and workspace.exists():
                 recovered = self._collect_files(workspace)
-                prev_error = log
+                prev_error = _summarize_log(log)
                 prev_files = recovered
-                if "main.py" not in recovered:
-                    if self._workspace_cleanup:
-                        shutil.rmtree(workspace, ignore_errors=True)
-                    else:
-                        _retire(workspace)
-                else:
+                if "main.py" in recovered:
                     logger.info(
                         "Beast mode: recovered %d file(s) from failed attempt; "
                         "stashing as fallback and continuing to retry",
@@ -1122,13 +1611,11 @@ class OpenCodeBridge:
                     salvaged_files = recovered
                     salvaged_error = log
                     salvaged_elapsed = elapsed
-                    _retire(workspace)
 
         if salvaged_files:
             files = self._ensure_main_entry_point(salvaged_files)
-            if self._workspace_cleanup and kept_workspace is not None:
-                shutil.rmtree(kept_workspace, ignore_errors=True)
-                kept_workspace = None
+            if self._workspace_cleanup and workspace and workspace.exists():
+                _rmtree_force(workspace)
             logger.warning(
                 "Beast mode: all %d attempt(s) failed; falling back to %d "
                 "file(s) salvaged from a failed run — package was never "
@@ -1144,7 +1631,19 @@ class OpenCodeBridge:
                 recovered_from_failure=True,
             )
 
-        # All attempts failed
+        # All attempts failed. The full transcript used to be dropped here (only
+        # the last attempt's final line survived in memory, nothing on disk), so
+        # persist the whole log for post-mortem. `last_error` stays the compact
+        # ~2000-char summary that fills RETRY.md's {reason} — the in-memory
+        # opencode_log field keeps that instead of the full log so a caller's
+        # retry prompt does not grow.
+        if last_log:
+            try:
+                (stage_dir / "opencode_log.txt").write_text(
+                    last_log or "", encoding="utf-8",
+                )
+            except OSError as _wexc:
+                logger.warning("Beast mode: failed to write log: %s", _wexc)
         return OpenCodeResult(
             success=False,
             opencode_log=last_error,

@@ -410,6 +410,7 @@ class TestBuildOpencodeCommand:
         assert "opencode" in inner
         assert "run" in inner
         assert "--format json" in inner
+        assert "--auto" in inner
 
     def test_linux_wrapper_preserves_child_exit_status(self):
         """The `-e` flag is required: without it `script` can return 0 even when
@@ -436,7 +437,7 @@ class TestBuildOpencodeCommand:
             )
         assert cmd == [
             "/usr/bin/opencode", "run", "-m",
-            "anthropic/claude-sonnet-4-6", "--format", "json", "prompt",
+            "anthropic/claude-sonnet-4-6", "--format", "json", "--auto", "prompt",
         ]
 
     def test_non_linux_does_not_wrap_even_if_script_present(self):
@@ -470,8 +471,54 @@ class TestBuildOpencodeCommand:
         # A shell parsing `inner` must recover the original argv verbatim,
         # with the payload as a single token rather than separate commands.
         assert shlex.split(inner) == [
-            "/usr/bin/opencode", "run", "-m", "m", "--format", "json", payload,
+            "/usr/bin/opencode", "run", "-m", "m", "--format", "json", "--auto", payload,
         ]
+
+    def test_title_parameter_adds_title_flag(self):
+        """When title is provided, --title flag is added."""
+        with patch(
+            "researchclaw.pipeline.opencode_bridge.sys.platform", "linux"
+        ), patch(
+            "researchclaw.pipeline.opencode_bridge.shutil.which",
+            return_value=None,
+        ):
+            cmd = OpenCodeBridge._build_opencode_command(
+                "/usr/bin/opencode", "m", "p", title="test-session"
+            )
+        assert "--title" in cmd
+        assert "test-session" in cmd
+        # Check the order: should be before the prompt
+        title_idx = cmd.index("--title")
+        assert cmd[title_idx + 1] == "test-session"
+        assert cmd[-1] == "p"  # prompt is last
+
+    def test_debug_parameter_adds_logging_flags(self):
+        """When debug=True, --print-logs and --log-level DEBUG are added."""
+        with patch(
+            "researchclaw.pipeline.opencode_bridge.sys.platform", "linux"
+        ), patch(
+            "researchclaw.pipeline.opencode_bridge.shutil.which",
+            return_value=None,
+        ):
+            cmd = OpenCodeBridge._build_opencode_command(
+                "/usr/bin/opencode", "m", "p", debug=True
+            )
+        assert "--print-logs" in cmd
+        assert "--log-level" in cmd
+        assert "DEBUG" in cmd
+
+    def test_auto_flag_always_present(self):
+        """The --auto flag should always be present for non-interactive runs."""
+        with patch(
+            "researchclaw.pipeline.opencode_bridge.sys.platform", "linux"
+        ), patch(
+            "researchclaw.pipeline.opencode_bridge.shutil.which",
+            return_value=None,
+        ):
+            cmd = OpenCodeBridge._build_opencode_command(
+                "/usr/bin/opencode", "m", "p"
+            )
+        assert "--auto" in cmd
 
 
 # ============================================================

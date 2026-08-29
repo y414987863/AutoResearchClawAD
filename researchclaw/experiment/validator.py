@@ -907,7 +907,36 @@ def check_api_correctness(code: str, fname: str = "main.py") -> list[str]:
 
     warnings: list[str] = []
 
+    # NumPy 2.0 removed names -> replacement. Matched as a whole attribute so
+    # the live aliases (np.float_, np.int_, np.complex_, np.float64/32) are NOT
+    # caught: the trailing-underscore names fail the "(?![_\w\d])" bound.
+    _NP_REMOVED = {
+        "np.bool": "bool",
+        "np.int": "int",
+        "np.float": "float",
+        "np.complex": "complex",
+        "np.object": "object",
+        "np.str": "str",
+        "np.trapz": "np.trapezoid",
+        "np.product": "np.prod",
+        "np.in1d": "np.isin",
+        "np.row_stack": "np.vstack",
+        "np.cumproduct": "np.cumprod",
+        "np.round_": "np.round",
+        "np.alltrue": "np.all",
+        "np.sometrue": "np.any",
+        "np.NaN": "np.nan",
+        "np.Inf": "np.inf",
+        "np.PINF": "np.inf",
+        "np.NINF": "-np.inf",
+        "np.PZERO": "0.0",
+        "np.NZERO": "-0.0",
+    }
+
     lines = code.splitlines()
+    _has_pandas = bool(
+        _re.search(r"^\s*(?:import\s+pandas|from\s+pandas)\b", code, _re.MULTILINE)
+    )
     for i, line in enumerate(lines, 1):
         stripped = line.strip()
         if stripped.startswith("#"):
@@ -927,15 +956,40 @@ def check_api_correctness(code: str, fname: str = "main.py") -> list[str]:
                 f"use np.ptp(arr) or arr.max() - arr.min() instead"
             )
 
-        # NumPy 2.0 removed type aliases
-        for old_alias in ("np.bool", "np.int", "np.float", "np.complex",
-                          "np.object", "np.str"):
-            pattern = _re.escape(old_alias) + r"(?![_\w\d])"
+        # NumPy 2.0 removed names (types, functions, constants). The regex
+        # requires a non-identifier boundary immediately after the name, so
+        # live aliases like np.float_ / np.int_ / np.complex_ (which end in an
+        # underscore, still valid) and current np.float64 / np.float32 are NOT
+        # caught, and the literal dotted name matches only the removed spelling.
+        for old_name, replacement in _NP_REMOVED.items():
+            pattern = _re.escape(old_name) + r"(?![_\w\d])"
             if _re.search(pattern, stripped):
                 warnings.append(
-                    f"[{fname}:{i}] {old_alias} was removed in NumPy 2.0 — "
-                    f"use {old_alias}_ or Python builtin instead"
+                    f"[{fname}:{i}] {old_name} was removed in NumPy 2.0 — "
+                    f"use {replacement} instead"
                 )
+
+        # pandas 2.0 removals. `.ix[]` and `.iteritems()` are unambiguous, so
+        # they are flagged regardless of context. `.append()` is NOT — a plain
+        # Python list.append is legal, so only flag it in a file that imports
+        # pandas, and even then only on a bare `.append(` (a `list.append(...)`
+        # qualified call is explicitly excluded).
+        # `.ix[` is a pd.DataFrame/Series selector removed in pandas 2.0.
+        if _re.search(r"\.ix\s*\[", stripped):
+            warnings.append(
+                f"[{fname}:{i}] `.ix[]` was removed in pandas 2.0 — "
+                f"use `.loc[]` or `.iloc[]` instead"
+            )
+        if _re.search(r"\.iteritems\s*\(", stripped):
+            warnings.append(
+                f"[{fname}:{i}] `.iteritems()` was removed in pandas 2.0 — "
+                f"use `.items()` instead"
+            )
+        if _has_pandas and "list.append" not in stripped and _re.search(r"\.append\s*\(", stripped):
+            warnings.append(
+                f"[{fname}:{i}] DataFrame/Series.append() was removed in pandas 2.0 — "
+                f"use pd.concat() instead"
+            )
 
         # np.random.RandomState with hardcoded seed in a function called multiple times
         if _re.search(r"RandomState\(\s*\d+\s*\)", stripped) and "def " not in stripped:
