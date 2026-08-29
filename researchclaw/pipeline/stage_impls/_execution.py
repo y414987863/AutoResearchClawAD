@@ -647,13 +647,9 @@ def _generate_llm4ad_task_packages(
         # name-based inference so evolution optimises the right way.
         _topic = getattr(getattr(config, "research", None), "topic", "") or ""
         _direction = getattr(getattr(config, "experiment", None), "metric_direction", "") or ""
-        # Optional eval-budget override so evolution gets headroom the stage-10
-        # instances (max_evals=200) did not leave. 0 = keep as generated.
-        _max_evals = int(_res_cfg.get("max_evals", 0) or 0)
         _manifests = generate_task_packages(
             Path(_tp_exp), _tp_out, _llm_config, _evo_cfg, _res_cfg,
             background=_topic, metric_direction=_direction,
-            max_evals=_max_evals,
         )
         logger.info(
             "Stage 13: generated %d LLM4AD task package(s) under %s",
@@ -905,14 +901,13 @@ def _promote_llm4ad_to_experiment_final(
 ) -> int:
     """Overlay evolved algorithm modules onto a clean project directory.
 
-    Each ``evolution_results/<algo>/`` is an LLM4AD task package
-    (``algorithms/<algo>/<algo>.py`` next to run_single.py / evaluator.py /
-    config.yaml / runs/ / .git/), but downstream stages consume
-    ``experiment_final/`` as a top-level project (``main.py`` +
-    ``algorithms/<algo>/<algo>.py`` + ``data/*.json``). Copying the package
-    wholesale would push llm4ad's scaffolding into the artifact, so we rebuild
-    ``final_dir`` from ``base_exp_dir`` (the clean stage-10 code) and overlay
-    ONLY ``algorithms/<algo>/<algo>.py``.
+    Each ``evolution_results/<algo>/`` is a copy of the winning individual's git
+    worktree — which, because ``version_control.local_path`` is
+    ``algorithms/<algo>``, holds just the evolved ``<algo>.py``. Downstream stages
+    consume ``experiment_final/`` as a top-level project (``main.py`` +
+    ``algorithms/<algo>/<algo>.py`` + ``data/*.json``), so we rebuild ``final_dir``
+    from ``base_exp_dir`` (the clean stage-10 code) and overlay ONLY the evolved
+    module back into its original nested slot.
 
     Returns the number of algorithm modules overlaid (0 means nothing promoted).
     """
@@ -937,11 +932,14 @@ def _promote_llm4ad_to_experiment_final(
         if not algo_pkg.is_dir():
             continue
         algo_name = algo_pkg.name
-        # The evolved algorithm module is nested at
-        # evolution_results/<algo>/algorithms/<algo>/<algo>.py so the package
-        # root can still host the fixed modules (benchmarks/evaluator/stats_utils)
-        # that the algorithm imports.
-        evolved_src = algo_pkg / "algorithms" / algo_name / f"{algo_name}.py"
+        # `evolution_results/<algo>/` is a copy of the winning individual's git
+        # worktree, and the worktree is a copy of `version_control.local_path` =
+        # `algorithms/<algo>`. So the evolved module sits FLAT at the root here.
+        # The nested path is the pre-flattening layout, kept so results produced
+        # by an older package build still promote.
+        evolved_src = algo_pkg / f"{algo_name}.py"
+        if not evolved_src.is_file():
+            evolved_src = algo_pkg / "algorithms" / algo_name / f"{algo_name}.py"
         if not evolved_src.is_file():
             continue
         # Map back to the original layout: algorithms/<algo>/<algo>.py.

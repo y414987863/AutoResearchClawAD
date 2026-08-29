@@ -526,11 +526,6 @@ class Llm4adResourcesConfig:
     # dividing time_budget_sec across N packages (which left every package
     # killed mid-generation). When 0, falls back to time_budget_sec // n_pkgs.
     per_package_timeout_sec: int = 0
-    # Override for the per-instance evaluation budget ``max_evals`` written into
-    # each task package's data/*.json and coder prompt. When > 0 it REPLACES the
-    # value baked in at stage-10 generation, so evolution and the baseline
-    # comparison see the same budget. 0 keeps the per-instance value untouched.
-    max_evals: int = 0
 
 
 @dataclass(frozen=True)
@@ -1601,7 +1596,6 @@ def _parse_llm4ad_resources_config(data: dict[str, Any]) -> Llm4adResourcesConfi
         eval_timeout_sec=_safe_int(data.get("eval_timeout_sec"), 120),
         parallel_workers=_safe_int(data.get("parallel_workers"), 4),
         per_package_timeout_sec=_safe_int(data.get("per_package_timeout_sec"), 0),
-        max_evals=_safe_int(data.get("max_evals"), 0),
     )
 
 

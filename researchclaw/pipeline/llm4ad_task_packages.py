@@ -4,13 +4,22 @@ Turns a stage-10 ``experiment/`` directory into one self-contained LLM4AD
 task package per algorithm. Each package copies the fixed evaluation modules,
 embeds the evolvable algorithm at ``algorithms/<algo>/<algo>.py`` (mirroring
 the stage-10 layout), and ships a custom evaluator + ``config.yaml`` wired to
-LLM4AD's ``local_path="."``.
+LLM4AD's ``local_path="algorithms/<algo>"``.
 
-Design decisions (verified against LLM4AD_Next/src/llm4ad):
-- ``local_path`` is the package root: the algorithm module imports the shared
-  modules (benchmarks/evaluator/stats_utils) at the same level, and the
-  evaluator's ``project_root`` is the whole worktree, so a subdir-only worktree
-  would break both imports and instance access.
+Design decisions (verified against LLM4AD_Next/src/llm4ad and its
+``examples/applications/task_template_python`` reference package):
+- ``local_path`` is the algorithm directory, not the package root. LLM4AD copies
+  local_path into a per-individual git worktree, so local_path is exactly the set
+  of files an individual may change. Scoping it to ``algorithms/<algo>`` keeps
+  run_single.py, the evaluator, the shared modules and ``data/`` at the package
+  root and out of every worktree — the comparison is then structurally guaranteed
+  to hold evaluation logic and instances fixed, instead of relying on the prompt
+  telling the model to edit only between the EVOLVE markers.
+- Because the worktree is flat (``<worktree>/<algo>.py``), the evaluator resolves
+  run_single.py and the fixed modules from ``__file__``, not from
+  ``cfg.project_root``, and passes the algorithm path down as an argument.
+  run_single.py loads it with ``spec_from_file_location`` so the worktree never
+  joins ``sys.path``.
 - ``main.py`` hard-codes one smoke instance, so it is NOT used. Each package
   gets ``run_single.py`` that reads any instance file from ``EvalContext.data_path``.
 - The evaluator reports per-instance metrics; LLM4AD aggregates across instances.
@@ -35,8 +44,21 @@ class PackageManifest:
     n_instances: int = 0
 
 
-# Shared module basenames that are fixed evaluation logic (copied verbatim).
-_SHARED_MODULES = ("benchmarks.py", "evaluator.py", "stats_utils.py")
+# Fixed modules live at the experiment root. Which ones exist is the generated
+# experiment's business — a TSP-style task needs nothing like the bounds/stats
+# helpers a continuous-optimisation task needs — so they are discovered rather
+# than named. `main.py` is deliberately excluded: the runner never imports it,
+# and copying it would invite an evaluator that depends on values main.py
+# injects at runtime (which the runner would then not supply).
+_EXCLUDED_ROOT_MODULES = frozenset({"main.py", "run_single.py"})
+
+
+def _discover_shared_modules(exp_dir: Path) -> list[Path]:
+    """Root-level ``*.py`` the package must ship alongside the algorithm."""
+    return sorted(
+        p for p in exp_dir.glob("*.py")
+        if p.is_file() and p.name not in _EXCLUDED_ROOT_MODULES
+    )
 
 # Metric-name fragments that decide the optimisation direction. LLM4AD needs a
 # MetricType per metric; getting it wrong silently evolves the algorithm in the
@@ -106,25 +128,32 @@ def build_providers_yaml(llm_config: dict[str, Any] | None) -> str:
 
 
 def _read_primary_metric(exp_dir: Path) -> str:
-    """Best-effort read of the primary metric name from the generated main.py."""
-    main_py = exp_dir / "main.py"
-    try:
-        text = main_py.read_text(encoding="utf-8")
-    except OSError:
-        return "mean_best_objective_value"
-    # Look for `primary_metric = "..."` / `"primary_metric": "..."` (either case).
+    """Read the primary metric name the generated experiment actually reports.
+
+    ``evaluator.py`` is checked first because that is where the Stage-10 contract
+    puts it (see ``_check_llm4ad_structure``: evaluator.py must export
+    ``PRIMARY_METRIC`` and ``evaluate_instance``). main.py normally just
+    re-exports it, so reading main.py alone silently misses the real name and the
+    package then declares a metric key that run_single.py never emits — every
+    individual fails with "Primary metric ... unusable: key absent".
+    """
     import re as _re
 
-    for pat in (
-        r'primary_metric\s*=\s*"([a-zA-Z0-9_]+)"',
+    pats = (
         r'PRIMARY_METRIC\s*=\s*"([a-zA-Z0-9_]+)"',
+        r'primary_metric\s*=\s*"([a-zA-Z0-9_]+)"',
         r'"primary_metric"\s*:\s*"([a-zA-Z0-9_]+)"',
         r"'primary_metric'\s*:\s*'([a-zA-Z0-9_]+)'",
-    ):
-        m = _re.search(pat, text)
-        if m:
-            return m.group(1)
-    # Fall back to HYPERPARAMETERS-like key if present; otherwise the default.
+    )
+    for name in ("evaluator.py", "main.py"):
+        try:
+            text = (exp_dir / name).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for pat in pats:
+            m = _re.search(pat, text)
+            if m:
+                return m.group(1)
     return "mean_best_objective_value"
 
 
@@ -158,69 +187,72 @@ def _algo_class_name(algo: str) -> str:
 def _write_run_single(algo: str, package: Path, primary_metric: str) -> None:
     """Write the single-instance entry point `run_single.py`.
 
-    It loads the evolvable algorithm module (at ``algorithms/<algo>/<algo>.py``),
-    realises the seeds/starts loop, and delegates the instance-level metric to the
-    shared ``evaluator.py`` (via ``prepare_start``/``evaluate_instance``/
-    ``PRIMARY_METRIC``). Because the package runner and ``main.py`` call the SAME
-    evaluator helpers, the number LLM4AD optimises equals the number the paper
-    reports.
+    This is a deliberately thin shim, and the thinness is the design: it loads the
+    candidate algorithm and hands it to ``evaluator.evaluate_instance``, which
+    owns every problem-specific decision (seeds, repeats, any budget or
+    hyperparameters, how to read the algorithm's return value, aggregation).
+    Nothing here knows what an instance contains or what ``optimize`` returns, so
+    the same runner serves any task in the domain rather than only continuous
+    box-constrained optimisation.
+
+    The algorithm path is an argument rather than an import: during evolution the
+    file lives in a per-individual git worktree, while this script and every fixed
+    module stay at the package root. ``spec_from_file_location`` loads it without
+    putting the worktree on ``sys.path``, so an evolved algorithm cannot shadow a
+    fixed module with a file of its own.
     """
     text = (
         "import json\n"
         "import sys\n"
         "from pathlib import Path\n"
         "\n"
-        "import numpy as np\n"
-        "\n"
         "sys.path.insert(0, str(Path(__file__).resolve().parent))\n"
         "\n"
-        "# Fixed evaluation data/logic (never evolved). These are the same helpers\n"
-        "# stage-12 uses, so the arithmetic here is bit-for-bit what the paper\n"
-        "# reports. A missing module means the package was built on an experiment\n"
-        "# that did not follow the task-package layout, which is a build error.\n"
-        "from benchmarks import get_bounds\n"
-        "from stats_utils import SEEDS, mean_std, rng_from_instance\n"
-        "from evaluator import evaluate_instance, PRIMARY_METRIC, prepare_start\n"
+        "# The ONLY contract with the generated experiment. evaluator.py is the\n"
+        "# same module stage-12's main.py calls, so the number LLM4AD optimises\n"
+        "# is the number the paper reports.\n"
+        "from evaluator import PRIMARY_METRIC, evaluate_instance\n"
         "\n"
         f'ALGO = "{algo}"\n'
         "\n"
         "\n"
+        "def _load_optimize(path):\n"
+        "    import importlib.util\n"
+        '    spec = importlib.util.spec_from_file_location(f"_evolved_{ALGO}", str(path))\n'
+        "    if spec is None or spec.loader is None:\n"
+        '        raise RuntimeError(f"cannot load algorithm from {path}")\n'
+        "    mod = importlib.util.module_from_spec(spec)\n"
+        "    spec.loader.exec_module(mod)\n"
+        '    fn = getattr(mod, "optimize", None)\n'
+        "    if fn is None:\n"
+        '        raise RuntimeError(f"{path.name} has no optimize(instance, seed) function")\n'
+        "    return fn\n"
+        "\n"
+        "\n"
         "def main():\n"
-        "    if len(sys.argv) < 2:\n"
-        '        print("usage: python run_single.py <instance.json>", file=sys.stderr)\n'
+        "    if len(sys.argv) < 3:\n"
+        '        print("usage: python run_single.py <instance.json> <algorithm.py>", file=sys.stderr)\n'
         "        sys.exit(1)\n"
         "    inst_path = Path(sys.argv[1])\n"
         "    if not inst_path.is_absolute():\n"
         "        inst_path = (Path.cwd() / inst_path).resolve()\n"
-        "    with open(inst_path, \"r\", encoding=\"utf-8\") as f:\n"
+        '    with open(inst_path, "r", encoding="utf-8") as f:\n'
         "        instance = json.load(f)\n"
         "\n"
-        "    import importlib\n"
-        "    alg_mod = importlib.import_module(f\"algorithms.{ALGO}\")\n"
-        "    optimize = getattr(alg_mod, \"optimize\", None)\n"
-        "    if optimize is None:\n"
-        '        raise RuntimeError(f"{ALGO}.py has no optimize(instance, seed) function")\n'
+        "    algo_path = Path(sys.argv[2]).resolve()\n"
+        "    if not algo_path.is_file():\n"
+        '        raise RuntimeError(f"algorithm file not found: {algo_path}")\n'
         "\n"
-        "    n_starts = int(instance.get('n_starts', 1))\n"
-        "    per_seed = {}\n"
-        "    for seed in SEEDS:\n"
-        "        values = []\n"
-        "        for sidx in range(n_starts):\n"
-        "            inst = prepare_start(instance, seed, sidx)\n"
-        "            result = optimize(inst, seed=seed)\n"
-        "            best_f = float(result.get('best_f', float('inf')))\n"
-        "            if not np.isfinite(best_f):\n"
-        "                best_f = float(1e12)\n"
-        "            values.append(best_f)\n"
-        "        if values:\n"
-        "            per_seed[seed] = float(np.mean(values))\n"
-        "\n"
-        "    metric = evaluate_instance(per_seed)\n"
-        "    payload = {\"primary_metric\": PRIMARY_METRIC, \"metrics\": metric}\n"
-        "    print(json.dumps(payload))\n"
+        "    metrics = evaluate_instance(instance, _load_optimize(algo_path))\n"
+        "    if not isinstance(metrics, dict):\n"
+        "        raise RuntimeError(\n"
+        '            "evaluate_instance must return a metrics dict, got %s"\n'
+        "            % type(metrics).__name__\n"
+        "        )\n"
+        '    print(json.dumps({"primary_metric": PRIMARY_METRIC, "metrics": metrics}))\n'
         "\n"
         "\n"
-        "if __name__ == \"__main__\":\n"
+        'if __name__ == "__main__":\n'
         "    main()\n"
     )
     (package / "run_single.py").write_text(text, encoding="utf-8")
@@ -249,6 +281,14 @@ def _write_evaluator(
         "\n"
         "\n"
         f'PRIMARY_METRIC = "{primary_metric}"\n'
+        f'ALGO = "{algo}"\n'
+        "\n"
+        "# This file, run_single.py and every fixed module live at the package\n"
+        "# root, which is NOT under version_control.local_path. Resolving them\n"
+        "# from __file__ rather than from cfg.project_root is what keeps the\n"
+        "# evaluation logic and the instance data outside the evolvable surface:\n"
+        "# an individual can only ever change its own algorithm file.\n"
+        "PACKAGE_ROOT = Path(__file__).resolve().parent\n"
         "\n"
         "\n"
         f'@BaseEvaluator.register("{algo}_evaluator")\n'
@@ -284,18 +324,30 @@ def _write_evaluator(
         f'                error_message=f"Data file not found: {{data_path}}",\n'
         "                duration_ms=(time.time() - start) * 1000,\n"
         "            )\n"
-        "        run_script = project_root / \"run_single.py\"\n"
+        "        run_script = PACKAGE_ROOT / \"run_single.py\"\n"
         "        if not run_script.is_file():\n"
         "            return EvaluationResult(\n"
         "                score=0.0, metrics={}, success=False,\n"
-        '                error_message="run_single.py not found in project_root",\n'
+        '                error_message="run_single.py not found in package root",\n'
+        "                duration_ms=(time.time() - start) * 1000,\n"
+        "            )\n"
+        "        # local_path is algorithms/<algo>, so the worktree is flat: the\n"
+        "        # evolved file sits at its root. Fall back to the package's own\n"
+        "        # copy for a local (non-worktree) run, e.g. a smoke test.\n"
+        "        algo_path = project_root / f\"{ALGO}.py\"\n"
+        "        if not algo_path.is_file():\n"
+        "            algo_path = PACKAGE_ROOT / \"algorithms\" / ALGO / f\"{ALGO}.py\"\n"
+        "        if not algo_path.is_file():\n"
+        "            return EvaluationResult(\n"
+        "                score=0.0, metrics={}, success=False,\n"
+        f'                error_message=f"Algorithm {{ALGO}}.py not found in {{project_root}}",\n'
         "                duration_ms=(time.time() - start) * 1000,\n"
         "            )\n"
         "        run_start = time.time()\n"
         "        try:\n"
         "            proc = await asyncio.create_subprocess_exec(\n"
-        "                sys.executable, str(run_script), str(data_path),\n"
-        "                cwd=str(project_root),\n"
+        "                sys.executable, str(run_script), str(data_path), str(algo_path),\n"
+        "                cwd=str(PACKAGE_ROOT),\n"
         "                stdout=asyncio.subprocess.PIPE,\n"
         "                stderr=asyncio.subprocess.PIPE,\n"
         "            )\n"
@@ -339,11 +391,22 @@ def _write_evaluator(
         "                scalar[k] = fv\n"
         "        value = scalar.get(PRIMARY_METRIC)\n"
         "        if value is None:\n"
+        "            # evaluate_instance() aggregates over seeds, so the emitted key is\n"
+        "            # normally `<PRIMARY_METRIC>_mean` rather than the bare name. Accept\n"
+        "            # either spelling and re-expose it under the declared Metric name so\n"
+        "            # compute_score() (which looks up self.metrics by name) can find it.\n"
+        "            value = scalar.get(PRIMARY_METRIC + \"_mean\")\n"
+        "            if value is not None:\n"
+        "                scalar[PRIMARY_METRIC] = value\n"
+        "        if value is None:\n"
         "            # Two distinct causes, so name them separately: the key was\n"
         "            # never emitted (evaluator/run_single contract mismatch), or\n"
         "            # it was emitted as inf/nan (a diverged run).\n"
         "            if PRIMARY_METRIC in metrics:\n"
         "                reason = \"non-finite value %r\" % (metrics[PRIMARY_METRIC],)\n"
+        "            elif PRIMARY_METRIC + \"_mean\" in metrics:\n"
+        "                reason = \"non-finite value %r\" % (\n"
+        "                    metrics[PRIMARY_METRIC + \"_mean\"],)\n"
         "            else:\n"
         "                reason = \"key absent; run_single emitted %s\" % (\n"
         "                    sorted(metrics) or \"no metrics\",\n"
@@ -391,7 +454,6 @@ def _write_config(
     resources: dict[str, Any] | None = None,
     description: str = "",
     background: str = "",
-    max_evals: int = 0,
 ) -> None:
     """Write the LLM4AD config.yaml for a self-contained task package.
 
@@ -469,16 +531,22 @@ def _write_config(
         "version_control:\n"
         "  enabled: true\n"
         "  type: \"git_worktree\"\n"
-        "  local_path: \".\"\n"
+        # The worktree is a copy of local_path, so local_path decides what an
+        # individual is allowed to change. Scoping it to the algorithm directory
+        # leaves run_single.py, the evaluator, the shared modules and data/ at the
+        # package root, outside every worktree: the evolvable surface is exactly
+        # one file, and no individual can be scored by a mutated evaluator or on
+        # mutated instances. This mirrors LLM4AD's own task_template_python.
+        "  local_path: \"algorithms/{algo}\"\n"
         "  auto_initialize: true\n"
         "  auto_cleanup: true\n"
         "\n"
         "repo_analyzer:\n"
         "  type: \"evolve_detector\"\n"
         "  include: [\"*.py\"]\n"
-        # runs/ and best/ hold copies of earlier candidates that still carry
-        # EVOLVE markers; without these excludes a second run would treat its
-        # own history as additional evolvable targets.
+        # The scan is already scoped to local_path, which holds only the seed
+        # algorithm; these excludes are belt-and-braces in case a run ever writes
+        # history inside the algorithm directory.
         "  exclude: [\".git/**\", \"__pycache__/**\", \"*.pyc\", \"runs/**\", \"best/**\", \"data/**\"]\n"
         "\n"
         "planner:\n"
@@ -494,24 +562,28 @@ def _write_config(
         "  type: \"custom\"\n"
         "  provider: \"default\"\n"
         "  prompt_template: |\n"
-        "    Rewrite ONLY the function body of `optimize(instance, seed)` in\n"
-        "    algorithms/{algo}/{algo}.py between the `# EVOLVE_START` and\n"
-        "    `# EVOLVE_END` markers.\n"
-        "    The instance dict carries function/dimension/seed/lb/ub/max_evals/x0.\n{max_evals_line}"
-        "    Return a dict with best_f (finite) and n_evals (<= max_evals).\n"
+        "    Rewrite ONLY the body of `optimize(instance, seed)` in {algo}.py\n"
+        "    between the `# EVOLVE_START` and `# EVOLVE_END` markers.\n"
+        "\n"
+        "    Keep the signature and the SHAPE of the returned value exactly as the\n"
+        "    current implementation has them. A fixed evaluator you cannot see reads\n"
+        "    that return value; changing its keys makes the candidate unscorable.\n"
+        "    Likewise, read only the instance fields the current implementation\n"
+        "    already reads - the instance files are fixed and will not gain fields.\n"
         "\n"
         "    OUTPUT FORMAT (STRICT): return EXACTLY ONE fenced code block with a\n"
-        "    `python:algorithms/{algo}/{algo}.py` header, containing the FULL\n"
-        "    {algo}.py file. The block header and closing fence must be the first\n"
-        "    and last lines.\n"
+        "    `python:{algo}.py` header, containing the FULL {algo}.py file. The\n"
+        "    block header and closing fence must be the first and last lines.\n"
         "    Keep imports and module-level constants outside the EVOLVE markers.\n"
+        "    Keep the WHOLE algorithm inside them - do not move logic out into a\n"
+        "    new module-level helper function or class, that would shrink the\n"
+        "    evolvable surface to nothing.\n"
         "    Output NOTHING outside the fence - no prose, no explanation, no\n"
         "    other markdown blocks, no sample outputs. In particular do not\n"
-        "    output a JSON block or a `python` block without the\n"
-        "    `:algorithms/{algo}/{algo}.py` suffix, or the response will be\n"
-        "    rejected.\n"
+        "    output a JSON block or a `python` block without the `:{algo}.py`\n"
+        "    suffix, or the response will be rejected.\n"
         "\n"
-        "    ```python:algorithms/{algo}/{algo}.py\n"
+        "    ```python:{algo}.py\n"
         "    <full file: imports, constants, then optimize() with the evolved\n"
         "     body between # EVOLVE_START and # EVOLVE_END>\n"
         "    ```\n"
@@ -531,35 +603,9 @@ def _write_config(
         parallel=parallel,
         desc_en=desc_en,
         bg_block=bg_block,
-        max_evals_line=(
-            f"    Evaluation budget: {int(max_evals)} = max_evals. Use it to\n"
-            "    make real progress; do not stop early after a handful of evals.\n"
-            if max_evals > 0 else ""
-        ),
     )
     (package / "config.yaml").write_text(config, encoding="utf-8")
 
-
-def _rewrite_max_evals(inst_file: Path, dst: Path, max_evals: int) -> None:
-    """Copy *inst_file* to *dst*, overriding its ``max_evals`` if present.
-
-    The per-instance eval budget is baked into the JSON at stage-10 generation
-    (typically 200). A tight budget leaves an already-saturated 2-D benchmark no
-    headroom for LLM4AD to improve. This lets the task run under a larger budget
-    so evolution has room; the caller must ensure the baseline is re-run under
-    the SAME budget for a fair comparison.
-    """
-    try:
-        data = json.loads(inst_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        # Not a JSON instance — copy verbatim; non-JSON files aren't ours.
-        shutil.copy2(inst_file, dst)
-        return
-    if isinstance(data, dict) and "max_evals" in data:
-        data["max_evals"] = int(max_evals)
-        dst.write_text(json.dumps(data, indent=1), encoding="utf-8")
-    else:
-        shutil.copy2(inst_file, dst)
 
 
 def generate_task_packages(
@@ -571,7 +617,6 @@ def generate_task_packages(
     *,
     background: str = "",
     metric_direction: str = "",
-    max_evals: int = 0,
 ) -> list[PackageManifest]:
     """Generate one self-contained LLM4AD task package per algorithm.
 
@@ -594,9 +639,6 @@ def generate_task_packages(
             case-insensitive) from ``config.experiment.metric_direction``. Takes
             precedence over name-based inference; empty uses
             :func:`infer_metric_direction`.
-        max_evals: Per-instance evaluation budget override. When > 0 it replaces
-            ``max_evals`` in each copied data/*.json and the coder prompt so the
-            evolved candidate keeps the same budget. 0 keeps the stage-10 value.
 
     Returns:
         A list of PackageManifest describing each generated package.
@@ -629,30 +671,22 @@ def generate_task_packages(
         package.mkdir(parents=True, exist_ok=True)
 
         # 1. Copy shared fixed evaluation modules.
-        for mod in _SHARED_MODULES:
-            shared_src = exp_dir / mod
-            if shared_src.is_file():
-                shutil.copy2(shared_src, package / mod)
+        for shared_src in _discover_shared_modules(exp_dir):
+            shutil.copy2(shared_src, package / shared_src.name)
 
-        # 1b. `algorithms/` is a real package so run_single.py can import
-        #     algorithms.<algo> without a namespace-package lookup.
-        (package / "algorithms").mkdir(parents=True, exist_ok=True)
-        (package / "algorithms" / "__init__.py").write_text("", encoding="utf-8")
-
-        # 2. Copy instance data (optionally overriding the eval budget).
+        # 2. Copy instance data verbatim. The files are the fixed evaluation
+        #    surface: rewriting anything in them here would mean LLM4AD scores
+        #    candidates on data the stage-12 baseline never saw.
         if instances:
             (package / "data").mkdir(parents=True, exist_ok=True)
         for inst in instances:
-            if max_evals > 0:
-                _rewrite_max_evals(inst, package / "data" / inst.name, max_evals)
-            else:
-                shutil.copy2(inst, package / "data" / inst.name)
+            shutil.copy2(inst, package / "data" / inst.name)
 
         # 3. Embed the evolvable algorithm at algorithms/<algo>/<algo>.py,
-        #    mirroring the stage-10 experiment layout and the LLM4AD task-package
-        #    structure. `local_path="."` keeps the worktree rooted at the package
-        #    root so the algorithm can still import the fixed modules
-        #    (benchmarks/evaluator/stats_utils) that live at the same level.
+        #    mirroring the stage-10 experiment layout. `local_path` points at
+        #    algorithms/<algo>, so this directory — and nothing else — becomes the
+        #    per-individual worktree. run_single.py loads the file by path, so the
+        #    algorithm never needs to import anything from its own directory.
         (package / "algorithms" / algo).mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, package / "algorithms" / algo / (algo + ".py"))
 
@@ -667,7 +701,6 @@ def generate_task_packages(
             algo, package, primary_metric, providers_yaml, evolution, resources,
             description=background,
             background=background,
-            max_evals=max_evals,
         )
 
         files = sorted(p.relative_to(package).as_posix() for p in package.rglob("*") if p.is_file())

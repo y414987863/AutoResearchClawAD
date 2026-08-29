@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
@@ -224,6 +225,170 @@ def _check_rl_compatibility(code: str) -> list[str]:
     return errors
 
 
+def _hard_indexed_instance_keys(code: str) -> set[str]:
+    """Keys an algorithm reads as ``instance["k"]`` with no fallback.
+
+    Derived from the source rather than from a fixed list, so this stays valid for
+    any problem family: whatever the generated code decides an instance looks
+    like, that is what the data files must provide.
+
+    Tracks the first parameter of ``optimize`` plus locals aliased directly from
+    it (``inst = dict(instance)``), which is how generated algorithms normally
+    copy before mutating. Keys the code also probes defensively
+    (``instance.get("k", ...)`` or ``"k" in instance``) are treated as optional
+    and excluded — a guarded read cannot raise ``KeyError``.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return set()
+
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "optimize":
+            args = node.args.args or node.args.posonlyargs
+            if args:
+                aliases.add(args[0].arg)
+    if not aliases:
+        return set()
+
+    # `inst = instance` / `inst = dict(instance)` / `inst = {**instance}`.
+    for _ in range(3):  # transitive, but generated code never nests deeply
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            src = node.value
+            if isinstance(src, ast.Call) and src.args:
+                src = src.args[0]
+            elif isinstance(src, ast.Dict) and len(src.keys) == 1 and src.keys[0] is None:
+                src = src.values[0]
+            if isinstance(src, ast.Name) and src.id in aliases:
+                aliases.add(target.id)
+
+    keys: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Subscript) or not isinstance(node.ctx, ast.Load):
+            continue
+        if not (isinstance(node.value, ast.Name) and node.value.id in aliases):
+            continue
+        sl = node.slice
+        if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
+            keys.add(sl.value)
+
+    optional = set()
+    for key in keys:
+        if f'.get("{key}"' in code or f".get('{key}'" in code:
+            optional.add(key)
+        elif f'"{key}" in ' in code or f"'{key}' in " in code:
+            optional.add(key)
+    return keys - optional
+
+
+def _injected_instance_keys(code: str) -> set[str]:
+    """Keys the evaluator writes into a dict before handing it to the algorithm.
+
+    Any ``<name>["k"] = ...`` counts. Deliberately generous: the point is to avoid
+    false positives in the data-field check, and an over-broad exemption only
+    weakens the check rather than blocking a valid experiment.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return set()
+    keys: set[str] = set()
+    for node in ast.walk(tree):
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        for t in targets:
+            if isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant):
+                if isinstance(t.slice.value, str):
+                    keys.add(t.slice.value)
+    return keys
+
+
+def _evolve_block_problems(path: str, code: str) -> list[str]:
+    """Check that the EVOLVE region actually contains the algorithm.
+
+    A block that merely constructs a module-level helper class and calls one of
+    its methods leaves the real algorithm outside the evolvable surface, so
+    evolution can do nothing but retune constructor arguments. Both checks are
+    purely structural — they say nothing about what the algorithm computes.
+    """
+    lines = code.splitlines()
+    starts = [i + 1 for i, ln in enumerate(lines) if "EVOLVE_START" in ln]
+    ends = [i + 1 for i, ln in enumerate(lines) if "EVOLVE_END" in ln]
+    if not starts or not ends:
+        return []  # already reported by the marker check
+    start_line, end_line = starts[0], ends[-1]
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []  # already reported by the syntax check
+
+    fn = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "optimize"),
+        None,
+    )
+    if fn is None:
+        return []  # already reported by the `def optimize(` check
+
+    body = list(fn.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]  # a leading docstring may sit above EVOLVE_START
+
+    problems: list[str] = []
+
+    outside = [
+        s for s in body
+        if s.lineno < start_line or (s.end_lineno or s.lineno) > end_line
+    ]
+    if outside:
+        problems.append(
+            f"LLM4AD_STRUCTURE: `{path}` — the EVOLVE markers cover only part of "
+            f"`optimize` ({len(outside)} of {len(body)} statements are outside, "
+            f"first at line {outside[0].lineno}). Move EVOLVE_START to the top of "
+            "the body (below the docstring) and EVOLVE_END below the final "
+            "`return` so the whole algorithm is evolvable."
+        )
+
+    helpers = {
+        n.name for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and n.name != "optimize"
+    }
+    if helpers:
+        used = sorted(
+            n.id for n in ast.walk(fn)
+            if isinstance(n, ast.Name)
+            and n.id in helpers
+            and start_line <= n.lineno <= end_line
+        )
+        if used:
+            problems.append(
+                f"LLM4AD_STRUCTURE: `{path}` — the EVOLVE block delegates to "
+                f"{', '.join(f'`{u}`' for u in dict.fromkeys(used))} defined in the "
+                "same file outside the markers, so the algorithm itself is not "
+                "evolvable. Inline that logic into `optimize` between the markers; "
+                "if it is genuinely shared across algorithms, move it to a module at "
+                "the experiment root and import it."
+            )
+
+    return problems
+
+
 def _check_llm4ad_structure(files: dict[str, str]) -> list[str]:
     """Validate that generated files satisfy the LLM4AD task-package layout.
 
@@ -259,6 +424,7 @@ def _check_llm4ad_structure(files: dict[str, str]) -> list[str]:
             problems.append(
                 f"LLM4AD_STRUCTURE: `{k}` missing `def optimize(instance, seed)`."
             )
+        problems.extend(_evolve_block_problems(k, code))
 
     if not any(k.startswith("data/") and k.endswith(".json") for k in files):
         problems.append(
@@ -283,17 +449,19 @@ def _check_llm4ad_structure(files: dict[str, str]) -> list[str]:
                     f"LLM4AD_STRUCTURE: main.py missing {label}."
                 )
 
-    # Stage-13 imports these symbols BY NAME; a missing export fails every
-    # algorithm at package-build time (after Stage 10). Check the code text
-    # rather than execute it — importing would run arbitrary generated code.
+    # Stage-13's package runner imports these two symbols BY NAME and nothing
+    # else; a missing export fails every algorithm at package-build time (after
+    # Stage 10). Check the code text rather than execute it — importing would run
+    # arbitrary generated code.
+    #
+    # Deliberately only `evaluator.py`: everything domain-specific (seeds,
+    # budgets, bounds, how to read the algorithm's return value) is that module's
+    # private business. Requiring named helpers in `benchmarks.py`/`stats_utils.py`
+    # would hard-wire one problem family — continuous box-constrained
+    # optimisation — into a profile that must cover the whole domain.
     for mod, needles, label in (
-        ("benchmarks.py", ("def get_bounds(",), "`get_bounds(func_name, dim)`"),
-        ("stats_utils.py", ("SEEDS", "mean_std", "rng_from_instance"),
-         "`SEEDS`, `mean_std`, `rng_from_instance`"),
-        # evaluator.py is the shared instance-level metric used by BOTH main.py
-        # and the package runner; without these the runner cannot aggregate.
-        ("evaluator.py", ("PRIMARY_METRIC", "prepare_start", "evaluate_instance"),
-         "`PRIMARY_METRIC`, `prepare_start`, `evaluate_instance`"),
+        ("evaluator.py", ("PRIMARY_METRIC", "evaluate_instance"),
+         "`PRIMARY_METRIC`, `evaluate_instance(instance, solve)`"),
     ):
         code = files.get(mod, "")
         # ``needles`` holds only the symbols/text that must appear in the module;
@@ -304,6 +472,71 @@ def _check_llm4ad_structure(files: dict[str, str]) -> list[str]:
                 f"LLM4AD_STRUCTURE: {mod} missing {label} — "
                 f"the task-package runner imports it by name."
             )
+
+    # A name check cannot tell the required `evaluate_instance(instance, solve)`
+    # apart from an aggregate-only helper such as `evaluate_instance(per_seed)`,
+    # and the difference is fatal: the runner passes the algorithm callable in.
+    _eval_code = files.get("evaluator.py", "")
+    if "evaluate_instance" in _eval_code:
+        try:
+            _tree = ast.parse(_eval_code)
+        except SyntaxError:
+            _tree = None
+        if _tree is not None:
+            for node in ast.walk(_tree):
+                if not isinstance(node, ast.FunctionDef) or node.name != "evaluate_instance":
+                    continue
+                n_pos = len(node.args.posonlyargs) + len(node.args.args)
+                if n_pos < 2:
+                    problems.append(
+                        "LLM4AD_STRUCTURE: evaluator.py `evaluate_instance` takes "
+                        f"{n_pos} positional argument(s); the runner calls "
+                        "`evaluate_instance(instance, solve)` where `solve` is the "
+                        "algorithm's `optimize`. Move the seeds/repeats loop inside "
+                        "this function so the runner stays problem-agnostic."
+                    )
+                break
+
+    # Every key an algorithm indexes unconditionally must exist in every instance    # file, or that algorithm dies with a KeyError the moment LLM4AD evaluates it.
+    # Stage 12 can mask this (main.py may inject values at runtime), so it only
+    # surfaces during evolution, where every individual scores -inf and the run
+    # looks like a modelling failure rather than a contract violation.
+    #
+    # The required keys come from the source, not from a hardcoded list, so this
+    # check makes no assumption about the problem family.
+    instance_files = {
+        k: v for k, v in files.items()
+        if k.startswith("data/") and k.endswith(".json")
+    }
+    if instance_files and algo_files:
+        injected = _injected_instance_keys(files.get("evaluator.py", ""))
+        parsed: dict[str, set[str]] = {}
+        for name, raw in instance_files.items():
+            try:
+                obj = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                problems.append(
+                    f"LLM4AD_STRUCTURE: `{name}` is not valid JSON — instance "
+                    "files must be machine-readable."
+                )
+                continue
+            if isinstance(obj, dict):
+                parsed[name] = set(obj)
+        for k in sorted(algo_files):
+            required = _hard_indexed_instance_keys(files[k]) - injected
+            for key in sorted(required):
+                lacking = sorted(n for n, present in parsed.items() if key not in present)
+                if not lacking:
+                    continue
+                shown = ", ".join(lacking[:3])
+                more = f" (+{len(lacking) - 3} more)" if len(lacking) > 3 else ""
+                problems.append(
+                    f"LLM4AD_STRUCTURE: `{k}` reads `instance[\"{key}\"]` "
+                    f"unconditionally, but {shown}{more} lack that key. Add it to "
+                    "every instance file, inject it in `evaluate_instance` before "
+                    "calling the algorithm, or read it with a default via "
+                    f"`instance.get(\"{key}\", ...)`."
+                )
 
     return problems
 
