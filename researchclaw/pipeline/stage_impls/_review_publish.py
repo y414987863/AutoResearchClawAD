@@ -218,6 +218,7 @@ def _execute_peer_review(
             _review_user,
             json_mode=sp.json_mode,
             max_tokens=sp.max_tokens,
+            reasoning=sp.reasoning,
         )
         reviews = resp.content
     else:
@@ -544,6 +545,7 @@ def _execute_quality_gate(
             sp.user,
             json_mode=sp.json_mode,
             max_tokens=sp.max_tokens,
+            reasoning=sp.reasoning,
         )
         parsed = _safe_json_loads(resp.content, {})
         if isinstance(parsed, dict):
@@ -739,6 +741,7 @@ def _execute_knowledge_archive(
             sp.user,
             json_mode=sp.json_mode,
             max_tokens=sp.max_tokens,
+            reasoning=sp.reasoning,
         )
         archive = resp.content
     else:
@@ -1530,6 +1533,7 @@ def _execute_export_publish(
             _export_user,
             json_mode=sp.json_mode,
             max_tokens=sp.max_tokens,
+            reasoning=sp.reasoning,
         )
         final_paper = resp.content
         # Content guard: reject LLM output that truncates the paper
@@ -2468,18 +2472,29 @@ def _execute_export_publish(
         code_dir.mkdir(parents=True, exist_ok=True)
         all_code_combined = ""
         code_file_names: list[str] = []
-        # Recurse so llm4ad-mode nested modules (algorithms/<algo>/<algo>.py,
-        # data/*.json) are packaged too — a flat glob dropped them, leaving a
-        # code package whose main.py imported a missing algorithm. Keep each
-        # file's path relative to the experiment root so same-named files in
-        # different subdirs don't collide.
+        # Recurse so llm4ad-mode nested modules (algorithms/<algo>/<algo>.py)
+        # are packaged too — a flat glob dropped them, leaving a code package
+        # whose main.py imported a missing algorithm. Keep each file's path
+        # relative to the experiment root so same-named files in different
+        # subdirs don't collide.
+        #
+        # Data files ship as well: the README tells the reader to run
+        # `python main.py`, and instance files under data/ are generated once
+        # and then read-only, so a .py-only package cannot run at all.
         exp_root = Path(exp_final_dir_path)
-        for src in sorted(exp_root.rglob("*.py")):
+        for src in sorted(exp_root.rglob("*")):
+            if not src.is_file():
+                continue
             rel = src.relative_to(exp_root)
+            if any(p == "__pycache__" or p.startswith(".") for p in rel.parts):
+                continue
             dst = code_dir / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(src.read_bytes())
-            all_code_combined += src.read_text(encoding="utf-8") + "\n"
+            # Only Python feeds the dependency scan below — it parses the files
+            # as one concatenated module, so JSON/Markdown would break it.
+            if src.suffix == ".py":
+                all_code_combined += src.read_text(encoding="utf-8") + "\n"
             code_file_names.append(rel.as_posix())
 
         # Detect dependencies from all files

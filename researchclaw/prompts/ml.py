@@ -189,6 +189,7 @@ _DEFAULT_STAGES: dict[str, dict[str, Any]] = {
             "- Add a 'Benchmark' subsection listing: name, source, and typical "
             "metrics — omit unverified performance numbers."
         ),
+        "max_tokens": 8192,
     },
     "problem_decompose": {
         "system": "You are a senior research strategist.",
@@ -200,9 +201,13 @@ _DEFAULT_STAGES: dict[str, dict[str, Any]] = {
             "Ranking, Risks.\n"
             "Goal context:\n{goal_text}"
         ),
+        "max_tokens": 8192,
     },
     # ── Phase B: Literature Discovery ────────────────────────────────────
     "search_strategy": {
+        # Fixed-schema output: a reasoning pass buys nothing here and
+        # can eat the whole token budget before any visible output.
+        "reasoning": False,
         "system": (
             "You design literature retrieval strategies and source verification plans."
         ),
@@ -249,8 +254,12 @@ _DEFAULT_STAGES: dict[str, dict[str, Any]] = {
             "Problem tree:\n{problem_tree}"
         ),
         "json_mode": True,
+        "max_tokens": 8192,
     },
     "literature_collect": {
+        # Fixed-schema output: a reasoning pass buys nothing here and
+        # can eat the whole token budget before any visible output.
+        "reasoning": False,
         "system": "You are a literature mining assistant.",
         "user": (
             "Generate candidate papers from the search plan.\n"
@@ -261,8 +270,12 @@ _DEFAULT_STAGES: dict[str, dict[str, Any]] = {
             "Search plan:\n{plan_text}"
         ),
         "json_mode": True,
+        "max_tokens": 8192,
     },
     "literature_screen": {
+        # Fixed-schema output: a reasoning pass buys nothing here and
+        # can eat the whole token budget before any visible output.
+        "reasoning": False,
         "system": (
             "You are a strict domain-aware reviewer with zero tolerance for "
             "cross-domain false positives. You MUST reject papers that are "
@@ -301,8 +314,12 @@ _DEFAULT_STAGES: dict[str, dict[str, Any]] = {
             "Candidates JSONL:\n{candidates_text}"
         ),
         "json_mode": True,
+        "max_tokens": 8192,
     },
     "knowledge_extract": {
+        # Fixed-schema output: a reasoning pass buys nothing here and
+        # can eat the whole token budget before any visible output.
+        "reasoning": False,
         "system": "You extract high-signal evidence cards from papers.",
         "user": (
             "Extract structured knowledge cards from shortlist.\n"
@@ -313,6 +330,7 @@ _DEFAULT_STAGES: dict[str, dict[str, Any]] = {
             "Shortlist:\n{shortlist}"
         ),
         "json_mode": True,
+        "max_tokens": 8192,
     },
     # ── Phase C: Knowledge Synthesis ─────────────────────────────────────
     "synthesis": {
@@ -359,9 +377,13 @@ _DEFAULT_STAGES: dict[str, dict[str, Any]] = {
             "{domain_context}"
             "Synthesis:\n{synthesis}"
         ),
+        "max_tokens": 8192,
     },
     # ── Phase D: Experiment Design ───────────────────────────────────────
     "experiment_design": {
+        # Fixed-schema output: a reasoning pass buys nothing here and
+        # can eat the whole token budget before any visible output.
+        "reasoning": False,
         "system": "You are a principal investigator designing rigorous research experiments.",
         "user": (
             "{preamble}\n\n"
@@ -492,6 +514,12 @@ _DEFAULT_STAGES: dict[str, dict[str, Any]] = {
             "stage cannot produce correct implementations.\n\n"
             "Hypotheses:\n{hypotheses}"
         ),
+        # The plan carries eight top-level sections, so it routinely runs past
+        # the 4096-token LLMConfig default this stage used to inherit — the
+        # response was then cut mid-scalar and the whole YAML failed to parse,
+        # which read as "the model emits bad YAML". Matches code_generation's
+        # budget; every other stage this heavy already declares one.
+        "max_tokens": 8192,
     },
     "code_generation": {
         "system": (
@@ -613,6 +641,11 @@ _DEFAULT_STAGES: dict[str, dict[str, Any]] = {
             "accuracy 0-1, discovery rate per episode)\n"
             "  * FORMULA: how the metric is computed from raw experiment outputs\n"
             "  * AGGREGATION: how per-step/per-episode values are reduced to a scalar\n"
+            "- ALSO define a module-level static dict at the top of main.py so downstream "
+            "stages agree on which way is better WITHOUT running your code:\n"
+            "  `METRIC_DEF = {\"primary_metric\": \"{metric}\", \"direction\": \"<maximize|minimize>\"}`\n"
+            "  Set \"direction\" to \"maximize\" when a LARGER value is better, \"minimize\" when "
+            "a SMALLER value is better. It must match DIRECTION above.\n"
             "- Print this definition at runtime: `METRIC_DEF: {metric} | direction=<higher/lower> "
             "| desc=<one-line description>`\n"
             "- Without this definition, the metric is UNINTERPRETABLE and the paper cannot "
@@ -847,9 +880,12 @@ _DEFAULT_STAGES: dict[str, dict[str, Any]] = {
             "- Report effect sizes (Cohen's d) alongside p-values\n\n"
             "Experiment plan:\n{exp_plan}"
         ),
-        "max_tokens": 8192,
+        "max_tokens": 16384,
     },
     "resource_planning": {
+        # Fixed-schema output: a reasoning pass buys nothing here and
+        # can eat the whole token budget before any visible output.
+        "reasoning": False,
         "system": "You are an experiment scheduler.",
         "user": (
             "Create schedule JSON with GPU/time estimates.\n"
@@ -858,6 +894,7 @@ _DEFAULT_STAGES: dict[str, dict[str, Any]] = {
             "Experiment plan:\n{exp_plan}"
         ),
         "json_mode": True,
+        "max_tokens": 8192,
     },
     # ── Phase F: Analysis & Decision ─────────────────────────────────────
     "result_analysis": {
@@ -921,6 +958,9 @@ _DEFAULT_STAGES: dict[str, dict[str, Any]] = {
         "max_tokens": 8192,
     },
     "research_decision": {
+        # Fixed-schema output: a reasoning pass buys nothing here and
+        # can eat the whole token budget before any visible output.
+        "reasoning": False,
         "system": "You are a research program lead making go/no-go decisions.",
         "user": (
             "Based on the analysis, make one of three decisions:\n"
@@ -945,6 +985,7 @@ _DEFAULT_STAGES: dict[str, dict[str, Any]] = {
             "Concrete steps for the chosen path.\n\n"
             "Analysis:\n{analysis}"
         ),
+        "max_tokens": 8192,
     },
     # ── Phase G: Paper Writing ───────────────────────────────────────────
     "paper_outline": {
@@ -1189,6 +1230,9 @@ _DEFAULT_STAGES: dict[str, dict[str, Any]] = {
     },
     # ── Phase H: Finalization ────────────────────────────────────────────
     "quality_gate": {
+        # Fixed-schema output: a reasoning pass buys nothing here and
+        # can eat the whole token budget before any visible output.
+        "reasoning": False,
         "system": "You are a final quality gate evaluator.",
         "user": (
             "Evaluate revised paper quality and return JSON.\n"
@@ -1198,6 +1242,7 @@ _DEFAULT_STAGES: dict[str, dict[str, Any]] = {
             "Paper:\n{revised}"
         ),
         "json_mode": True,
+        "max_tokens": 8192,
     },
     "knowledge_archive": {
         "system": "You produce reproducibility-focused research retrospectives.",

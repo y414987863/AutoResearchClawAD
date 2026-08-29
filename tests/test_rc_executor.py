@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import yaml
 
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
@@ -1400,6 +1401,295 @@ class TestExperimentDesignGuard:
         assert set(meta["missing_required_keys"]) == {
             "baselines", "proposed_methods", "ablations",
         }
+
+
+class _ScriptedPlanLLM(FakeLLMClient):
+    """Returns each queued response in turn and records the prompts it saw."""
+
+    def __init__(self, *responses: str) -> None:
+        super().__init__(responses[0])
+        self._responses = list(responses)
+
+    def chat(self, messages: list[dict[str, str]], **kwargs: object):
+        _ = kwargs
+        self.calls.append(messages)
+        from researchclaw.llm.client import LLMResponse
+
+        idx = min(len(self.calls) - 1, len(self._responses) - 1)
+        return LLMResponse(content=self._responses[idx], model="fake-model")
+
+    def user_text(self, call_index: int) -> str:
+        return " ".join(
+            m.get("content", "") for m in self.calls[call_index]
+        )
+
+
+_GOOD_PLAN = (
+    "baselines:\n  - name: B1\nproposed_methods:\n  - name: P1\n"
+    "ablations:\n  - name: A1\ndatasets:\n  - synthetic\n"
+    "metrics:\n  - rmse\nobjectives:\n  - measure it\n"
+    "risks:\n  - none\ncompute_budget: 1 CPU-hour\n"
+)
+# Unrecoverable on purpose: an unterminated flow sequence, which the repair
+# loop declines to rewrite rather than risk corrupting the document.
+_UNPARSEABLE_PLAN = "baselines: [unterminated\n  proposed_methods: also broken\n"
+
+
+class TestPlanParseRetryLadder:
+    """A parse failure must not immediately cost the prompt's context.
+
+    The only retry Stage 9 had was a 122-token generic prompt that dropped the
+    hypotheses, the literature, the metric definitions and the real compute
+    budget — so a response that was complete and on-topic, and merely written
+    with bad YAML syntax, still produced a context-free plan. Re-asking the
+    same prompt comes first now; the stripped prompt stays as the later rung.
+    """
+
+    def test_reask_uses_the_original_prompt_and_wins_before_the_strict_one(
+        self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle
+    ) -> None:
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        stage_dir = run_dir / "stage-09"
+        stage_dir.mkdir(parents=True)
+        llm = _ScriptedPlanLLM(_UNPARSEABLE_PLAN, _GOOD_PLAN)
+
+        rc_executor._execute_experiment_design(
+            stage_dir, run_dir, rc_config, adapters, llm=llm
+        )
+
+        assert len(llm.calls) == 2, "the strict prompt should not be reached"
+        first, second = llm.user_text(0), llm.user_text(1)
+        # The re-ask carries the whole original prompt, not a stripped one.
+        assert len(second) > len(first)
+        assert "could not be parsed as YAML" in second
+        # And it says what actually broke, so the retry is corrective.
+        assert "numbered list" in second
+
+    def test_strict_prompt_still_runs_when_the_reask_also_fails(
+        self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle
+    ) -> None:
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        stage_dir = run_dir / "stage-09"
+        stage_dir.mkdir(parents=True)
+        llm = _ScriptedPlanLLM(
+            _UNPARSEABLE_PLAN, _UNPARSEABLE_PLAN, _GOOD_PLAN
+        )
+
+        rc_executor._execute_experiment_design(
+            stage_dir, run_dir, rc_config, adapters, llm=llm
+        )
+
+        assert len(llm.calls) == 3
+        assert "Output ONLY valid YAML" in llm.user_text(2)
+
+    def test_a_parseable_response_never_triggers_a_second_call(
+        self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle
+    ) -> None:
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        stage_dir = run_dir / "stage-09"
+        stage_dir.mkdir(parents=True)
+        llm = _ScriptedPlanLLM(_GOOD_PLAN)
+
+        rc_executor._execute_experiment_design(
+            stage_dir, run_dir, rc_config, adapters, llm=llm
+        )
+
+        assert len(llm.calls) == 1
+
+    def test_reask_is_skipped_when_the_response_was_empty(
+        self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle
+    ) -> None:
+        """Nothing to correct and no diagnosis to hand back — re-asking the
+        same prompt would just reproduce the empty body. The empty-response
+        retry in ``_chat_with_prompt`` owns that case."""
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        stage_dir = run_dir / "stage-09"
+        stage_dir.mkdir(parents=True)
+        llm = _ScriptedPlanLLM("", _GOOD_PLAN)
+
+        rc_executor._execute_experiment_design(
+            stage_dir, run_dir, rc_config, adapters, llm=llm
+        )
+
+        assert "Output ONLY valid YAML" in llm.user_text(1)
+
+
+class TestPlanResponseParsing:
+    """The three ways a plan is pulled out of a response, folded into one
+    helper so the main call, the re-ask and the strict retry cannot drift."""
+
+    def test_reads_a_fenced_block(self) -> None:
+        from researchclaw.pipeline.stage_impls._experiment_design import (
+            _parse_plan_response,
+        )
+        assert _parse_plan_response(
+            f"Here is the plan:\n```yaml\n{_GOOD_PLAN}```\n"
+        )["datasets"] == ["synthetic"]
+
+    def test_reads_bare_yaml_with_no_fences(self) -> None:
+        from researchclaw.pipeline.stage_impls._experiment_design import (
+            _parse_plan_response,
+        )
+        assert _parse_plan_response(_GOOD_PLAN)["metrics"] == ["rmse"]
+
+    def test_scans_past_leading_prose(self) -> None:
+        from researchclaw.pipeline.stage_impls._experiment_design import (
+            _parse_plan_response,
+        )
+        noisy = "**Plan follows.**\nSome prose: with a colon.\n\n" + _GOOD_PLAN
+        assert _parse_plan_response(noisy)["baselines"] == [{"name": "B1"}]
+
+    def test_returns_none_when_nothing_parses(self) -> None:
+        from researchclaw.pipeline.stage_impls._experiment_design import (
+            _parse_plan_response,
+        )
+        assert _parse_plan_response("I cannot help with that.") is None
+
+
+class TestYamlRecovery:
+    """Stage 9 threw away complete plans over a single bad scalar.
+
+    `yaml.safe_load` is all-or-nothing, so one unquotable value (a math norm,
+    a markdown bold, a bare `:`) discarded the whole plan and the stage fell
+    back to a generic template — silently, with only a warning logged.
+    """
+
+    def test_recovers_norm_notation(self) -> None:
+        # `||x||` opens with the YAML block-scalar indicator and is the exact
+        # failure seen in a real stage-09 plan.
+        from researchclaw.pipeline._helpers import _safe_load_yaml
+        text = "metrics:\n  - distance: ||x_best - x*||_2\n"
+        assert _safe_load_yaml(text) == {
+            "metrics": [{"distance": "||x_best - x*||_2"}]
+        }
+
+    def test_recovers_bare_list_item(self) -> None:
+        from researchclaw.pipeline._helpers import _safe_load_yaml
+        assert _safe_load_yaml("metrics:\n  - ||x - x*||_2\n") == {
+            "metrics": ["||x - x*||_2"]
+        }
+
+    def test_preserves_valid_yaml_untouched(self) -> None:
+        # The repair must never rewrite a document that already parses —
+        # block scalars, flow collections and multi-line quoted scalars are
+        # all valid structure that a whole-document rewrite would corrupt.
+        from researchclaw.pipeline._helpers import _safe_load_yaml
+        text = (
+            "desc: |\n  line one\n  line two\n"
+            "keys: [a, b]\n"
+            "hp: {lr: 0.01}\n"
+            "note: 'starts here\n  and continues.'\n"
+        )
+        assert _safe_load_yaml(text) == yaml.safe_load(text)
+
+    def test_unrecoverable_returns_none(self) -> None:
+        from researchclaw.pipeline._helpers import _safe_load_yaml
+        assert _safe_load_yaml("") is None
+
+    def test_recovers_markdown_numbered_list_under_a_key(self) -> None:
+        """The exact shape of a real stage-09 failure.
+
+        `algorithm_steps:` declared no value, so the numbered lines became one
+        plain multi-line scalar and the `:` in step 3 raised "mapping values
+        are not allowed here". Quoting that value cannot help — the line is a
+        mapping inside a scalar either way — so the line-driven repair loop
+        burned its budget without progress and the whole plan was discarded.
+        """
+        from researchclaw.pipeline._helpers import _safe_load_yaml
+        text = (
+            "baselines:\n"
+            "  - name: Ledoit_Wolf\n"
+            "    implementation_spec:\n"
+            "      algorithm_steps:\n"
+            "        1. Compute sample covariance matrix\n"
+            "        2. Estimate optimal shrinkage intensity\n"
+            "        3. Shrink toward identity: S = d * I + (1-d) * C\n"
+            "        4. Extract eigenvalues\n"
+        )
+        parsed = _safe_load_yaml(text)
+        steps = parsed["baselines"][0]["implementation_spec"]["algorithm_steps"]
+        assert steps == [
+            "1. Compute sample covariance matrix",
+            "2. Estimate optimal shrinkage intensity",
+            "3. Shrink toward identity: S = d * I + (1-d) * C",
+            "4. Extract eigenvalues",
+        ]
+
+    def test_numbered_list_inside_a_block_scalar_stays_literal(self) -> None:
+        """A `|` scalar means "this text is the value" — a numbered list there
+        is prose the author wrote on purpose, not a malformed sequence.
+
+        The norm on the first line is what forces the recovery path; without an
+        actual parse error the document returns before normalisation and the
+        guard is never exercised.
+        """
+        from researchclaw.pipeline._helpers import _safe_load_yaml
+        text = (
+            "metric: ||x - x*||_2\n"
+            "protocol: |\n"
+            "  1. Fit the model\n"
+            "  2. Score it: report RMSE\n"
+        )
+        assert _safe_load_yaml(text)["protocol"] == (
+            "1. Fit the model\n2. Score it: report RMSE\n"
+        )
+
+    def test_a_numbered_list_that_is_already_a_sequence_is_left_alone(self) -> None:
+        from researchclaw.pipeline._helpers import _safe_load_yaml
+        text = "steps:\n  - 1. already a list item\n  - 2. and so is this\n"
+        assert _safe_load_yaml(text) == yaml.safe_load(text)
+
+    def test_numbered_list_after_a_key_that_has_a_value_is_not_rewritten(self) -> None:
+        """Only a key with an *empty* value is waiting for a list. A version
+        string or an ordinal continuing a real scalar must not be folded into
+        a sequence — that would change the parsed type under the caller."""
+        from researchclaw.pipeline._helpers import _safe_load_yaml
+        text = "metric: ||x - x*||_2\nversion: 1. release candidate\n"
+        assert _safe_load_yaml(text)["version"] == "1. release candidate"
+
+    def test_unwraps_container_key(self) -> None:
+        # Models wrap the plan in `experiment_plan:` even when asked for a
+        # flat mapping; that pushed every required key one level down and
+        # paused the pipeline on a plan that was actually complete.
+        from researchclaw.pipeline.stage_impls._experiment_design import _unwrap_plan
+        wrapped = {"experiment_plan": {"baselines": ["nm"], "ablations": ["a"]}}
+        assert _unwrap_plan(wrapped) == {"baselines": ["nm"], "ablations": ["a"]}
+
+    def test_does_not_unwrap_unknown_single_key(self) -> None:
+        from researchclaw.pipeline.stage_impls._experiment_design import _unwrap_plan
+        plan = {"baselines": ["nm"]}
+        assert _unwrap_plan(plan) == plan
+
+    def test_wrapped_plan_no_longer_pauses(
+        self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle
+    ) -> None:
+        # End-to-end: a fenced, wrapped plan carrying a norm value used to
+        # pause the stage as schema-deficient. It must now produce a plan.
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        stage_dir = run_dir / "stage-09"
+        stage_dir.mkdir(parents=True)
+        _write_prior_artifact(run_dir, 8, "hypotheses.md", "# Hypotheses\n")
+        fake_llm = FakeLLMClient(
+            "```yaml\n"
+            "experiment_plan:\n"
+            "  baselines:\n    - nelder_mead\n"
+            "  proposed_methods:\n    - aada\n"
+            "  ablations:\n    - no_priors\n"
+            "  metrics:\n    - dist: ||x_best - x*||_2\n"
+            "```"
+        )
+        result = rc_executor._execute_experiment_design(
+            stage_dir, run_dir, rc_config, adapters, llm=fake_llm
+        )
+        assert result.status == StageStatus.DONE
+        plan = yaml.safe_load((stage_dir / "exp_plan.yaml").read_text(encoding="utf-8"))
+        assert plan["baselines"] == ["nelder_mead"]
+        assert plan["proposed_methods"] == ["aada"]
 
 
 class TestResourcePlanningFallback:

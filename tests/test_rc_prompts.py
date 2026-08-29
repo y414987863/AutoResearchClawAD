@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 from researchclaw.prompts import (
+    SUPPORTED_DOMAINS,
     PromptManager,
     RenderedPrompt,
     _render,
@@ -149,9 +150,32 @@ class TestPromptManagerDefaults:
 
     def test_max_tokens(self) -> None:
         pm = PromptManager()
-        assert pm.max_tokens("code_generation") == 8192
+        assert pm.max_tokens("code_generation") == 16384
         assert pm.max_tokens("paper_draft") == 16384
-        assert pm.max_tokens("topic_init") is None
+        assert pm.max_tokens("topic_init") == 8192
+
+    def test_every_stage_declares_a_token_budget(self) -> None:
+        """No stage may fall through to the client's 4096 default.
+
+        A stage left at ``None`` silently inherits ``LLMConfig.max_tokens``,
+        which is small enough to truncate a long answer mid-token. The failure
+        looks like the model emitting malformed output, so it is worth pinning
+        the invariant rather than the individual numbers.
+        """
+        for domain in SUPPORTED_DOMAINS:
+            pm = PromptManager(domain=domain)
+            missing = [s for s in pm.stage_names() if pm.max_tokens(s) is None]
+            assert not missing, f"{domain}: stages without a budget: {missing}"
+
+    def test_sub_prompt_carries_json_mode_and_max_tokens(self) -> None:
+        """``sub_prompt`` used to drop both, pinning every sub-prompt to 4096."""
+        pm = PromptManager()
+        rp = pm.sub_prompt(
+            "code_exec_fix", stderr="boom", all_files_ctx="", traceback_tail=""
+        )
+        assert rp.max_tokens == 16384
+        assert pm.sub_prompt("code_reviewer", topic="t", exp_plan="p",
+                             metric="m", files_context="").json_mode is True
 
     def test_block_topic_constraint(self) -> None:
         pm = PromptManager()
@@ -332,3 +356,63 @@ class TestRenderedPrompt:
         rp = RenderedPrompt(system="s", user="u")
         with pytest.raises(AttributeError):
             rp.system = "modified"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Per-stage reasoning control
+# ---------------------------------------------------------------------------
+
+
+class TestStageReasoning:
+    """Reasoning is turned off only for stages that emit a fixed schema.
+
+    Those stages fill in a known set of YAML/JSON keys; a long reasoning pass
+    buys nothing there and can consume the whole token budget before any
+    visible output. Generative stages keep it — that is where reasoning
+    actually changes the result.
+    """
+
+    SCHEMA_STAGES = {
+        "experiment_design",
+        "knowledge_extract",
+        "literature_collect",
+        "literature_screen",
+        "quality_gate",
+        "research_decision",
+        "resource_planning",
+        "search_strategy",
+    }
+    GENERATIVE_STAGES = {
+        "code_generation",
+        "hypothesis_gen",
+        "paper_draft",
+        "paper_outline",
+        "paper_revision",
+        "result_analysis",
+        "synthesis",
+        "topic_init",
+    }
+
+    def test_schema_stages_disable_reasoning_in_every_domain(self) -> None:
+        for domain in SUPPORTED_DOMAINS:
+            pm = PromptManager(domain=domain)
+            for stage in self.SCHEMA_STAGES:
+                assert pm.reasoning(stage) is False, f"{domain}/{stage}"
+
+    def test_generative_stages_leave_the_provider_default_alone(self) -> None:
+        """None, not True: we never force reasoning on, we only decline to
+        turn it off. A provider without a reasoning mode is unaffected."""
+        for domain in SUPPORTED_DOMAINS:
+            pm = PromptManager(domain=domain)
+            for stage in self.GENERATIVE_STAGES:
+                assert pm.reasoning(stage) is None, f"{domain}/{stage}"
+
+    def test_for_stage_carries_the_flag(self) -> None:
+        pm = PromptManager()
+        sp = pm.for_stage(
+            "experiment_design",
+            topic="t", hypotheses="h", preamble="", domain_context="",
+            dataset_guidance="", hardware_profile="", evolution_overlay="",
+            per_condition_budget_sec="60", available_tier1_datasets="",
+        )
+        assert sp.reasoning is False

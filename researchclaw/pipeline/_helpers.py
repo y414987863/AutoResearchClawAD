@@ -7,7 +7,7 @@ import json
 import logging
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -492,6 +492,76 @@ def _read_prior_artifact(run_dir: Path, filename: str) -> str | None:
     return None
 
 
+# The generated experiment declares which way its primary metric is judged, in
+# either the static dict (preferred — readable without running the code) or the
+# runtime line it prints. The dict pattern stays inside one brace pair
+# (``[^}]*``, which already spans newlines) rather than using a lazy ``.*?``:
+# the lazy form walks past a METRIC_DEF that omits ``direction`` and latches
+# onto the next unrelated dict that happens to have one.
+_METRIC_DIRECTION_DICT_RE = re.compile(
+    r'METRIC_DEF\s*=\s*\{[^}]*"direction"\s*:\s*"(maximize|minimize)"',
+    re.IGNORECASE,
+)
+_METRIC_DIRECTION_PRINT_RE = re.compile(
+    r"METRIC_DEF\s*:.*?direction\s*=\s*(higher|lower)", re.IGNORECASE
+)
+
+
+def correct_metric_direction(run_dir: Path, config: RCConfig) -> RCConfig:
+    """Return ``config`` with the direction the generated experiment declares.
+
+    Returns ``config`` unchanged when no experiment has been generated yet or it
+    declares nothing. Called once per stage from the pipeline loop, so every
+    stage after code generation reads a corrected value through the ordinary
+    ``config.experiment.metric_direction`` and needs no lookup of its own.
+
+    ``metric_direction`` in the config is a template default (``minimize``) that
+    nobody judged against the metric the model actually generated. In the
+    rc_full3 run that made promote read ``valid_prediction_time`` (``max(0,
+    baseline - corrected)``, larger is better) as lower-is-better and ship a
+    regression as a -100% "improvement". The code computing the metric is the
+    only thing that knows which way is better, so its declaration wins.
+    """
+    exp_dir = _read_prior_artifact(run_dir, "experiment/")
+    if not (exp_dir and Path(exp_dir).is_dir()):
+        return config
+
+    declared = ""
+    for name in ("evaluator.py", "main.py"):
+        try:
+            # errors="replace": a model-generated file with one stray byte must
+            # not raise UnicodeDecodeError here — this runs before every stage,
+            # so an uncaught decode error would kill the whole run.
+            text = (Path(exp_dir) / name).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            continue
+        m = _METRIC_DIRECTION_DICT_RE.search(text)
+        if m:
+            declared = m.group(1).lower()
+            break
+        m = _METRIC_DIRECTION_PRINT_RE.search(text)
+        if m:
+            declared = "maximize" if m.group(1).lower() == "higher" else "minimize"
+            break
+
+    current = str(getattr(config.experiment, "metric_direction", "") or "").lower()
+    if not declared or declared == current:
+        return config
+
+    logger.warning(
+        "Metric direction corrected: config says %r but the generated experiment "
+        "declares %r for metric %r. Using %r — the code that computes the metric "
+        "is authoritative. Set experiment.metric_direction=%r in the config to "
+        "silence this.",
+        current, declared, config.experiment.metric_key, declared, declared,
+    )
+    return replace(
+        config, experiment=replace(config.experiment, metric_direction=declared)
+    )
+
+
 def _find_prior_file(run_dir: Path, filename: str) -> Path | None:
     """Like ``_read_prior_artifact`` but returns the *Path* instead of content."""
     def _stage_sort_key(p: Path) -> tuple[str, int]:
@@ -577,6 +647,221 @@ def _extract_yaml_block(text: str) -> str:
         return "\n".join(yaml_lines).strip()
 
     return text.strip()
+
+
+_YAML_BLOCK_HEADER_RE = re.compile(r"^[|>][+-]?\d*\s*$")
+_YAML_KEY_SEP_RE = re.compile(r":(?:\s|$)")
+
+
+def _repair_yaml_line(line: str) -> str | None:
+    """Quote the scalar value on ``line`` so PyYAML stops rejecting it.
+
+    Models routinely emit values that open with a YAML indicator character —
+    ``||x - x*||_2`` (a norm), ``**bold**``, ``*.py``, ``> 0.5`` — or that
+    carry a bare ``:`` inside the value.  Wrapping the value in double quotes
+    makes it a plain string without changing what it says.
+
+    Returns None when there is nothing safe to rewrite, which tells the caller
+    to give up rather than risk corrupting the document.
+    """
+    stripped = line.lstrip()
+    if not stripped or stripped.startswith(("#", "---", "...")):
+        return None
+    indent = line[: len(line) - len(stripped)]
+
+    prefix = ""
+    inner = stripped
+    while inner.startswith("- "):
+        prefix += "- "
+        inner = inner[2:]
+    if not inner:
+        return None
+
+    if inner[0] in "{[":
+        # A flow collection (``- {lr: 0.01}``) is valid structure. Bailing out
+        # before the key split matters: the split would otherwise cut at the
+        # ``:`` *inside* the braces and quote the fragment, turning
+        # ``- {a: 1}`` into ``- {a: "1}"``. The ``value[0] in "{["`` guard
+        # further down cannot catch this — after the split the value is ``1}``.
+        return None
+
+    match = _YAML_KEY_SEP_RE.search(inner)
+    if match and inner[0] not in "'\"":
+        key = inner[: match.start() + 1]
+        value = inner[match.end():].strip()
+    else:
+        # A bare list item (``- ||x||``): the whole entry is the value.  A
+        # quoted scalar is left alone — any ``:`` inside it is part of the
+        # string, not a key separator.
+        if not prefix or inner[0] in "'\"":
+            return None
+        key = ""
+        value = inner
+
+    # Leave real block scalars (``key: |``) and flow collections
+    # (``[a, b]`` / ``{lr: 0.01}``) alone — those are valid structure.
+    if not value or _YAML_BLOCK_HEADER_RE.match(value) or value[0] in "{[":
+        return None
+
+    cleaned = value.strip("\"'").replace("\\", "\\\\").replace('"', '\\"')
+    if not cleaned:
+        return None
+    separator = f"{key} " if key else ""
+    return f'{indent}{prefix}{separator}"{cleaned}"'
+
+
+def _describe_yaml_failure(text: str) -> str:
+    """Return a one-line diagnosis of why ``text`` did not yield a plan.
+
+    ``_safe_load_yaml`` swallows the parser error so callers can fall back, but
+    that leaves the failure log unable to tell a stray colon in one scalar from
+    a truncated response — and the document is often 14 KB, so "first 200
+    chars" shows nothing about the actual defect. This re-parses on the failure
+    path only, and reports the parser's own position plus the offending line.
+
+    Also distinguishes the case where YAML parsed *fine* but produced a list or
+    a string, which the caller rejects for a different reason entirely.
+    """
+    if not text or not text.strip():
+        return "empty content"
+    try:
+        parsed = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None) or getattr(
+            exc, "context_mark", None
+        )
+        problem = getattr(exc, "problem", None) or str(exc).splitlines()[0]
+        if mark is None:
+            return str(problem)
+        lines = text.split("\n")
+        src = (
+            lines[mark.line].strip()
+            if 0 <= mark.line < len(lines)
+            else "<line out of range>"
+        )
+        return "%s at line %d col %d: %r" % (
+            problem, mark.line + 1, mark.column + 1, src[:160],
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}"
+    return (
+        f"valid YAML but top level is {type(parsed).__name__}, not a mapping"
+    )
+
+
+_YAML_NUMBERED_ITEM_RE = re.compile(r"^(\s*)(\d+[.)])(\s+)(\S.*)$")
+_YAML_EMPTY_VALUE_KEY_RE = re.compile(
+    r"^\s*(?:-\s+)?(?:[^\s:#][^:]*|\"[^\"]*\"|'[^']*'):\s*$"
+)
+_YAML_BLOCK_SCALAR_RE = re.compile(r":\s*[|>][+-]?\d*\s*$")
+
+
+def _normalize_markdown_lists(text: str) -> str:
+    """Turn markdown numbered lists back into YAML sequences.
+
+    Models routinely answer a key that wants a list with the prose form they
+    were trained on::
+
+        algorithm_steps:
+          1. Compute sample covariance matrix
+          2. Estimate optimal shrinkage intensity
+          3. Shrink toward identity: Sigma = d * I + (1-d) * S
+
+    YAML reads that as one plain multi-line scalar, so the ``:`` on the third
+    line raises "mapping values are not allowed here". ``_repair_yaml_line``
+    cannot help: quoting the value leaves the line a mapping inside a scalar
+    and the parser fails at the same spot, so the repair loop spends its budget
+    without progress. An observed Stage 9 response carried 20 such lines across
+    5 blocks — past ``max_repairs`` even if each one had been fixable.
+
+    Conversion is deliberately narrow. A line is rewritten only when it is
+    indented under a key that declared no value, or continues a run already
+    being rewritten, and never inside a ``|``/``>`` block scalar where a
+    numbered list is intended as literal text. The number is kept in the string
+    because the ordering it encodes is part of the content.
+    """
+    out: list[str] = []
+    block_indent: int | None = None  # inside a |/> scalar started at this indent
+    key_indent: int | None = None  # nearest key that declared an empty value
+    run_indent: int | None = None  # indent of the run currently being rewritten
+
+    for line in text.split("\n"):
+        indent = len(line) - len(line.lstrip())
+        if block_indent is not None:
+            if line.strip() and indent > block_indent:
+                out.append(line)
+                continue
+            block_indent = None
+        if _YAML_BLOCK_SCALAR_RE.search(line):
+            block_indent, key_indent, run_indent = indent, None, None
+            out.append(line)
+            continue
+
+        match = _YAML_NUMBERED_ITEM_RE.match(line)
+        if match and (
+            run_indent == indent
+            or (key_indent is not None and indent > key_indent)
+        ):
+            prefix, number, _, rest = match.groups()
+            body = f"{number} {rest}".replace("\\", "\\\\").replace('"', '\\"')
+            out.append(f'{prefix}- "{body}"')
+            run_indent = indent
+            continue
+
+        run_indent = None
+        if line.strip():
+            key_indent = (
+                indent if _YAML_EMPTY_VALUE_KEY_RE.match(line) else None
+            )
+        out.append(line)
+    return "\n".join(out)
+
+
+def _safe_load_yaml(text: str, max_repairs: int = 12) -> Any:
+    """Parse YAML, repairing only the lines the parser actually rejects.
+
+    ``yaml.safe_load`` is all-or-nothing: one bad scalar discards an otherwise
+    complete document.  For LLM output that means a well-formed experiment plan
+    can be thrown away over a single character, and the caller silently falls
+    back to a generic template.
+
+    Repairs are driven by the parser's own error position, so valid content is
+    never rewritten — whole-document rewriting is not safe here, because it
+    mistakes multi-line quoted scalars for unterminated quotes.  Returns None
+    when the document cannot be recovered.
+    """
+    if not text or not text.strip():
+        return None
+    try:
+        return yaml.safe_load(text)
+    except yaml.YAMLError:
+        pass
+
+    # Tabs are never legal YAML indentation, but models emit them anyway.
+    lines = [
+        re.sub(r"^\t+", lambda m: "  " * len(m.group()), ln)
+        for ln in text.split("\n")
+    ]
+    # Markdown numbered lists defeat the line-driven repair below, so fold them
+    # into sequences first. Failure path only: a document that already parsed
+    # returned above and is never touched.
+    lines = _normalize_markdown_lists("\n".join(lines)).split("\n")
+    repaired: set[int] = set()
+    for _ in range(max_repairs):
+        try:
+            return yaml.safe_load("\n".join(lines))
+        except yaml.YAMLError as exc:
+            mark = getattr(exc, "problem_mark", None) or getattr(
+                exc, "context_mark", None
+            )
+            if mark is None or mark.line >= len(lines) or mark.line in repaired:
+                return None
+            repaired.add(mark.line)
+            fixed = _repair_yaml_line(lines[mark.line])
+            if fixed is None or fixed == lines[mark.line]:
+                return None
+            lines[mark.line] = fixed
+    return None
 
 
 def _safe_json_loads(text: str, default: Any) -> Any:
@@ -865,6 +1150,74 @@ def _parse_metrics_from_stdout(stdout: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _retry_empty_reasoning_response(
+    llm: LLMClient,
+    resp: Any,
+    messages: list[dict[str, str]],
+    *,
+    system: str,
+    json_mode: bool,
+    max_tokens: int | None,
+    strip_thinking: bool,
+    reasoning: bool | None,
+) -> Any:
+    """Re-ask once when a reasoning model burned its whole budget thinking.
+
+    A reasoning model counts its hidden reasoning against ``max_tokens``. When
+    the prompt is long and the budget is tight it can hit the ceiling before
+    emitting a single visible token, and the provider returns HTTP 200 with an
+    empty body and ``finish_reason="length"`` — not an error, so nothing
+    upstream retries. The stage then falls back to a much weaker path: Stage 9
+    collapsed a 6767-token design prompt to a 122-token generic one, losing the
+    hypotheses, the literature and the real compute budget.
+
+    Retrying the *same* prompt with the reasoning pass disabled and double the
+    budget keeps the full context, which is the part that actually determines
+    plan quality. Returns None when this does not apply, so the caller keeps
+    the original response.
+    """
+    if (getattr(resp, "content", "") or "").strip():
+        return None
+    if str(getattr(resp, "finish_reason", "")).lower() != "length":
+        return None
+
+    _retry_max = (max_tokens or 4096) * 2
+    logger.warning(
+        "LLM returned an empty body with finish_reason=length "
+        "(completion_tokens=%s, max_tokens=%s) — the reasoning pass consumed "
+        "the budget. Re-asking the same prompt with reasoning off and "
+        "max_tokens=%d.",
+        getattr(resp, "completion_tokens", "?"),
+        max_tokens,
+        _retry_max,
+    )
+    try:
+        retry = llm.chat(
+            messages,
+            system=system,
+            json_mode=json_mode,
+            max_tokens=_retry_max,
+            strip_thinking=strip_thinking,
+            reasoning=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Best-effort salvage: the caller still has the (empty) original and
+        # its own fallbacks. Turning this into a raise would make a recoverable
+        # stage fail outright.
+        logger.warning("Empty-response retry failed: %s", exc)
+        return None
+    if not (getattr(retry, "content", "") or "").strip():
+        logger.warning(
+            "Empty-response retry also returned nothing (finish_reason=%s). "
+            "Set llm.reasoning_off_params for this provider — without it the "
+            "retry only raises the budget.",
+            getattr(retry, "finish_reason", "?"),
+        )
+        return None
+    logger.info("Empty-response retry recovered %d chars.", len(retry.content))
+    return retry
+
+
 def _chat_with_prompt(
     llm: LLMClient,
     system: str,
@@ -874,6 +1227,7 @@ def _chat_with_prompt(
     max_tokens: int | None = None,
     retries: int = 0,
     strip_thinking: bool = True,
+    reasoning: bool | None = None,
 ) -> Any:
     """Send a chat request with optional retry on timeout/transient errors.
 
@@ -886,6 +1240,9 @@ def _chat_with_prompt(
         If True (default for pipeline usage), strip ``<think>`` tags from
         the LLM response.  This prevents chain-of-thought leakage from
         breaking YAML / JSON / LaTeX parsers downstream.
+    reasoning:
+        ``False`` asks the provider to skip its reasoning pass. Only worth
+        setting for fixed-schema output; see ``LlmConfig.reasoning_off_params``.
     """
     import time
 
@@ -894,13 +1251,25 @@ def _chat_with_prompt(
     _effective_json_mode = json_mode
     for attempt in range(1 + retries):
         try:
-            if _effective_json_mode and max_tokens is not None:
-                return llm.chat(messages, system=system, json_mode=True, max_tokens=max_tokens, strip_thinking=strip_thinking)
-            if _effective_json_mode:
-                return llm.chat(messages, system=system, json_mode=True, strip_thinking=strip_thinking)
-            if max_tokens is not None:
-                return llm.chat(messages, system=system, max_tokens=max_tokens, strip_thinking=strip_thinking)
-            return llm.chat(messages, system=system, strip_thinking=strip_thinking)
+            resp = llm.chat(
+                messages,
+                system=system,
+                json_mode=_effective_json_mode,
+                max_tokens=max_tokens,
+                strip_thinking=strip_thinking,
+                reasoning=reasoning,
+            )
+            _salvaged = _retry_empty_reasoning_response(
+                llm,
+                resp,
+                messages,
+                system=system,
+                json_mode=_effective_json_mode,
+                max_tokens=max_tokens,
+                strip_thinking=strip_thinking,
+                reasoning=reasoning,
+            )
+            return _salvaged if _salvaged is not None else resp
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             # Auto-disable json_mode on HTTP 400 — likely provider incompatibility
@@ -1858,6 +2227,7 @@ def _synthesize_perspectives(
     resp = llm.chat(
         [{"role": "user", "content": sp.user}],
         system=sp.system,
+        max_tokens=sp.max_tokens,
     )
     return resp.content
 

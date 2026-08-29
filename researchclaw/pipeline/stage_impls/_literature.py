@@ -126,6 +126,7 @@ def _execute_search_strategy(
             sp.user,
             json_mode=sp.json_mode,
             max_tokens=sp.max_tokens,
+            reasoning=sp.reasoning,
         )
         payload = _safe_json_loads(resp.content, {})
         if isinstance(payload, dict):
@@ -496,6 +497,7 @@ def _execute_literature_collect(
             sp.user,
             json_mode=sp.json_mode,
             max_tokens=sp.max_tokens,
+            reasoning=sp.reasoning,
         )
         payload = _safe_json_loads(resp.content, {})
         if isinstance(payload, dict) and isinstance(payload.get("candidates"), list):
@@ -766,6 +768,7 @@ def _execute_literature_screen(
             sp.user,
             json_mode=sp.json_mode,
             max_tokens=sp.max_tokens,
+            reasoning=sp.reasoning,
         )
         payload = _safe_json_loads(resp.content, {})
         raw = payload.get("shortlist") if isinstance(payload, dict) else None
@@ -934,6 +937,7 @@ def _execute_knowledge_extract(
             sp.user,
             json_mode=sp.json_mode,
             max_tokens=sp.max_tokens,
+            reasoning=sp.reasoning,
         )
         payload = _safe_json_loads(resp.content, {})
         if isinstance(payload, dict) and isinstance(payload.get("cards"), list):

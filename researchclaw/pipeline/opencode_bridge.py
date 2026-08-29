@@ -29,6 +29,33 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+def _rmtree_force(path: Path) -> None:
+    """Delete ``path`` including read-only files (git worktrees).
+
+    ``shutil.rmtree(..., ignore_errors=True)`` is not enough here: git marks
+    every object under ``.git/objects`` read-only, so on Windows the unlink
+    raises PermissionError and ``ignore_errors`` swallows it — the tree is left
+    half-deleted with the old git history intact. A resurrected history is worse
+    than no cleanup at all: the next run's ``auto_initialize`` sees the previous
+    snapshot as HEAD. Clearing the read-only bit and retrying is the standard
+    way to remove a git tree on Windows.
+    """
+    import stat as _stat
+
+    def _clear_readonly(func, target, _exc):  # noqa: ANN001 - shutil callback shape
+        try:
+            os.chmod(target, _stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass  # genuinely undeletable (locked by another process)
+
+    try:
+        shutil.rmtree(path, onexc=_clear_readonly)
+    except TypeError:  # Python < 3.12 renamed the hook to onexc
+        shutil.rmtree(path, onerror=_clear_readonly)
+
+
 # ---------------------------------------------------------------------------
 # Complexity scoring
 # ---------------------------------------------------------------------------
@@ -271,8 +298,23 @@ is discarded as a failure. If a detail is unclear, pick a sensible default,
 note it in a comment, and continue.
 
 Your first action must be a tool call that reads TASK.md — never a text reply.
-You are done when main.py and its supporting modules exist and run.
-Writing no files is a failure.
+
+RULE — ONE file per step. Write exactly one file per step, then start the next
+step for the next file. Never emit a whole multi-file project in a single step.
+A single step's output is capped at a hard limit: if a step tries to write more
+than one large file (or one very large file), the tail of that output is
+truncated and you LOSE everything it was writing — the truncated step commits
+no files. This is a requirement, not a suggestion. Keep each step focused,
+small and complete: one file, written and closed, then continue.
+
+If any single file is itself too large to fit in one step (roughly 400+ lines),
+do not write a huge file in one step. Split it: write the smaller modules as
+separate files, or grow a large file across steps by writing the first part
+then appending the rest with a shell redirect (`>>`) in the next step.
+
+You are NOT done when the files exist — you are done when you have RUN them and
+they work. TASK.md tells you which interpreter to use and what to check.
+Writing no files is a failure; so is reporting success for code you never ran.
 """
 
 # Full instructions, written to the workspace as TASK.md. This is read by the
@@ -315,6 +357,53 @@ method or dataset.
 - All results must go to stdout via print statements.
 - Keep the experiment feasible within {time_budget_sec} seconds total.
 
+## Verify before you finish (MANDATORY)
+
+Writing the files is not the end of the task. Code that has never been executed
+is not done — a single bad line (an accumulator reset to `None`, a key that no
+data file carries) is invisible on reading and fatal on running, and nothing
+downstream will fix it for you.
+
+1. Always use this exact interpreter, never a bare `python`. It is the
+   environment the experiment is executed in later, and the only one guaranteed
+   to have the packages `GUIDANCE.md` lists. Keep it quoted — the path may
+   contain spaces:
+
+       "{python}"
+
+2. Run the DEFAULT entry point — this is what the pipeline executes later, so it
+   is the ONLY valid completion check:
+
+       "{python}" main.py
+
+   It must exit 0 and print a finite `{metric}`. A traceback, `nan`/`inf`, or a
+   missing metric means the task is NOT done — no exception.
+
+   If it fails, FIX the code and re-run the default. Keep fixing and re-running
+   until the default passes. This is a loop, not a single try.
+
+   If `GUIDANCE.md` defines a single-unit mode (e.g. an `--algorithm` selector),
+   you may run `"{python}" main.py --algorithm <name>` to LOCATE which algorithm
+   is at fault when the default fails — but a passing single-unit run is NOT a
+   pass. Only the default run (no flags) counts as done.
+
+3. Read the output. It must exit 0 and print a finite `{metric}`. A traceback,
+   a `nan`/`inf`, or a missing metric means the task is NOT done.
+
+4. Fix whatever you find and run it again. Repeat until it passes.
+
+   One exception: if it fails only because a package `GUIDANCE.md` lists as
+   available cannot be imported here, that is an environment gap, not a defect.
+   The experiment may be executed elsewhere (a container) where the package does
+   exist. Note it in a comment and move on — do NOT restructure the code, drop
+   the dependency, or reimplement it by hand to make the import go away.
+
+5. Keep the default configuration small enough that this verification finishes
+   in seconds. Shrink the workload, not the correctness.
+
+Never report success for code you did not run to completion. If it still fails
+after your best effort, say so explicitly and leave the files in place.
+
 ## Working style
 
 - Do not ask clarifying questions; no human is available to answer. Choose a
@@ -324,10 +413,18 @@ method or dataset.
 
 # Prepended to the CLI prompt on a retry. Kept deliberately short for the same
 # command-line length reason; the detail goes in RETRY.md.
+#
+# BUG-OB-X: the retry used to open a FRESH OpenCode session with no task
+# description, so attempt 2+ replied "I don't have the original task description"
+# and wrote nothing. The full task is always on disk in TASK.md (rewritten per
+# attempt), so the retry prompt must point straight at it rather than assume the
+# session carries the prior task context.
 _RETRY_PROMPT_PREFIX = """\
 RETRY: the previous attempt FAILED and produced no usable code.
-Read RETRY.md for what went wrong, then implement the task properly this time.
-
+Read RETRY.md for what went wrong. This is a brand-new session — it has NOT
+seen the previous attempt or the task. The full task is in TASK.md; read it
+FIRST (tool call, not text) and implement it. Do not reply with a question:
+a text-only reply is itself the failure mode.
 """
 
 _RETRY_MD_TEMPLATE = """\
@@ -338,10 +435,15 @@ Reason: {reason}
 {no_files_note}Do not repeat the previous mistake. Write the actual files this
 time: create `main.py` and every supporting module with real, runnable code.
 
+Write ONE file per step. Do not emit a whole project in a single step — a step
+is capped and the tail of a big output is truncated. Keep each step small and
+complete, then start the next step for the next file.
+
 The previous attempt's output is in `PREVIOUS_ATTEMPT/` and its log in
 `PREVIOUS_ATTEMPT_ERROR.txt`, for reference only.
 
-Re-read `TASK.md` and follow it.
+This is a brand-new session. Re-read `TASK.md` FIRST and follow it — that is
+the task; do not reply with a question.
 """
 
 _NO_FILES_NOTE = (
@@ -349,6 +451,133 @@ _NO_FILES_NOTE = (
     "question or with commentary instead of calling tools to write files. That "
     "is exactly the failure mode to avoid: ask nothing, write code.\n\n"
 )
+
+# Cap the context handed back to a retry. ``_invoke_opencode`` returns EVERY
+# line opencode prints as a JSON event, and each event embeds whatever file the
+# agent read (TASK.md, GUIDANCE.md, RETRY.md itself, ...) in full. Dumping all
+# of it as the retry ``reason`` blew RETRY.md and PREVIOUS_ATTEMPT_ERROR.txt up
+# to ~72KB each; and because the agent then READS RETRY.md, that content re-entered
+# the event stream and the next retry's dump grew again — a compounding blow-up
+# across retries that also bloated the model context. Only a short diagnostic
+# tail is useful to the next attempt; the verbose event stream stays on disk in
+# opencode_log.txt for humans.
+_RETRY_REASON_MAX_CHARS = 2000
+
+
+def _summarize_log(log: str, *, max_chars: int = _RETRY_REASON_MAX_CHARS) -> str:
+    """Compress an OpenCode event stream into a short retry reason.
+
+    The raw log is one JSON object per line. Most of it is tool-use noise with
+    huge ``output``/``content`` payloads (the agent echoing every file it read),
+    which carries no signal about WHY the attempt failed. This keeps only the
+    diagnostic lines — the trailing failure marker (``TIMEOUT`` / ``error`` /
+    ``exit`` / ``reason``) and the final events — and strips the embedded
+    file-content fields, so a retry sees a compact reason rather than a ~70KB
+    transcript.
+    """
+    if not log:
+        return ""
+    lines = [l.rstrip("\n") for l in log.splitlines()]
+
+    # Best-effort over UNTRUSTED data: an arbitrary opencode event stream may be
+    # truncated mid-JSON or carry circular/unpicklable objects, so json.loads /
+    # json.dumps / _shrink can all throw. A raise here would mask the very error
+    # we are summarising (callers assign ``last_error = _summarize_log(log)`` at
+    # the top of the exception path), so fall back to a plain tail-of-log.
+    try:
+        return _summarize_log_impl(log, lines, max_chars=max_chars)
+    except Exception:  # noqa: BLE001 — log summarisation must never raise
+        fallback = "\n".join(lines[-6:])
+        return fallback[-max_chars:]
+
+
+def _summarize_log_impl(log: str, lines: list[str], *, max_chars: int) -> str:
+    """Actual summarisation; wrapped by :func:`_summarize_log` for safety."""
+    if not lines:
+        return ""
+
+    def _is_signal(line: str) -> bool:
+        # Only a line that is a TOP-LEVEL event object counts. Matching signal
+        # words anywhere is too loose: the agent reads GUIDANCE.md, whose prose
+        # ("no network access", "do NOT use", ...) contains "error"/"failed",
+        # echoed into a read event's content, which then passes the word match
+        # while carrying zero diagnostic signal.
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            # Not JSON — keep only a trailing marker like the TIMEOUT line.
+            return line.startswith("TIMEOUT") or (
+                "timeout" in line.lower() and "after" in line.lower()
+            )
+        if not isinstance(obj, dict):
+            return False
+        # An event declaring a type like "error"/"failure" is a real signal.
+        etype = str(obj.get("type", "")).lower()
+        if any(tok in etype for tok in ("error", "fail", "timeout")):
+            return True
+        # A step that ended for a "length" / "error" / "max_tokens" / "stop"
+        # reason is the failure mechanism (output truncated mid-write).
+        reason = str(obj.get("part", {}).get("reason", "")).lower() if isinstance(
+            obj.get("part"), dict
+        ) else ""
+        return any(tok in reason for tok in ("error", "length", "max_tokens", "stop"))
+
+    # Prefer signal-carrying lines; fall back to the tail when none are present
+    # (e.g. a plain tool-call loop that never raised, which is itself the bug).
+    chosen = [l for l in lines if _is_signal(l)]
+    if not chosen:
+        chosen = lines[-6:]
+
+    # Compress any embedded JSON deep in a line down to its bare text.
+    compact: list[str] = []
+    for line in chosen:
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            compact.append(line)
+            continue
+
+        def _shrink(v: Any) -> Any:
+            if isinstance(v, dict):
+                out = {}
+                for k, val in v.items():
+                    # File-body echoes are the bulk of the transcript; drop them.
+                    if k in ("output", "content", "preview", "text"):
+                        out[k] = _truncate_json_text(val)
+                    else:
+                        out[k] = _shrink(val)
+                return out
+            if isinstance(v, list):
+                return [_shrink(item) for item in v]
+            return v
+
+        obj = _shrink(obj)
+        # Keep the original single-line-per-event style (the ``sep`` output) so a
+        # compacted reason stays one object per line, not pretty-printed.
+        try:
+            compact.append(json.dumps(obj, ensure_ascii=False))
+        except (TypeError, ValueError, RecursionError):
+            # A single un-serialisable line (circular ref, odd provider shape)
+            # must not kill the whole summary — keep the raw line instead.
+            compact.append(line)
+
+    out = "\n".join(compact)
+    return out[-max_chars:]
+
+
+def _truncate_json_text(value: Any, limit: int = 160) -> Any:
+    """Shrink an ``output``/``content``/``preview``/``text`` field.
+
+    These hold the file text the agent read (or the code it wrote) verbatim,
+    which is exactly the bulk that bloats the retry reason. Keep a short
+    head+tail so the *kind* of content is still identifiable.
+    """
+    if not isinstance(value, str):
+        return value
+    if len(value) <= limit:
+        return value
+    return value[:limit] + f"...<+{len(value) - limit} chars truncated>"
+
 
 
 class OpenCodeBridge:
@@ -365,6 +594,7 @@ class OpenCodeBridge:
         timeout_sec: int = 600,
         max_retries: int = 1,
         workspace_cleanup: bool = True,
+        python_path: str = "",
     ) -> None:
         self._model = model
         self._llm_base_url = llm_base_url
@@ -374,6 +604,11 @@ class OpenCodeBridge:
         self._timeout_sec = timeout_sec
         self._max_retries = max_retries
         self._workspace_cleanup = workspace_cleanup
+        # Interpreter the generated code will actually be executed with later
+        # (the sandbox's). The agent is told to verify with THIS one, because a
+        # bare `python` on PATH is often a different environment without the
+        # scientific packages, so "it ran for me" would not transfer.
+        self._python_path = python_path
 
     # -- availability check ---------------------------------------------------
 
@@ -429,8 +664,24 @@ class OpenCodeBridge:
 
         # Write the full task instructions. These live here rather than in the
         # CLI prompt because argv has a hard length limit (32767 on Windows).
+        #
+        # The interpreter is spelled out so the agent verifies with the SAME
+        # environment the experiment later runs in; falling back to "python"
+        # only when none is configured, which at least keeps the instruction
+        # runnable.
+        _py = self._python_path or "python"
+        try:
+            if self._python_path:
+                # POSIX separators on purpose: the agent runs this through a
+                # shell, and a Windows path like ``D:\4.work\...`` would have
+                # ``\4`` eaten as an escape. Windows accepts forward slashes for
+                # every API we need, so this form is safe on both platforms.
+                _py = Path(self._python_path).resolve().as_posix()
+        except OSError:
+            pass
         (ws / "TASK.md").write_text(
             _TASK_MD_TEMPLATE
+            .replace("{python}", _py)
             .replace("{metric}", metric)
             .replace("{time_budget_sec}", str(time_budget_sec)),
             encoding="utf-8",
@@ -948,6 +1199,7 @@ class OpenCodeBridge:
 
         workspace: Path | None = None
         last_error = ""
+        last_log = ""
         files: dict[str, str] = {}
         elapsed = 0.0
         prev_error = ""
@@ -957,14 +1209,13 @@ class OpenCodeBridge:
         # BUG-03: files salvaged from a FAILED attempt are a last resort, not a
         # reason to stop retrying. Stash them and keep going — a later attempt
         # may still succeed cleanly, and it gets the salvaged output as
-        # PREVIOUS_ATTEMPT context. Only if every attempt fails do we return
-        # the stash, flagged via ``recovered_from_failure``.
+        # PREVIOUS_ATTEMPT context. Only if every attempt fails do we return the
+        # stash, flagged via ``recovered_from_failure``.
         salvaged_files: dict[str, str] = {}
         salvaged_error = ""
         salvaged_elapsed = 0.0
-        # BUG-07: keep at most ONE failed workspace on disk for post-mortem.
-        # Retries used to leak every workspace, each nesting the previous
-        # attempt's PREVIOUS_ATTEMPT/ copy inside it.
+        # BUG-07: keep at most ONE failed workspace for post-mortem, since retries
+        # used to leak every workspace (each nesting the previous attempt's copy).
         kept_workspace: Path | None = None
 
         def _retire(ws: Path | None) -> None:
@@ -973,13 +1224,13 @@ class OpenCodeBridge:
             if ws is None:
                 return
             if kept_workspace is not None and kept_workspace != ws:
-                shutil.rmtree(kept_workspace, ignore_errors=True)
+                _rmtree_force(kept_workspace)
             kept_workspace = ws
 
         for attempt in range(1 + self._max_retries):
-            # On a retry, tell the agent what failed last time. A byte-identical
-            # prompt reliably reproduced the same failure — notably the model
-            # replying with a clarifying question and writing nothing.
+            # On a retry, tell the agent what failed last time — a byte-identical
+            # prompt reliably reproduced the same failure (notably a clarifying
+            # question and no written files).
             retry_note = ""
             if attempt > 0:
                 retry_note = (
@@ -1013,9 +1264,9 @@ class OpenCodeBridge:
                 continue
 
             # Build the CLI prompt. It only points at TASK.md, so it stays well
-            # inside the argv length limit regardless of plan/guidance size.
-            # Use replace instead of .format() to avoid KeyError when the metric
-            # contains curly braces like "F{1}".
+            # inside the argv length limit regardless of plan/guidance size. Use
+            # replace, not .format(), to avoid KeyError when the metric contains
+            # curly braces like "F{1}".
             prompt = _MEGA_PROMPT_TEMPLATE.replace(
                 "{metric}", metric
             ).replace(
@@ -1034,6 +1285,7 @@ class OpenCodeBridge:
             )
 
             success, log, elapsed = self._invoke_opencode(workspace, prompt)
+            last_log = log
 
             if success:
                 files = self._collect_files(workspace)
@@ -1043,8 +1295,8 @@ class OpenCodeBridge:
                         "(files: %s)", list(files.keys()),
                     )
                     # Distinguish "wrote nothing at all" (replied with text
-                    # instead of calling tools) from "wrote code but no
-                    # main.py" — they need different retry guidance.
+                    # instead of calling tools) from "wrote code but no main.py"
+                    # — they need different retry guidance.
                     if not any(f.endswith(".py") for f in files):
                         last_error = (
                             "OpenCode wrote no code files at all — it replied "
@@ -1055,7 +1307,9 @@ class OpenCodeBridge:
                         last_error = "No main.py in OpenCode output"
                         prev_had_no_files = False
                     # Carry this attempt's output + reason to the next retry.
-                    prev_error = log
+                    # Keep the reason COMPACT: a full log here re-enters RETRY.md
+                    # and, once the agent reads RETRY.md, the next attempt's log.
+                    prev_error = _summarize_log(log)
                     prev_files = files
                     # BUG-07: keep the workspace so partial output can be
                     # inspected — but only the newest one. This path used to
@@ -1063,7 +1317,7 @@ class OpenCodeBridge:
                     _retire(workspace)
                     continue
 
-                # BUG-R52-01: Ensure main.py has an entry point
+                # BUG-R52-01: Ensure main.py has an entry point.
                 files = self._ensure_main_entry_point(files)
 
                 # Write log
@@ -1078,9 +1332,9 @@ class OpenCodeBridge:
                 # every earlier failed attempt, so drop those too.
                 if self._workspace_cleanup:
                     if workspace.exists():
-                        shutil.rmtree(workspace, ignore_errors=True)
+                        _rmtree_force(workspace)
                     if kept_workspace is not None:
-                        shutil.rmtree(kept_workspace, ignore_errors=True)
+                        _rmtree_force(kept_workspace)
                         kept_workspace = None
 
                 return OpenCodeResult(
@@ -1090,25 +1344,24 @@ class OpenCodeBridge:
                     elapsed_sec=elapsed,
                 )
 
-            last_error = log
+            last_error = _summarize_log(log)
             logger.warning(
                 "Beast mode: OpenCode attempt %d failed (%.1fs): %s",
                 attempt + 1,
                 elapsed,
                 log[:500],
             )
-            # Attempt to recover output even on failure/timeout: opencode may
-            # have written a complete package before the process was killed
-            # (e.g. timed out during the final full-run validation). Prefer
-            # that over discarding it, and only wipe the workspace when there
-            # is nothing useful to keep.
+            # Recover output even on failure/timeout: opencode may have written a
+            # complete package before the process was killed (e.g. timed out
+            # during final full-run validation). Prefer that over discarding it;
+            # only wipe the workspace when there is nothing useful to keep.
             if workspace and workspace.exists():
                 recovered = self._collect_files(workspace)
-                prev_error = log
+                prev_error = _summarize_log(log)
                 prev_files = recovered
                 if "main.py" not in recovered:
                     if self._workspace_cleanup:
-                        shutil.rmtree(workspace, ignore_errors=True)
+                        _rmtree_force(workspace)
                     else:
                         _retire(workspace)
                 else:
@@ -1127,7 +1380,7 @@ class OpenCodeBridge:
         if salvaged_files:
             files = self._ensure_main_entry_point(salvaged_files)
             if self._workspace_cleanup and kept_workspace is not None:
-                shutil.rmtree(kept_workspace, ignore_errors=True)
+                _rmtree_force(kept_workspace)
                 kept_workspace = None
             logger.warning(
                 "Beast mode: all %d attempt(s) failed; falling back to %d "
@@ -1144,7 +1397,19 @@ class OpenCodeBridge:
                 recovered_from_failure=True,
             )
 
-        # All attempts failed
+        # All attempts failed. The full transcript used to be dropped here (only
+        # the last attempt's final line survived in memory, nothing on disk), so
+        # persist the whole log for post-mortem. `last_error` stays the compact
+        # ~2000-char summary that fills RETRY.md's {reason} — the in-memory
+        # opencode_log field keeps that instead of the full log so a caller's
+        # retry prompt does not grow.
+        if last_log:
+            try:
+                (stage_dir / "opencode_log.txt").write_text(
+                    last_log or "", encoding="utf-8",
+                )
+            except OSError as _wexc:
+                logger.warning("Beast mode: failed to write log: %s", _wexc)
         return OpenCodeResult(
             success=False,
             opencode_log=last_error,

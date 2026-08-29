@@ -265,6 +265,7 @@ STAGES: dict[str, dict[str, Any]] = {
             "- Add a 'Benchmark' subsection listing: the experiment/search, "
             "the observable, the current published limit, and the CL level."
         ),
+        "max_tokens": 8192,
     },
     "problem_decompose": {
         "system": "You are a senior HEP-ph research strategist.",
@@ -283,9 +284,13 @@ STAGES: dict[str, dict[str, Any]] = {
             "inconsistencies).\n"
             "Goal context:\n{goal_text}"
         ),
+        "max_tokens": 8192,
     },
     # ── Phase B: Literature Discovery ───────────────────────────────────── #
     "search_strategy": {
+        # Fixed-schema output: a reasoning pass buys nothing here and
+        # can eat the whole token budget before any visible output.
+        "reasoning": False,
         "system": (
             "You design literature retrieval strategies for an HEP-ph study. "
             "Primary sources are arXiv (hep-ph, hep-ex, astro-ph.CO), INSPIRE-HEP, "
@@ -305,8 +310,12 @@ STAGES: dict[str, dict[str, Any]] = {
             "Problem tree:\n{problem_tree}"
         ),
         "json_mode": True,
+        "max_tokens": 8192,
     },
     "literature_collect": {
+        # Fixed-schema output: a reasoning pass buys nothing here and
+        # can eat the whole token budget before any visible output.
+        "reasoning": False,
         "system": (
             "You are a literature mining assistant for HEP-ph. You prefer "
             "peer-reviewed papers from JHEP, PRD, PRL, EPJC, Phys.Lett.B, "
@@ -324,8 +333,12 @@ STAGES: dict[str, dict[str, Any]] = {
             "Search plan:\n{plan_text}"
         ),
         "json_mode": True,
+        "max_tokens": 8192,
     },
     "literature_screen": {
+        # Fixed-schema output: a reasoning pass buys nothing here and
+        # can eat the whole token budget before any visible output.
+        "reasoning": False,
         "system": (
             "You are a strict HEP-ph reviewer with zero tolerance for "
             "cross-domain false positives. A paper about 'dark matter' in "
@@ -368,8 +381,12 @@ STAGES: dict[str, dict[str, Any]] = {
             "Candidates JSONL:\n{candidates_text}"
         ),
         "json_mode": True,
+        "max_tokens": 8192,
     },
     "knowledge_extract": {
+        # Fixed-schema output: a reasoning pass buys nothing here and
+        # can eat the whole token budget before any visible output.
+        "reasoning": False,
         "system": (
             "You extract high-signal physics evidence cards from HEP-ph papers. "
             "Each card captures the BSM framework, the observable, the "
@@ -397,6 +414,7 @@ STAGES: dict[str, dict[str, Any]] = {
             "Shortlist:\n{shortlist}"
         ),
         "json_mode": True,
+        "max_tokens": 8192,
     },
     # ── Phase C: Knowledge Synthesis ────────────────────────────────────── #
     "synthesis": {
@@ -485,9 +503,13 @@ STAGES: dict[str, dict[str, Any]] = {
             "{domain_context}"
             "Synthesis:\n{synthesis}"
         ),
+        "max_tokens": 8192,
     },
     # ── Phase D: Experiment Design ──────────────────────────────────────── #
     "experiment_design": {
+        # Fixed-schema output: a reasoning pass buys nothing here and
+        # can eat the whole token budget before any visible output.
+        "reasoning": False,
         "system": (
             "You are a principal investigator designing a rigorous "
             "HEP-phenomenology computational study. Your plan must be "
@@ -630,6 +652,10 @@ STAGES: dict[str, dict[str, Any]] = {
             "exclusion contour (quantitatively if possible).\n\n"
             "Hypotheses:\n{hypotheses}"
         ),
+        # See ml.py: without an explicit budget this stage inherits the 4096
+        # LLMConfig default and truncates mid-plan, which surfaces as a YAML
+        # parse failure rather than as a length problem.
+        "max_tokens": 8192,
     },
     "code_generation": {
         "system": (
@@ -751,6 +777,10 @@ STAGES: dict[str, dict[str, Any]] = {
             "(cite the equation number of the source paper).\n"
             "  * AGGREGATION: how the grid reduces to a scalar (e.g. "
             "'minimum m_med excluded at 95% CL across the grid').\n"
+            "- ALSO define a module-level static dict at the top of main.py so downstream "
+            "stages agree on which way is better WITHOUT running your code:\n"
+            "  `METRIC_DEF = {\"primary_metric\": \"{metric}\", \"direction\": \"<maximize|minimize>\"}`\n"
+            "  It must match DIRECTION above.\n"
             "- Print at runtime: `METRIC_DEF: {metric} | direction=<higher/lower> "
             "| desc=<one-line physics description>`.\n\n"
             "STATISTICAL RIGOUR (HEP convention):\n"
@@ -847,9 +877,12 @@ STAGES: dict[str, dict[str, Any]] = {
             "not fabricated.\n\n"
             "Experiment plan:\n{exp_plan}"
         ),
-        "max_tokens": 8192,
+        "max_tokens": 16384,
     },
     "resource_planning": {
+        # Fixed-schema output: a reasoning pass buys nothing here and
+        # can eat the whole token budget before any visible output.
+        "reasoning": False,
         "system": (
             "You are an HEP-ph experiment scheduler. Parameter scans are "
             "single-CPU and fast; budget is measured in CPU-minutes."
@@ -864,6 +897,7 @@ STAGES: dict[str, dict[str, Any]] = {
             "Experiment plan:\n{exp_plan}"
         ),
         "json_mode": True,
+        "max_tokens": 8192,
     },
     # ── Phase F: Analysis & Decision ────────────────────────────────────── #
     "result_analysis": {
@@ -938,6 +972,9 @@ STAGES: dict[str, dict[str, Any]] = {
         "max_tokens": 8192,
     },
     "research_decision": {
+        # Fixed-schema output: a reasoning pass buys nothing here and
+        # can eat the whole token budget before any visible output.
+        "reasoning": False,
         "system": (
             "You are an HEP-ph research program lead making go/no-go "
             "decisions on whether the parameter-scan output is ready for "
@@ -979,6 +1016,7 @@ STAGES: dict[str, dict[str, Any]] = {
             "'widen m_med range to 5 TeV', 'include spin-dependent DD bound').\n\n"
             "Analysis:\n{analysis}"
         ),
+        "max_tokens": 8192,
     },
     # ── Phase G: Paper Writing ──────────────────────────────────────────── #
     "paper_outline": {
@@ -1332,6 +1370,9 @@ STAGES: dict[str, dict[str, Any]] = {
     },
     # ── Phase H: Finalisation ───────────────────────────────────────────── #
     "quality_gate": {
+        # Fixed-schema output: a reasoning pass buys nothing here and
+        # can eat the whole token budget before any visible output.
+        "reasoning": False,
         "system": (
             "You are the final HEP-ph quality gate evaluator for a "
             "JHEP/PRD submission candidate."
@@ -1354,6 +1395,7 @@ STAGES: dict[str, dict[str, Any]] = {
             "Paper:\n{revised}"
         ),
         "json_mode": True,
+        "max_tokens": 8192,
     },
     "knowledge_archive": {
         "system": (

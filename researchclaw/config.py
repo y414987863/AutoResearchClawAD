@@ -232,6 +232,18 @@ class LlmConfig:
     log_traces: bool = False
     trace_path: str = ""
     trace_max_chars: int = 200_000
+    # Provider-specific request-body fields merged into *every* chat call, e.g.
+    # ``{"reasoning_effort": "none"}``. OpenAI-compatible providers each spell
+    # their knobs differently and new ones appear faster than we can model
+    # them, so this stays an untyped passthrough.
+    extra_body_params: dict[str, Any] = field(default_factory=dict)
+    # Same shape, but merged only for stages whose prompt declares
+    # ``reasoning: False``. Those stages emit a fixed schema (YAML/JSON) where
+    # a long reasoning pass buys nothing and can consume the whole token
+    # budget before a single output token is emitted — the observed failure was
+    # an empty response with ``finish_reason=length``. Left empty by default:
+    # the right spelling is provider-specific, so opting in is explicit.
+    reasoning_off_params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -512,6 +524,13 @@ class Llm4adEvolutionConfig:
     mutation_rate: float = 0.6
     crossover_rate: float = 0.3
     island: dict[str, Any] = field(default_factory=dict)
+    # Which algorithms to evolve. Empty (default) evolves everything in
+    # algorithms/. A dict selects a subset: {"categories": ["proposed"]},
+    # {"names": ["cma_es_default"]}, or both (union). Categories resolve against
+    # the per-run algorithms_classification.json stage-10 writes; names match
+    # algorithm directory names directly. Kept free-form so the same field needs
+    # no schema change when a topic labels methods differently.
+    evolve_scope: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -526,11 +545,6 @@ class Llm4adResourcesConfig:
     # dividing time_budget_sec across N packages (which left every package
     # killed mid-generation). When 0, falls back to time_budget_sec // n_pkgs.
     per_package_timeout_sec: int = 0
-    # Override for the per-instance evaluation budget ``max_evals`` written into
-    # each task package's data/*.json and coder prompt. When > 0 it REPLACES the
-    # value baked in at stage-10 generation, so evolution and the baseline
-    # comparison see the same budget. 0 keeps the per-instance value untouched.
-    max_evals: int = 0
 
 
 @dataclass(frozen=True)
@@ -1267,6 +1281,8 @@ def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
         log_traces=bool(data.get("log_traces", False)),
         trace_path=str(data.get("trace_path", "") or ""),
         trace_max_chars=_safe_int(data.get("trace_max_chars"), 200_000),
+        extra_body_params=dict(data.get("extra_body_params") or {}),
+        reasoning_off_params=dict(data.get("reasoning_off_params") or {}),
     )
 
 
@@ -1583,6 +1599,12 @@ def _parse_llm4ad_evolution_config(data: dict[str, Any]) -> Llm4adEvolutionConfi
     if not data:
         return Llm4adEvolutionConfig()
     island = data.get("island") or {}
+    # evolve_scope is free-form (dict-shaped) so it needs no schema revision
+    # when a topic labels methods differently; an absent/invalid value stays
+    # empty, which the downstream filter treats as "evolve everything".
+    evolve_scope = data.get("evolve_scope")
+    if not isinstance(evolve_scope, dict):
+        evolve_scope = {}
     return Llm4adEvolutionConfig(
         method=str(data.get("method", "island_ga")),
         max_generations=_safe_int(data.get("max_generations"), 2),
@@ -1590,6 +1612,7 @@ def _parse_llm4ad_evolution_config(data: dict[str, Any]) -> Llm4adEvolutionConfi
         mutation_rate=_safe_float(data.get("mutation_rate"), 0.6),
         crossover_rate=_safe_float(data.get("crossover_rate"), 0.3),
         island=dict(island) if isinstance(island, dict) else {},
+        evolve_scope=dict(evolve_scope),
     )
 
 
@@ -1601,7 +1624,6 @@ def _parse_llm4ad_resources_config(data: dict[str, Any]) -> Llm4adResourcesConfi
         eval_timeout_sec=_safe_int(data.get("eval_timeout_sec"), 120),
         parallel_workers=_safe_int(data.get("parallel_workers"), 4),
         per_package_timeout_sec=_safe_int(data.get("per_package_timeout_sec"), 0),
-        max_evals=_safe_int(data.get("max_evals"), 0),
     )
 
 
