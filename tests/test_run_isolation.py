@@ -12,39 +12,57 @@ def _exp():
     return exp
 
 
-def _write_best(base, algo, run_id, score):
-    w = base / algo / f"{algo}_task" / run_id / 'best' / 'code'
-    w.mkdir(parents=True, exist_ok=True)
-    (w / f"{algo}.py").write_text('# EVOLVE_START\n# EVOLVE_END\n')
-    (w.parent / 'metadata.json').write_text(json.dumps({'evaluation': {'score': score}}))
-
-
-def test_run_id_pinned_in_config():
-    exp = _exp(); out = Path(tempfile.mkdtemp()) / 'o'
-    base = Path(tempfile.gettempdir()) / "rc_llm4ad" / "ab-proj" / "run_TOK"
-    lp.generate_task_packages(exp, out, None, None, None, background='t', metric_direction='minimize',
-                              runs_base_dir=base, run_id='TOK')
-    cfg = yaml.safe_load((out / 'nm' / 'config.yaml').read_text())
-    assert cfg['run_id'] == 'TOK'
-    assert 'run_TOK' in cfg['base_dir']
-
-
-def test_resolve_isolated_per_run():
-    # RUN1 token=AAAA leaves a stale -99; RUN2 token=BBBB writes -5; resolve RUN2 reads -5
+def test_token_is_per_call_and_scopes_both_gen_and_collect():
+    """Each package-generation call gets a FRESH token, and that same token
+    appears in the config base_dir that collection reads back."""
     exp = _exp()
-    baseA = Path(tempfile.gettempdir()) / "rc_llm4ad" / "ab-proj" / "run_AAAA"
-    out1 = Path(tempfile.mkdtemp()) / 'p1'
-    lp.generate_task_packages(exp, out1, None, None, None, background='t', metric_direction='minimize',
-                              runs_base_dir=baseA, run_id='AAAA')
-    _write_best(baseA, 'nm', 'AAAA', -99.0)
+    tmp = Path(tempfile.mkdtemp())
 
-    baseB = Path(tempfile.gettempdir()) / "rc_llm4ad" / "ab-proj" / "run_BBBB"
-    out2 = Path(tempfile.mkdtemp()) / 'p2'
-    lp.generate_task_packages(exp, out2, None, None, None, background='t', metric_direction='minimize',
-                              runs_base_dir=baseB, run_id='BBBB')
-    _write_best(baseB, 'nm', 'BBBB', -5.0)
+    # Call 1
+    out1 = tmp / 'p1'
+    tok1 = 'tok_one'
+    lp.generate_task_packages(exp, out1, None, None, None, background='t',
+                              metric_direction='minimize',
+                              runs_base_dir=Path(tempfile.gettempdir())/"rc_llm4ad"/"ab"/f"run_{tok1}",
+                              run_id=tok1)
+    # Call 2 with a DIFFERENT token
+    out2 = tmp / 'p2'
+    tok2 = 'tok_two'
+    lp.generate_task_packages(exp, out2, None, None, None, background='t',
+                              metric_direction='minimize',
+                              runs_base_dir=Path(tempfile.gettempdir())/"rc_llm4ad"/"ab"/f"run_{tok2}",
+                              run_id=tok2)
 
-    cfg = yaml.safe_load((out2 / 'nm' / 'config.yaml').read_text())
-    root = Path(cfg['base_dir'])
-    _, _, sc, _ = lp._resolve_run_best(out2 / 'nm', 'nm', runs_root=root)
-    assert sc == -5.0  # reads THIS run, not stale -99
+    # Config base_dir carries the token -> collection reads it back
+    cfg1 = yaml.safe_load((out1/'nm'/'config.yaml').read_text())
+    cfg2 = yaml.safe_load((out2/'nm'/'config.yaml').read_text())
+    assert 'run_tok_one' in cfg1['base_dir'] and cfg1['run_id'] == 'tok_one'
+    assert 'run_tok_two' in cfg2['base_dir'] and cfg2['run_id'] == 'tok_two'
+    assert 'run_tok_one' in cfg1['base_dir'] and 'run_tok_one' not in cfg2['base_dir']
+
+
+def test_two_calls_isolated_end_to_end():
+    """Two tokens -> two workspaces; resolve reads only its own."""
+    exp = _exp()
+    tmp = Path(tempfile.mkdtemp())
+
+    def write_best(base, algo, runid, score):
+        w = base / algo / f"{algo}_task" / runid / 'best' / 'code'
+        w.mkdir(parents=True, exist_ok=True)
+        (w / f"{algo}.py").write_text('# EVOLVE_START\n# EVOLVE_END\n')
+        (w.parent / 'metadata.json').write_text(json.dumps({'evaluation': {'score': score}}))
+
+    baseA = Path(tempfile.gettempdir())/"rc_llm4ad"/"ab"/"run_AAA"
+    outA = tmp/'a'; lp.generate_task_packages(exp, outA, None, None, None, background='t',
+        metric_direction='minimize', runs_base_dir=baseA, run_id='AAA')
+    write_best(baseA, 'nm', 'AAA', -99.0)
+
+    baseB = Path(tempfile.gettempdir())/"rc_llm4ad"/"ab"/"run_BBB"
+    outB = tmp/'b'; lp.generate_task_packages(exp, outB, None, None, None, background='t',
+        metric_direction='minimize', runs_base_dir=baseB, run_id='BBB')
+    write_best(baseB, 'nm', 'BBB', -5.0)
+
+    cfgB = yaml.safe_load((outB/'nm'/'config.yaml').read_text())
+    rootB = Path(cfgB['base_dir'])
+    _, _, sc, _ = lp._resolve_run_best(outB/'nm', 'nm', runs_root=rootB)
+    assert sc == -5.0  # not -99 from call A

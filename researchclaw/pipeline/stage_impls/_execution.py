@@ -42,11 +42,6 @@ from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
 
-# Each invocation gets a unique temp workspace. run_dir.name is stable across
-# repeated --from-stage runs, so without this the temp dir accumulates worktrees
-# and _resolve_run_best (which rglob-scans the run root) reads a STALE best.
-_LLM4AD_RUN_TOKEN = uuid.uuid4().hex[:8]
-
 
 def _execute_resource_planning(
     stage_dir: Path,
@@ -654,13 +649,19 @@ def _generate_llm4ad_task_packages(
         # name-based inference so evolution optimises the right way.
         _topic = getattr(getattr(config, "research", None), "topic", "") or ""
         _direction = getattr(getattr(config, "experiment", None), "metric_direction", "") or ""
+        # Fresh per-call token: run_dir.name is stable across repeated runs, so a
+        # module-level token would reuse the same temp workspace for every entry
+        # into Stage 13 (including a same-process re-entry after a rollback),
+        # making _resolve_run_best read a stale best. Generating it here ties
+        # gen + collect to the same new token per package-generation call.
+        _l4b_token = uuid.uuid4().hex[:8]
         _manifests = generate_task_packages(
             Path(_tp_exp), _tp_out, _llm_config, _evo_cfg, _res_cfg,
             background=_topic, metric_direction=_direction,
             # Worktrees live under the temp dir (not task_packages/, whose deep
             # path hits Windows' 260-char limit), scoped to this invocation.
-            runs_base_dir=Path(tempfile.gettempdir()) / "rc_llm4ad" / run_dir.name / f"run_{_LLM4AD_RUN_TOKEN}",
-            run_id=_LLM4AD_RUN_TOKEN,
+            runs_base_dir=Path(tempfile.gettempdir()) / "rc_llm4ad" / run_dir.name / f"run_{_l4b_token}",
+            run_id=_l4b_token,
         )
         logger.info(
             "Stage 13: generated %d LLM4AD task package(s) under %s",
