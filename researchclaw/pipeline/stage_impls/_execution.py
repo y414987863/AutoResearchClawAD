@@ -920,8 +920,10 @@ def _promote_llm4ad_to_experiment_final(
     base_exp_dir: Path,
     evolution_dir: Path,
     final_dir: Path,
-) -> int:
-    """Overlay evolved algorithm modules onto a clean project directory.
+    *,
+    metric_direction: str = "minimize",
+) -> tuple[int, dict[str, Any]]:
+    """Overlay only genuinely-improved evolved modules onto a clean project.
 
     Each ``evolution_results/<algo>/`` is a copy of the winning individual's git
     worktree — which, because ``version_control.local_path`` is
@@ -929,27 +931,76 @@ def _promote_llm4ad_to_experiment_final(
     consume ``experiment_final/`` as a top-level project (``main.py`` +
     ``algorithms/<algo>/<algo>.py`` + ``data/*.json``), so we rebuild ``final_dir``
     from ``base_exp_dir`` (the clean stage-10 code) and overlay ONLY the evolved
-    module back into its original nested slot.
+    modules that actually beat their clean baseline under the experiment's own
+    evaluator protocol.  A module that fails to run, has no finite primary
+    metric, or is equal/worse than the baseline is left as the clean code, so
+    LLM4AD can only ever improve ``experiment_final/`` — never degrade it.
 
-    Returns the number of algorithm modules overlaid (0 means nothing promoted).
+    ``metric_direction`` ("minimize"/"maximize") decides which score is better.
+
+    Returns ``(n_promoted, comparison)`` where ``comparison`` is a dict of
+    ``{algo: {baseline, evolved, delta_pct, promoted, failed, reason}}`` for
+    every algo present in ``evolution_dir``.
     """
     import shutil as _sh_promote
+    import subprocess as _sp
+    import sys as _sys
+
+    _dir = metric_direction.strip().lower()
+    maximize = _dir == "maximize"
+    if _dir not in ("minimize", "maximize"):
+        logger.warning(
+            "Stage 13: unknown metric_direction=%r, assuming minimize", metric_direction,
+        )
 
     if not base_exp_dir.is_dir():
         logger.warning(
             "Stage 13: cannot promote llm4ad results — base experiment dir "
             "missing: %s", base_exp_dir,
         )
-        return 0
+        return 0, {}
 
     # Rebuild final_dir from the clean base (remove errant leftover, if any).
     if final_dir.exists():
         _sh_promote.rmtree(final_dir, ignore_errors=True)
     _sh_promote.copytree(base_exp_dir, final_dir, symlinks=False)
 
+    _runner = Path(__file__).resolve().parent.parent / "llm4ad_utils" / "comparison_runner.py"
+
+    def _score(algo_name: str, algo_file: Path) -> float | None:
+        """Score one algorithm file via the experiment's own evaluator."""
+        try:
+            proc = _sp.run(
+                [_sys.executable, str(_runner), str(base_exp_dir), algo_name, str(algo_file)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=600,
+            )
+        except (OSError, _sp.TimeoutExpired) as _pexc:
+            logger.warning("Stage 13: %s scoring failed to run: %s", algo_name, _pexc)
+            return None
+        if proc.returncode != 0:
+            logger.warning(
+                "Stage 13: %s scoring exited %d: %s",
+                algo_name, proc.returncode, (proc.stderr or proc.stdout or "")[-300:],
+            )
+            return None
+        payload = _safe_json_loads(proc.stdout.strip(), None)
+        if not isinstance(payload, dict):
+            logger.warning("Stage 13: %s scoring returned unparsable stdout", algo_name)
+            return None
+        if payload.get("error"):
+            logger.warning("Stage 13: %s scoring error: %s", algo_name, payload["error"])
+            return None
+        mean = payload.get("mean")
+        if not isinstance(mean, (int, float)):
+            return None
+        return float(mean)
+
+    comparison: dict[str, Any] = {}
     n_promoted = 0
     if not evolution_dir.is_dir():
-        return 0
+        return 0, comparison
+
     for algo_pkg in sorted(evolution_dir.iterdir()):
         if not algo_pkg.is_dir():
             continue
@@ -964,22 +1015,95 @@ def _promote_llm4ad_to_experiment_final(
             evolved_src = algo_pkg / "algorithms" / algo_name / f"{algo_name}.py"
         if not evolved_src.is_file():
             continue
+
         # Map back to the original layout: algorithms/<algo>/<algo>.py.
+        base_algo = base_exp_dir / "algorithms" / algo_name / f"{algo_name}.py"
         _dest = final_dir / "algorithms" / algo_name / f"{algo_name}.py"
         _dest.parent.mkdir(parents=True, exist_ok=True)
-        _sh_promote.copy2(evolved_src, _dest)
-        n_promoted += 1
+
+        if not base_algo.is_file():
+            # No clean counterpart — cannot judge improvement, keep clean code.
+            comparison[algo_name] = {
+                "baseline": None, "evolved": None, "delta_pct": None,
+                "promoted": False, "failed": True,
+                "reason": "baseline algorithm file missing",
+            }
+            continue
+
+        # Byte-identical source means no evolvable change: keep the clean code.
+        try:
+            identical = evolved_src.read_bytes() == base_algo.read_bytes()
+        except OSError:
+            identical = False
+
+        if identical:
+            comparison[algo_name] = {
+                "baseline": None, "evolved": None, "delta_pct": None,
+                "promoted": False, "failed": False,
+                "reason": "evolved source identical to baseline; no change to promote",
+            }
+            logger.info("Stage 13: %s unchanged — keeping baseline", algo_name)
+            continue
+
+        baseline_score = _score(algo_name, base_algo)
+        evolved_score = _score(algo_name, evolved_src)
+
+        # A failed/unsaved evolution counts as "no improvement": never degrade.
+        if evolved_score is None:
+            comparison[algo_name] = {
+                "baseline": baseline_score, "evolved": None, "delta_pct": None,
+                "promoted": False, "failed": True,
+                "reason": "evolved evaluation failed (timeout/error/empty)",
+            }
+            logger.warning("Stage 13: %s evolved evaluation failed — keeping baseline",
+                           algo_name)
+            continue
+
+        if baseline_score is None:
+            # Baseline exists but couldn't be scored (subprocess failed) — we
+            # cannot judge improvement, and the clean file is already in
+            # final_dir, so keep it. Conservative: never guess by promoting.
+            comparison[algo_name] = {
+                "baseline": None, "evolved": evolved_score, "delta_pct": None,
+                "promoted": False, "failed": False,
+                "reason": "baseline evaluation failed (no reference score)",
+            }
+            logger.warning(
+                "Stage 13: %s baseline evaluation failed — keeping clean code",
+                algo_name,
+            )
+            continue
+
+        # Direction-aware improvement test (minimize → lower is better).
+        better = evolved_score < baseline_score if not maximize else evolved_score > baseline_score
+        if better:
+            _sh_promote.copy2(evolved_src, _dest)
+            n_promoted += 1
+        delta_pct = (
+            (evolved_score - baseline_score) / baseline_score * 100.0
+            if baseline_score
+            else None
+        )
+        comparison[algo_name] = {
+            "baseline": baseline_score,
+            "evolved": evolved_score,
+            "delta_pct": delta_pct,
+            "promoted": better,
+            "failed": False,
+            "reason": "improved" if better else "equal or worse than baseline",
+        }
         logger.info(
-            "Stage 13: promoted evolved %s/algorithms/%s/%s.py into experiment_final/",
-            algo_name, algo_name, algo_name,
+            "Stage 13: %s %s (baseline=%.6g evolved=%.6g delta=%.3f%%)",
+            algo_name, "promoted" if better else "kept baseline",
+            baseline_score, evolved_score, delta_pct if delta_pct is not None else 0.0,
         )
 
     if not n_promoted:
         logger.warning(
-            "Stage 13: llm4ad evolution produced no overlayable algorithm "
-            "module — experiment_final/ left as the clean stage-10 code"
+            "Stage 13: no evolved algorithm beat its baseline — experiment_final/ "
+            "left as the clean stage-10 code"
         )
-    return n_promoted
+    return n_promoted, comparison
 
 
 def _execute_iterative_refine(
@@ -1927,15 +2051,47 @@ def _execute_iterative_refine(
         # just snapshotted. Rebuild from that clean source.
         _clean_exp = _read_prior_artifact(run_dir, "experiment/")
         if _clean_exp and Path(_clean_exp).is_dir():
-            _n = _promote_llm4ad_to_experiment_final(
-                Path(_clean_exp), _evo_dir, final_dir
+            _metric_direction = getattr(
+                config.experiment, "metric_direction", ""
+            ) or "minimize"
+            _n, _comparison = _promote_llm4ad_to_experiment_final(
+                Path(_clean_exp), _evo_dir, final_dir,
+                metric_direction=_metric_direction,
             )
+            # Persist the per-algo evolvability comparison so reviewers can see
+            # which evolved algorithms were actually promoted into experiment_final/.
+            _cmp_path = stage_dir / "llm4ad_comparison.json"
+            try:
+                _cmp_path.write_text(
+                    json.dumps(
+                        {
+                            "generated": _utcnow_iso(),
+                            "metric_direction": _metric_direction,
+                            "base": _clean_exp,
+                            "n_promoted": _n,
+                            "algorithms": _comparison,
+                        },
+                        ensure_ascii=False, indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError as _cmp_err:
+                logger.warning(
+                    "Stage 13: could not write llm4ad_comparison.json: %s", _cmp_err,
+                )
+            else:
+                artifacts.append("llm4ad_comparison.json")
             log["llm4ad_promoted"] = {
                 "n_algorithms_overlaid": _n,
+                "n_algorithms_total": len(_comparison),
                 "base": _clean_exp,
+                "metric_direction": _metric_direction,
+                "comparison": _comparison,
                 "note": (
-                    "algorithms/<algo>/<algo>.py overlaid from evolution_results/; "
-                    "main.py, data/, other algorithms come from clean stage-10 code"
+                    "only evolved <algo>.py that beat their clean baseline under the "
+                    "experiment's own evaluator protocol are overlaid into "
+                    "experiment_final/; main.py, data/, other algorithms come from "
+                    "clean stage-10 code"
                 ),
             }
             # Keep experiment_final.py consistent with the promoted main.py.
