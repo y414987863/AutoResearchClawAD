@@ -42,6 +42,19 @@ from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
 
+# Wall-clock ceiling for a single LLM4AD scoring subprocess (one algorithm
+# scored across all instances). 600s was too tight for O(N^3) non-parametric
+# candidates (e.g. a GP with gradient ascent on the Gram matrix): the whole
+# evaluation has to finish inside this window, so a slow candidate was
+# mis-classified as "failed" rather than "slow". 1800s covers a full sweep.
+_SCORING_TIMEOUT_SEC = 1800
+
+# Per-file ceiling when a project file is rendered into a refinement prompt.
+# Sized just above the largest source file observed across generated projects
+# (~50KB), so real code passes through untouched and only a pathological file
+# is trimmed.
+_CONTEXT_FILE_MAX_CHARS = 60_000
+
 
 def _execute_resource_planning(
     stage_dir: Path,
@@ -967,34 +980,46 @@ def _promote_llm4ad_to_experiment_final(
 
     _runner = Path(__file__).resolve().parent.parent / "llm4ad_utils" / "comparison_runner.py"
 
-    def _score(algo_name: str, algo_file: Path) -> float | None:
-        """Score one algorithm file via the experiment's own evaluator."""
+    # Enumerating instances has one implementation, shared with the task
+    # packager: every file directly under data/, whatever its extension.
+    from researchclaw.pipeline.llm4ad_task_packages import _discover_instances
+    _instance_argv = json.dumps([str(p) for p in _discover_instances(base_exp_dir)])
+
+    def _score(algo_name: str, algo_file: Path) -> tuple[dict[str, float] | None, str]:
+        """Per-instance primary-metric values via the experiment's own evaluator.
+
+        Returns ``(values, detail)``.  ``values`` is None when scoring could not
+        run at all; ``detail`` explains why, and is surfaced in the comparison
+        artifact so a failure is not mistaken for "no improvement".
+        """
         try:
             proc = _sp.run(
                 [_sys.executable, str(_runner), str(base_exp_dir), algo_name, str(algo_file)],
+                input=_instance_argv,
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=600,
+                timeout=_SCORING_TIMEOUT_SEC,
             )
         except (OSError, _sp.TimeoutExpired) as _pexc:
-            logger.warning("Stage 13: %s scoring failed to run: %s", algo_name, _pexc)
-            return None
+            return None, f"scoring failed to run: {_pexc}"
         if proc.returncode != 0:
-            logger.warning(
-                "Stage 13: %s scoring exited %d: %s",
-                algo_name, proc.returncode, (proc.stderr or proc.stdout or "")[-300:],
+            return None, (
+                f"scoring exited {proc.returncode}: "
+                f"{(proc.stderr or proc.stdout or '').strip()[-200:]}"
             )
-            return None
         payload = _safe_json_loads(proc.stdout.strip(), None)
         if not isinstance(payload, dict):
-            logger.warning("Stage 13: %s scoring returned unparsable stdout", algo_name)
-            return None
+            return None, "scoring returned unparsable stdout"
         if payload.get("error"):
-            logger.warning("Stage 13: %s scoring error: %s", algo_name, payload["error"])
-            return None
-        mean = payload.get("mean")
-        if not isinstance(mean, (int, float)):
-            return None
-        return float(mean)
+            return None, str(payload["error"])
+        values = payload.get("values")
+        if not isinstance(values, dict) or not values:
+            _failed = payload.get("failures") or {}
+            _first = next(iter(_failed.values()), "") if isinstance(_failed, dict) else ""
+            return None, f"no finite primary metric on any instance{f'; e.g. {_first}' if _first else ''}"
+        try:
+            return {str(k): float(v) for k, v in values.items()}, ""
+        except (TypeError, ValueError):
+            return None, "scoring returned non-numeric values"
 
     comparison: dict[str, Any] = {}
     n_promoted = 0
@@ -1045,34 +1070,48 @@ def _promote_llm4ad_to_experiment_final(
             logger.info("Stage 13: %s unchanged — keeping baseline", algo_name)
             continue
 
-        baseline_score = _score(algo_name, base_algo)
-        evolved_score = _score(algo_name, evolved_src)
+        baseline_values, baseline_detail = _score(algo_name, base_algo)
+        evolved_values, evolved_detail = _score(algo_name, evolved_src)
 
         # A failed/unsaved evolution counts as "no improvement": never degrade.
-        if evolved_score is None:
+        # Which side failed matters — "evolved failed" and "baseline failed"
+        # need different follow-up, and reporting one as the other sent an
+        # earlier investigation down the wrong path.
+        if baseline_values is None or evolved_values is None:
+            if baseline_values is None and evolved_values is None:
+                _reason = (
+                    f"scoring failed on both sides (baseline: {baseline_detail}; "
+                    f"evolved: {evolved_detail})"
+                )
+            elif evolved_values is None:
+                _reason = f"evolved scoring failed ({evolved_detail})"
+            else:
+                _reason = f"baseline scoring failed ({baseline_detail})"
             comparison[algo_name] = {
-                "baseline": baseline_score, "evolved": None, "delta_pct": None,
-                "promoted": False, "failed": True,
-                "reason": "evolved evaluation failed (timeout/error/empty)",
+                "baseline": None, "evolved": None, "delta_pct": None,
+                "promoted": False, "failed": True, "reason": _reason,
             }
-            logger.warning("Stage 13: %s evolved evaluation failed — keeping baseline",
-                           algo_name)
+            logger.warning("Stage 13: %s — %s; keeping baseline", algo_name, _reason)
             continue
 
-        if baseline_score is None:
-            # Baseline exists but couldn't be scored (subprocess failed) — we
-            # cannot judge improvement, and the clean file is already in
-            # final_dir, so keep it. Conservative: never guess by promoting.
+        # Compare like with like.  If the candidate crashed on an instance the
+        # baseline solved, averaging each over its own instance set compares two
+        # different quantities and can promote a strictly worse algorithm.
+        common = sorted(set(baseline_values) & set(evolved_values))
+        if not common:
             comparison[algo_name] = {
-                "baseline": None, "evolved": evolved_score, "delta_pct": None,
-                "promoted": False, "failed": False,
-                "reason": "baseline evaluation failed (no reference score)",
+                "baseline": None, "evolved": None, "delta_pct": None,
+                "promoted": False, "failed": True,
+                "reason": "no instance was scored by both baseline and evolved",
             }
             logger.warning(
-                "Stage 13: %s baseline evaluation failed — keeping clean code",
-                algo_name,
+                "Stage 13: %s — no shared scored instance; keeping baseline", algo_name,
             )
             continue
+
+        baseline_score = sum(baseline_values[k] for k in common) / len(common)
+        evolved_score = sum(evolved_values[k] for k in common) / len(common)
+        n_total = max(len(baseline_values), len(evolved_values))
 
         # Direction-aware improvement test (minimize → lower is better).
         better = evolved_score < baseline_score if not maximize else evolved_score > baseline_score
@@ -1090,12 +1129,15 @@ def _promote_llm4ad_to_experiment_final(
             "delta_pct": delta_pct,
             "promoted": better,
             "failed": False,
+            "n_instances_compared": len(common),
+            "n_instances_total": n_total,
             "reason": "improved" if better else "equal or worse than baseline",
         }
         logger.info(
-            "Stage 13: %s %s (baseline=%.6g evolved=%.6g delta=%.3f%%)",
+            "Stage 13: %s %s (baseline=%.6g evolved=%.6g delta=%.3f%% over %d/%d instances)",
             algo_name, "promoted" if better else "kept baseline",
             baseline_score, evolved_score, delta_pct if delta_pct is not None else 0.0,
+            len(common), n_total,
         )
 
     if not n_promoted:
@@ -1484,8 +1526,26 @@ def _execute_iterative_refine(
 
     # --- Helper: format all files for LLM context ---
     def _files_to_context(project_files: dict[str, str]) -> str:
+        """Render the project as prompt context — source files only.
+
+        ``best_files`` is the project payload as well as the prompt context, and
+        the two need different contents.  ``_write_project`` must keep every
+        collected file so the refined project stays runnable (data/*.json
+        included), but the refinement prompt asks for ``filename:xxx.py`` back
+        and never acts on a data file.  One ML23 run carried 3.8MB of
+        data/*.json into the prompt — ~1M tokens — and every gateway rejected it
+        with HTTP 400 across three vendors before the fallback chain gave up.
+        Filtering here, not at collection time, keeps both uses correct.
+        """
         parts = []
         for fname, code in sorted(project_files.items()):
+            if not fname.endswith(".py"):
+                continue
+            if len(code) > _CONTEXT_FILE_MAX_CHARS:
+                code = (
+                    code[:_CONTEXT_FILE_MAX_CHARS]
+                    + f"\n# ... [truncated, {len(code)} chars total]"
+                )
             parts.append(f"```filename:{fname}\n{code}\n```")
         return "\n\n".join(parts)
 
