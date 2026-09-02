@@ -29,6 +29,33 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+def _rmtree_force(path: Path) -> None:
+    """Delete ``path`` including read-only files (git worktrees).
+
+    ``shutil.rmtree(..., ignore_errors=True)`` is not enough here: git marks
+    every object under ``.git/objects`` read-only, so on Windows the unlink
+    raises PermissionError and ``ignore_errors`` swallows it — the tree is left
+    half-deleted with the old git history intact. A resurrected history is worse
+    than no cleanup at all: the next run's ``auto_initialize`` sees the previous
+    snapshot as HEAD. Clearing the read-only bit and retrying is the standard
+    way to remove a git tree on Windows.
+    """
+    import stat as _stat
+
+    def _clear_readonly(func, target, _exc):  # noqa: ANN001 - shutil callback shape
+        try:
+            os.chmod(target, _stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass  # genuinely undeletable (locked by another process)
+
+    try:
+        shutil.rmtree(path, onexc=_clear_readonly)
+    except TypeError:  # Python < 3.12 renamed the hook to onexc
+        shutil.rmtree(path, onerror=_clear_readonly)
+
+
 # ---------------------------------------------------------------------------
 # Complexity scoring
 # ---------------------------------------------------------------------------
@@ -271,6 +298,20 @@ is discarded as a failure. If a detail is unclear, pick a sensible default,
 note it in a comment, and continue.
 
 Your first action must be a tool call that reads TASK.md — never a text reply.
+
+RULE — ONE file per step. Write exactly one file per step, then start the next
+step for the next file. Never emit a whole multi-file project in a single step.
+A single step's output is capped at a hard limit: if a step tries to write more
+than one large file (or one very large file), the tail of that output is
+truncated and you LOSE everything it was writing — the truncated step commits
+no files. This is a requirement, not a suggestion. Keep each step focused,
+small and complete: one file, written and closed, then continue.
+
+If any single file is itself too large to fit in one step (roughly 400+ lines),
+do not write a huge file in one step. Split it: write the smaller modules as
+separate files, or grow a large file across steps by writing the first part
+then appending the rest with a shell redirect (`>>`) in the next step.
+
 You are NOT done when the files exist — you are done when you have RUN them and
 they work. TASK.md tells you which interpreter to use and what to check.
 Writing no files is a failure; so is reporting success for code you never ran.
@@ -372,10 +413,18 @@ after your best effort, say so explicitly and leave the files in place.
 
 # Prepended to the CLI prompt on a retry. Kept deliberately short for the same
 # command-line length reason; the detail goes in RETRY.md.
+#
+# BUG-OB-X: the retry used to open a FRESH OpenCode session with no task
+# description, so attempt 2+ replied "I don't have the original task
+# description" and wrote nothing. The full task is always on disk in TASK.md
+# (rewritten per attempt by _prepare_workspace), so the retry prompt must point
+# straight at it — never assume the session carries the prior task context.
 _RETRY_PROMPT_PREFIX = """\
 RETRY: the previous attempt FAILED and produced no usable code.
-Read RETRY.md for what went wrong, then implement the task properly this time.
-
+Read RETRY.md for what went wrong. This is a brand-new session — it has NOT
+seen the previous attempt or the task. The full task is in TASK.md; read it
+FIRST (tool call, not text) and implement it. Do not reply with a question:
+a text-only reply is itself the failure mode.
 """
 
 _RETRY_MD_TEMPLATE = """\
@@ -386,10 +435,15 @@ Reason: {reason}
 {no_files_note}Do not repeat the previous mistake. Write the actual files this
 time: create `main.py` and every supporting module with real, runnable code.
 
+Write ONE file per step. Do not emit a whole project in a single step — a step
+is capped and the tail of a big output is truncated. Keep each step small and
+complete, then start the next step for the next file.
+
 The previous attempt's output is in `PREVIOUS_ATTEMPT/` and its log in
 `PREVIOUS_ATTEMPT_ERROR.txt`, for reference only.
 
-Re-read `TASK.md` and follow it.
+This is a brand-new session. Re-read `TASK.md` FIRST and follow it — that is
+the task; do not reply with a question.
 """
 
 _NO_FILES_NOTE = (
@@ -1043,7 +1097,7 @@ class OpenCodeBridge:
             if ws is None:
                 return
             if kept_workspace is not None and kept_workspace != ws:
-                shutil.rmtree(kept_workspace, ignore_errors=True)
+                _rmtree_force(kept_workspace)
             kept_workspace = ws
 
         for attempt in range(1 + self._max_retries):
@@ -1148,9 +1202,9 @@ class OpenCodeBridge:
                 # every earlier failed attempt, so drop those too.
                 if self._workspace_cleanup:
                     if workspace.exists():
-                        shutil.rmtree(workspace, ignore_errors=True)
+                        _rmtree_force(workspace)
                     if kept_workspace is not None:
-                        shutil.rmtree(kept_workspace, ignore_errors=True)
+                        _rmtree_force(kept_workspace)
                         kept_workspace = None
 
                 return OpenCodeResult(
@@ -1178,7 +1232,7 @@ class OpenCodeBridge:
                 prev_files = recovered
                 if "main.py" not in recovered:
                     if self._workspace_cleanup:
-                        shutil.rmtree(workspace, ignore_errors=True)
+                        _rmtree_force(workspace)
                     else:
                         _retire(workspace)
                 else:
@@ -1197,7 +1251,7 @@ class OpenCodeBridge:
         if salvaged_files:
             files = self._ensure_main_entry_point(salvaged_files)
             if self._workspace_cleanup and kept_workspace is not None:
-                shutil.rmtree(kept_workspace, ignore_errors=True)
+                _rmtree_force(kept_workspace)
                 kept_workspace = None
             logger.warning(
                 "Beast mode: all %d attempt(s) failed; falling back to %d "
@@ -1215,6 +1269,17 @@ class OpenCodeBridge:
             )
 
         # All attempts failed
+        # BUG: the full transcript used to be dropped here — only `last_error`
+        # (the last attempt's final line) survived, and only in the in-memory
+        # result; nothing was written to disk. Persist the whole log so a
+        # post-mortem can see what OpenCode actually did across all attempts.
+        if last_error:
+            try:
+                (stage_dir / "opencode_log.txt").write_text(
+                    last_error or "", encoding="utf-8",
+                )
+            except OSError as _wexc:
+                logger.warning("Beast mode: failed to write log: %s", _wexc)
         return OpenCodeResult(
             success=False,
             opencode_log=last_error,

@@ -512,6 +512,14 @@ class Llm4adEvolutionConfig:
     mutation_rate: float = 0.6
     crossover_rate: float = 0.3
     island: dict[str, Any] = field(default_factory=dict)
+    # Which algorithms to evolve. Empty (default) evolves everything in
+    # algorithms/. A dict selects a subset: {"categories": ["proposed"]},
+    # {"names": ["cma_es_default"]}, or both (union). Categories are resolved
+    # against the per-run algorithms_classification.json that stage-10 writes
+    # after the LLM classifies the generated algorithm tree; names match
+    # algorithm directory names directly. Kept free-form so the same field
+    # needs no schema change when a topic labels methods differently.
+    evolve_scope: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1578,6 +1586,12 @@ def _parse_llm4ad_evolution_config(data: dict[str, Any]) -> Llm4adEvolutionConfi
     if not data:
         return Llm4adEvolutionConfig()
     island = data.get("island") or {}
+    # evolve_scope is free-form (dict-shaped) so it needs no schema revision
+    # when a topic labels methods differently; an absent/invalid value stays
+    # empty, which the downstream filter treats as "evolve everything".
+    evolve_scope = data.get("evolve_scope")
+    if not isinstance(evolve_scope, dict):
+        evolve_scope = {}
     return Llm4adEvolutionConfig(
         method=str(data.get("method", "island_ga")),
         max_generations=_safe_int(data.get("max_generations"), 2),
@@ -1585,6 +1599,7 @@ def _parse_llm4ad_evolution_config(data: dict[str, Any]) -> Llm4adEvolutionConfi
         mutation_rate=_safe_float(data.get("mutation_rate"), 0.6),
         crossover_rate=_safe_float(data.get("crossover_rate"), 0.3),
         island=dict(island) if isinstance(island, dict) else {},
+        evolve_scope=dict(evolve_scope),
     )
 
 

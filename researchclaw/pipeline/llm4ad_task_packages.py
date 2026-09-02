@@ -28,10 +28,13 @@ Design decisions (verified against LLM4AD_Next/src/llm4ad and its
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -182,6 +185,83 @@ def _discover_algorithms(exp_dir: Path) -> list[tuple[str, Path]]:
         if src.is_file():
             found.append((sub.name, src))
     return found
+
+
+def _read_algorithms_classification(exp_dir: Path) -> dict[str, str] | None:
+    """Read stage-10's algorithm classification, if present.
+
+    Returns a mapping ``{algo_name: category}`` (category ∈ proposed /
+    baseline / ablation) or ``None`` when the file does not exist. When it does
+    exist but is unreadable the caller treats it as absent, so a malformed file
+    never hard-fails evolution.
+    """
+    cls_path = exp_dir / "algorithms_classification.json"
+    if not cls_path.is_file():
+        return None
+    try:
+        data = json.loads(cls_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    mapping = data.get("classification", {}) if isinstance(data, dict) else {}
+    if not isinstance(mapping, dict):
+        return None
+    return {
+        str(algo): str(cat) for algo, cat in mapping.items()
+        if isinstance(cat, str)
+    }
+
+
+def _filter_algorithms_by_scope(
+    algorithms: list[tuple[str, Path]],
+    exp_dir: Path,
+    evolve_scope: dict[str, Any] | None,
+) -> list[tuple[str, Path]]:
+    """Filter ``algorithms`` down to the configured evolution scope.
+
+    ``evolve_scope`` is dict-shaped (see ``Llm4adEvolutionConfig.evolve_scope``):
+    ``{"categories": [...]}`` selects by the category stage-10 assigned each
+    algorithm; ``{"names": [...]}`` selects by algorithm directory name; both
+    keys select the union. An empty/absent dict or a scope that selects no
+    known algorithm leaves the full list intact (whole-list evolution keeps
+    working, and a typo in a name logs a warning instead of silently producing
+    zero packages).
+    """
+    if not evolve_scope:
+        return algorithms
+    wanted_categories = {
+        str(c).strip().lower()
+        for c in evolve_scope.get("categories", []) if str(c).strip()
+    }
+    wanted_names = {
+        str(n).strip() for n in evolve_scope.get("names", []) if str(n).strip()
+    }
+    if not wanted_categories and not wanted_names:
+        return algorithms
+
+    classification = _read_algorithms_classification(exp_dir)
+    filtered: list[tuple[str, Path]] = []
+    for algo, src in algorithms:
+        in_names = algo in wanted_names
+        in_cats = (
+            wanted_categories
+            and classification is not None
+            and str(classification.get(algo, "")).strip().lower() in wanted_categories
+        )
+        if in_names or in_cats:
+            filtered.append((algo, src))
+        else:
+            logger.info(
+                "llm4ad: algorithm '%s' excluded by evolve_scope %s",
+                algo, evolve_scope,
+            )
+    if not filtered:
+        logger.warning(
+            "llm4ad: evolve_scope %s matched no algorithm; falling back to "
+            "the full algorithm list (%d).",
+            evolve_scope, len(algorithms),
+        )
+        return algorithms
+    return filtered
 
 
 def _discover_instances(exp_dir: Path) -> list[Path]:
@@ -717,6 +797,7 @@ def generate_task_packages(
     metric_direction: str = "",
     runs_base_dir: Path | None = None,
     run_id: str = "",
+    evolve_scope: dict[str, Any] | None = None,
 ) -> list[PackageManifest]:
     """Generate one self-contained LLM4AD task package per algorithm.
 
@@ -743,6 +824,13 @@ def generate_task_packages(
             git worktrees live. Under a deep artifact tree this keeps paths under
             Windows' 260-char limit; when omitted each package uses its own
             ``./runs``.
+        evolve_scope: Optional subset filter. An empty/absent value evolves every
+            discovered algorithm. A dict restricts the set: ``{"categories":
+            ["proposed"]}`` keeps algorithms stage-10 classified as ``proposed``;
+            ``{"names": [...]}`` keeps exact directory names; keep both for the
+            union. Categories come from the per-run
+            ``experiment/algorithms_classification.json``, so no distribution
+            assumptions are baked in here.
 
     Returns:
         A list of PackageManifest describing each generated package."""
@@ -757,12 +845,26 @@ def generate_task_packages(
         metric_direction = infer_metric_direction(primary_metric)
     providers_yaml = build_providers_yaml(llm_config)
     algorithms = _discover_algorithms(exp_dir)
+    n_all_algorithms = len(algorithms)
+    algorithms = _filter_algorithms_by_scope(algorithms, exp_dir, evolve_scope)
     instances = _discover_instances(exp_dir)
 
     manifests: list[PackageManifest] = []
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for algo, src in algorithms:
+    total_pkgs = len(algorithms)
+    if total_pkgs < n_all_algorithms:
+        logger.info(
+            "llm4ad: evolve_scope kept %d/%d algorithm(s)",
+            total_pkgs, n_all_algorithms,
+        )
+    logger.info(
+        "llm4ad: building %d task package(s)",
+        total_pkgs,
+    )
+
+    for idx, (algo, src) in enumerate(algorithms, start=1):
+        logger.info("llm4ad: building package %d/%d -> %s", idx, total_pkgs, algo)
         package = out_dir / algo
 
         # Rebuild from scratch every run: llm4ad's git_worktree branches new
@@ -833,6 +935,11 @@ def generate_task_packages(
     manifest_path.write_text(
         json.dumps([m.__dict__ for m in manifests], indent=2),
         encoding="utf-8",
+    )
+
+    logger.info(
+        "llm4ad: finished building %d/%d task package(s); manifest -> %s",
+        len(manifests), total_pkgs, manifest_path,
     )
 
     return manifests

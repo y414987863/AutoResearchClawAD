@@ -671,6 +671,10 @@ def _generate_llm4ad_task_packages(
         _manifests = generate_task_packages(
             Path(_tp_exp), _tp_out, _llm_config, _evo_cfg, _res_cfg,
             background=_topic, metric_direction=_direction,
+            # Evolution scope (categories/names) from config; empty evolves all
+            # algorithms. Category membership is resolved against the per-run
+            # algorithms_classification.json stage-10 wrote.
+            evolve_scope=_evo_cfg.get("evolve_scope") if _evo_cfg else None,
             # Worktrees live under the temp dir (not task_packages/, whose deep
             # path hits Windows' 260-char limit), scoped to this invocation.
             runs_base_dir=Path(tempfile.gettempdir()) / "rc_llm4ad" / run_dir.name / f"run_{_l4b_token}",
