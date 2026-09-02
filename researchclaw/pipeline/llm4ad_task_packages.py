@@ -20,13 +20,17 @@ Design decisions (verified against LLM4AD_Next/src/llm4ad and its
   ``cfg.project_root``, and passes the algorithm path down as an argument.
   run_single.py loads it with ``spec_from_file_location`` so the worktree never
   joins ``sys.path``.
-- ``main.py`` hard-codes one smoke instance, so it is NOT used. Each package
-  gets ``run_single.py`` that reads any instance file from ``EvalContext.data_path``.
+- ``main.py`` hard-codes one smoke instance, so it is not the ENTRY POINT here:
+  each package gets ``run_single.py`` that reads any instance file from
+  ``EvalContext.data_path``. It is still SHIPPED, because the algorithm may
+  legitimately import it for shared configuration; what must not happen is
+  ``evaluator.py`` depending on it, which is asserted rather than assumed.
 - The evaluator reports per-instance metrics; LLM4AD aggregates across instances.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import shutil
@@ -50,10 +54,19 @@ class PackageManifest:
 # Fixed modules live at the experiment root. Which ones exist is the generated
 # experiment's business — a TSP-style task needs nothing like the bounds/stats
 # helpers a continuous-optimisation task needs — so they are discovered rather
-# than named. `main.py` is deliberately excluded: the runner never imports it,
-# and copying it would invite an evaluator that depends on values main.py
-# injects at runtime (which the runner would then not supply).
-_EXCLUDED_ROOT_MODULES = frozenset({"main.py", "run_single.py"})
+# than named.
+#
+# Only `run_single.py` is excluded, because the packager writes its own.
+# `main.py` used to be excluded too, on the reasoning that "the runner never
+# imports it". That held for the runner but not for the ALGORITHM: a stage-12
+# experiment is free to keep shared configuration at the entry point (the
+# structure validator in _code_generation.py positively REQUIRES main.py to
+# exist), and an algorithm that reads it — `import main; main.HYPERPARAMETERS` —
+# then died with ModuleNotFoundError inside every single candidate, scoring the
+# whole run -inf. Excluding a module by name cannot know whether the algorithm
+# depends on it; shipping every root module and CHECKING the property we
+# actually care about can (see _assert_evaluator_independent_of_main).
+_EXCLUDED_ROOT_MODULES = frozenset({"run_single.py"})
 
 # Marker prefixing run_single.py's JSON line so the evaluator can find it even
 # when stdout carries other output.
@@ -74,6 +87,71 @@ def _discover_shared_modules(exp_dir: Path) -> list[Path]:
         p for p in exp_dir.glob("*.py")
         if p.is_file() and p.name not in _EXCLUDED_ROOT_MODULES
     )
+
+
+def _local_import_closure(entry: Path, exp_dir: Path) -> set[str]:
+    """Root-module names transitively imported by ``entry``, resolved in ``exp_dir``.
+
+    Static (AST) resolution over a FLAT layout: the package root holds every
+    shared module, so an import resolves iff ``exp_dir/<name>.py`` exists.
+    Relative imports are skipped (there is no package to be relative to), and so
+    are stdlib/third-party names, which have no file beside the entry point.
+    Function-local imports count — ``main.py`` imports the evaluator inside
+    ``main()``, and the algorithm that motivated this did its ``import main``
+    inside ``optimize()``.
+
+    This cannot see ``importlib.import_module(name)``, which is exactly how
+    main.py loads the algorithm, so it never decides what ships —
+    :func:`_discover_shared_modules` ships every root module for that reason.
+    It only answers the narrow question the independence check needs.
+    """
+    seen: set[str] = set()
+    queue = [entry]
+    while queue:
+        current = queue.pop()
+        try:
+            tree = ast.parse(current.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module.split(".")[0]]
+            for name in names:
+                if name in seen:
+                    continue
+                candidate = exp_dir / f"{name}.py"
+                if candidate.is_file():
+                    seen.add(name)
+                    queue.append(candidate)
+    return seen
+
+
+def _assert_evaluator_independent_of_main(exp_dir: Path) -> None:
+    """Reject an experiment whose ``evaluator.py`` depends on ``main.py``.
+
+    This is the property the old ``main.py`` exclusion was really protecting.
+    run_single.py calls ``evaluate_instance`` directly and never runs ``main()``,
+    so an evaluator reading values main.py sets up at runtime would score every
+    candidate against something the runner does not supply. Omitting main.py
+    enforced that by construction — but also broke every algorithm that
+    legitimately imports it, which is the strictly worse failure: it is silent
+    (candidates just fail), total (-inf for the whole run), and pays full LLM
+    budget first. Checking the property keeps the guarantee without the cost.
+    """
+    evaluator = exp_dir / "evaluator.py"
+    if not evaluator.is_file():
+        return
+    if "main" in _local_import_closure(evaluator, exp_dir):
+        raise ValueError(
+            "evaluator.py imports main.py (directly or transitively), but "
+            "run_single.py calls evaluate_instance() without ever running "
+            "main() — anything main.py prepares at runtime would be missing "
+            "and every candidate would be scored against it. Move the shared "
+            "values into a module both can import."
+        )
 
 # Metric-name fragments that decide the optimisation direction. LLM4AD needs a
 # MetricType per metric; getting it wrong silently evolves the algorithm in the
@@ -844,6 +922,10 @@ def generate_task_packages(
     else:
         metric_direction = infer_metric_direction(primary_metric)
     providers_yaml = build_providers_yaml(llm_config)
+    # Now that every root module ships, the evaluator/main independence that the
+    # old exclusion enforced by omission has to be asserted. Checked once for the
+    # experiment, before any package is written.
+    _assert_evaluator_independent_of_main(exp_dir)
     algorithms = _discover_algorithms(exp_dir)
     n_all_algorithms = len(algorithms)
     algorithms = _filter_algorithms_by_scope(algorithms, exp_dir, evolve_scope)
@@ -1066,6 +1148,80 @@ def _resolve_run_best(
     return None, None, None, {}
 
 
+def smoke_check_package(
+    package_dir: Path,
+    algo: str,
+    timeout_sec: float = 600.0,
+    env: dict[str, str] | None = None,
+) -> str:
+    """Score the SEED algorithm once; return "" on success or a reason string.
+
+    Reproduces exactly what the generated evaluator does per candidate —
+    ``sys.executable run_single.py <instance> <algo.py>`` from the package root,
+    then look for :data:`_RESULT_MARKER` in stdout — using the unevolved seed
+    algorithm the package shipped with.
+
+    Every candidate is a mutation of this seed and is scored through this same
+    path, so a seed that cannot produce a marker line means no candidate will
+    either. That is worth one ~5s subprocess: the failure mode it catches
+    (ModuleNotFoundError inside ``optimize``) is invisible in llm4ad's exit code,
+    which is 0 for a run where all 11 candidates failed and the best score is
+    -inf, and is only reachable after the full LLM budget has been spent.
+
+    In principle evolution could repair a broken seed, but stage-10's baseline is
+    the comparison reference — if it does not run, the comparison is meaningless
+    regardless of what evolves.
+    """
+    import subprocess as _sp
+    import sys as _sys
+
+    # Absolute, because we hand these to a child with cwd=package_dir: a relative
+    # path would be resolved against the NEW cwd and fail to open. The generated
+    # evaluator has the same requirement and meets it via Path(__file__).resolve().
+    package_dir = Path(package_dir).resolve()
+    run_script = package_dir / "run_single.py"
+    if not run_script.is_file():
+        return "run_single.py missing from package root"
+    algo_file = package_dir / "algorithms" / algo / f"{algo}.py"
+    if not algo_file.is_file():
+        return f"seed algorithm missing: algorithms/{algo}/{algo}.py"
+    instances = sorted(p for p in (package_dir / "data").glob("*") if p.is_file())
+    if not instances:
+        return "no instance files under data/"
+
+    try:
+        proc = _sp.run(
+            [_sys.executable, str(run_script), str(instances[0]), str(algo_file)],
+            cwd=str(package_dir),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_sec,
+            check=False,
+            env=env,
+        )
+    except _sp.TimeoutExpired:
+        return f"seed algorithm timed out after {timeout_sec:g}s on {instances[0].name}"
+    except OSError as exc:
+        return f"could not run run_single.py: {exc}"
+
+    if proc.returncode != 0:
+        _err = (proc.stderr or "").strip().splitlines()
+        # The last line carries the exception; the traceback above it is noise
+        # here (it is already in the package and in llm4ad's own log).
+        return (
+            f"seed algorithm failed on {instances[0].name}: "
+            f"{_err[-1] if _err else f'exit {proc.returncode}'}"
+        )
+    if _RESULT_MARKER not in (proc.stdout or ""):
+        return (
+            f"seed algorithm ran on {instances[0].name} but printed no "
+            f"{_RESULT_MARKER} line — the evaluator would score it as a failure"
+        )
+    return ""
+
+
 def run_evolution_on_packages(
     packages_dir: Path,
     llm4ad_cmd: str = "llm4ad",
@@ -1120,16 +1276,67 @@ def run_evolution_on_packages(
         algo = package_dir.name
         import yaml as _yw
         try:
-            _bs = (_yw.safe_load(cfg_path.read_text(encoding="utf-8")) or {}).get("base_dir") or ""
+            _cfg_data = _yw.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
         except (OSError, ValueError):
-            _bs = ""
+            _cfg_data = {}
+        _bs = _cfg_data.get("base_dir") or ""
         # Absolute (temp) base_dir wins; otherwise fall back to the package's
         # own ./runs for packages built by older code.
-        if _bs and not _bs.startswith("./") and not _bs.startswith(".\\"):
-            _runs_root = Path(_bs).resolve()
+        # Use Path.is_absolute() to reliably detect absolute paths on any platform.
+        if _bs:
+            _bs_path = Path(_bs)
+            _use_temp_dir = _bs_path.is_absolute()
+            _runs_root = _bs_path.resolve()
         else:
             _runs_root = package_dir / "runs"
-        _runs_root.mkdir(parents=True, exist_ok=True)
+            _use_temp_dir = False
+
+        # Clear the run directory before evolution for a clean slate.
+        # When using temp dir: clear both temp dir and package/runs/
+        # When not using temp dir: they're the same, clear once
+        _package_runs = package_dir / "runs"
+
+        if _use_temp_dir:
+            # Clear temp directory first
+            if _runs_root.exists():
+                shutil.rmtree(_runs_root, ignore_errors=True)
+            _runs_root.mkdir(parents=True, exist_ok=True)
+            # Clear package runs/ to prepare for copy-back
+            if _package_runs.exists():
+                shutil.rmtree(_package_runs, ignore_errors=True)
+            _package_runs.mkdir(parents=True, exist_ok=True)
+        else:
+            # _runs_root and _package_runs are the same, clear once
+            if _package_runs.exists():
+                shutil.rmtree(_package_runs, ignore_errors=True)
+            _package_runs.mkdir(parents=True, exist_ok=True)
+
+        # Score the seed once before spending any LLM budget. Bound it by the
+        # evaluator's OWN per-candidate timeout so the check is faithful: a seed
+        # that needs longer than a candidate is allowed would fail as a candidate
+        # too, and that is a finding, not a false alarm.
+        _smoke_timeout = 600.0
+        try:
+            _smoke_timeout = float(
+                (_cfg_data.get("evaluator") or {}).get("timeout") or _smoke_timeout
+            )
+        except (TypeError, ValueError):
+            pass
+        _smoke_err = smoke_check_package(
+            package_dir, algo, timeout_sec=_smoke_timeout, env=base_env,
+        )
+        if _smoke_err:
+            results.append(
+                EvolutionResult(
+                    algo=algo,
+                    success=False,
+                    error_message=(
+                        f"pre-evolution smoke check failed, evolution skipped: "
+                        f"{_smoke_err}"
+                    ),
+                )
+            )
+            continue
         try:
             proc = _sp.run(
                 [llm4ad_cmd, "run", "config.yaml"],
@@ -1160,6 +1367,23 @@ def run_evolution_on_packages(
             best_dir, run_id, best_score, best_metrics = _resolve_run_best(
                 package_dir, algo, runs_root=_runs_root
             )
+
+            # Copy the temp run directory back to the package for visualization
+            # and artifact preservation.
+            if _use_temp_dir and _runs_root.is_dir():
+                try:
+                    # Copy the entire temp runs tree back to package/runs/
+                    for item in _runs_root.iterdir():
+                        dest = _package_runs / item.name
+                        if item.is_dir():
+                            shutil.copytree(item, dest, dirs_exist_ok=True)
+                        else:
+                            shutil.copy2(item, dest)
+                except Exception as _copy_exc:
+                    # Log but don't fail the run — the evolution succeeded,
+                    # we just couldn't preserve its artifacts locally.
+                    tail += f"\n[WARNING] Failed to copy runs back: {_copy_exc}"
+
             results.append(
                 EvolutionResult(
                     algo=algo,

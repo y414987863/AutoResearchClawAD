@@ -452,6 +452,137 @@ _NO_FILES_NOTE = (
     "is exactly the failure mode to avoid: ask nothing, write code.\n\n"
 )
 
+# Cap the context handed back to a retry. ``_invoke_opencode`` returns EVERY
+# line opencode prints as a JSON event, and each event embeds whatever file the
+# agent read (TASK.md, GUIDANCE.md, RETRY.md itself, ...) in full. Dumping all
+# of it as the retry ``reason`` blew RETRY.md and PREVIOUS_ATTEMPT_ERROR.txt up
+# to ~72KB each and, because the agent then READS RETRY.md, the file content
+# re-entered the event stream and the next retry's dump grew again — a
+# compounding blow-up across retries that also bloated the model's context.
+# Only a short diagnostic tail is useful to the next attempt; the verbose
+# event stream stays on disk in opencode_log.txt for humans.
+_RETRY_REASON_MAX_CHARS = 2000
+
+
+def _summarize_log(log: str, *, max_chars: int = _RETRY_REASON_MAX_CHARS) -> str:
+    """Compress an OpenCode event stream into a short retry reason.
+
+    The raw log is one JSON object per line. Most of it is tool-use noise with
+    huge ``output``/``content`` payloads (the agent echoing every file it read),
+    which carries no signal about WHY the attempt failed. This keeps only the
+    diagnostic lines — the trailing failure marker (``TIMEOUT`` / ``error`` /
+    ``exit`` / ``reason``) and the final events — and strips the embedded
+    file-content fields, so a retry sees a compact reason rather than a
+    ~70KB transcript.
+    """
+    if not log:
+        return ""
+    lines = [l.rstrip("\n") for l in log.splitlines()]
+
+    # The whole pipeline below is best-effort over UNTRUSTED data (an arbitrary
+    # opencode event stream, possibly truncated mid-JSON, possibly with
+    # circular/unpicklable objects if a provider returns an odd shape). Any of
+    # json.loads / json.dumps / the recursive _shrink can throw on such input.
+    # A failure here must NOT take down the retry loop — the callers assign
+    # ``last_error = _summarize_log(log)`` at the top of the exception-handling
+    # path, so a raise would mask the very error we are trying to summarise.
+    # Fall back to a plain tail-of-log if anything unexpected blows up.
+    try:
+        return _summarize_log_impl(log, lines, max_chars=max_chars)
+    except Exception:  # noqa: BLE001 — log summarisation must never raise
+        fallback = "\n".join(lines[-6:])
+        return fallback[-max_chars:]
+
+
+def _summarize_log_impl(log: str, lines: list[str], *, max_chars: int) -> str:
+    """Actual summarisation; wrapped by :func:`_summarize_log` for safety."""
+    if not lines:
+        return ""
+
+    def _is_signal(line: str) -> bool:
+        # Only a line that is a TOP-LEVEL event object counts. Matching signal
+        # words anywhere is too loose: the agent reads GUIDANCE.md, whose prose
+        # ("no network access", "do NOT use", ...) contains "error"/"failed"
+        # and those get echoed into a read event's content, which then passes
+        # the word match while carrying zero diagnostic signal.
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            # Not JSON — keep only a trailing marker like the TIMEOUT line.
+            return line.startswith("TIMEOUT") or (
+                "timeout" in line.lower() and "after" in line.lower()
+            )
+        if not isinstance(obj, dict):
+            return False
+        # An event declaring a type like "error"/"failure" is a real signal.
+        etype = str(obj.get("type", "")).lower()
+        if any(tok in etype for tok in ("error", "fail", "timeout")):
+            return True
+        # A step that ended for a "length" / "error" / "max_tokens" / "stop"
+        # reason is the failure mechanism (output truncated mid-write).
+        reason = str(obj.get("part", {}).get("reason", "")).lower() if isinstance(
+            obj.get("part"), dict
+        ) else ""
+        return any(tok in reason for tok in ("error", "length", "max_tokens", "stop"))
+
+    # Prefer signal-carrying lines; fall back to the tail when none are present
+    # (e.g. a plain tool-call loop that never raised, which is itself the bug).
+    chosen = [l for l in lines if _is_signal(l)]
+    if not chosen:
+        chosen = lines[-6:]
+
+    # Compress any embedded JSON deep in a line down to its bare text. This is
+    # best-effort: if a line is not JSON or truncation already cut it, keep it.
+    compact: list[str] = []
+    for line in chosen:
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            compact.append(line)
+            continue
+
+        def _shrink(v: Any) -> Any:
+            if isinstance(v, dict):
+                out = {}
+                for k, val in v.items():
+                    # File-body echoes are the bulk of the transcript; drop them.
+                    if k in ("output", "content", "preview", "text"):
+                        out[k] = _truncate_json_text(val)
+                    else:
+                        out[k] = _shrink(val)
+                return out
+            if isinstance(v, list):
+                return [_shrink(item) for item in v]
+            return v
+
+        obj = _shrink(obj)
+        # The original ``sep`` style is single-line per event; keep it that way
+        # so a compacted reason stays one object per line, not pretty-printed.
+        try:
+            compact.append(json.dumps(obj, ensure_ascii=False))
+        except (TypeError, ValueError, RecursionError):
+            # A single un-serialisable line (circular ref, odd provider shape)
+            # must not kill the whole summary — keep the raw line instead.
+            compact.append(line)
+
+    out = "\n".join(compact)
+    return out[-max_chars:]
+
+
+def _truncate_json_text(value: Any, limit: int = 160) -> Any:
+    """Shrink an ``output``/``content``/``preview``/``text`` field.
+
+    These hold the file text the agent read (or the code it wrote) verbatim,
+    which is exactly the bulk that bloats the retry reason. Keep a short
+    head+tail so the *kind* of content is still identifiable.
+    """
+    if not isinstance(value, str):
+        return value
+    if len(value) <= limit:
+        return value
+    return value[:limit] + f"...<+{len(value) - limit} chars truncated>"
+
+
 
 class OpenCodeBridge:
     """Manages OpenCode CLI invocations for beast mode code generation."""
@@ -1179,7 +1310,9 @@ class OpenCodeBridge:
                         last_error = "No main.py in OpenCode output"
                         prev_had_no_files = False
                     # Carry this attempt's output + reason to the next retry.
-                    prev_error = log
+                    # Keep the reason COMPACT: a full log here re-enters RETRY.md
+                    # and, once the agent reads RETRY.md, the next attempt's log.
+                    prev_error = _summarize_log(log)
                     prev_files = files
                     # BUG-07: keep the workspace so partial output can be
                     # inspected — but only the newest one. This path used to
@@ -1214,7 +1347,7 @@ class OpenCodeBridge:
                     elapsed_sec=elapsed,
                 )
 
-            last_error = log
+            last_error = _summarize_log(log)
             logger.warning(
                 "Beast mode: OpenCode attempt %d failed (%.1fs): %s",
                 attempt + 1,
@@ -1228,7 +1361,7 @@ class OpenCodeBridge:
             # is nothing useful to keep.
             if workspace and workspace.exists():
                 recovered = self._collect_files(workspace)
-                prev_error = log
+                prev_error = _summarize_log(log)
                 prev_files = recovered
                 if "main.py" not in recovered:
                     if self._workspace_cleanup:

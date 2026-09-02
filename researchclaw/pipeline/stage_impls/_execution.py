@@ -883,30 +883,61 @@ def _run_llm4ad_evolution(
             for r in results
         ],
     }
-    if not ok:
-        logger.warning(
-            "Stage 13: LLM4AD evolution produced no successes (%d packages "
-            "attempted); first error: %s",
-            len(results),
-            next((r.error_message for r in results if r.error_message), "n/a"),
-        )
+    # A completely-failed evolution must not be silent. Returning () here means
+    # no evolution_results/ → no promotion → no llm4ad_comparison.json, and
+    # experiment_final/ keeps the legacy refinement output. That is the correct
+    # DEGRADATION, but on its own it is indistinguishable in the artifacts from
+    # "evolution ran and found nothing better": the stage still reports
+    # status=done. Record the reason under its own log key (it lands in
+    # refinement_log.json) and let fail_silently decide whether it is fatal.
+    def _fail_evolution(reason: str, detail: str) -> tuple[str, ...]:
+        log["evolution_failed_completely"] = {"reason": reason, "detail": detail}
+        logger.warning("Stage 13: %s — %s", reason, detail)
+        if not fail_silently:
+            raise RuntimeError(f"Stage 13 LLM4AD evolution: {reason} — {detail}")
         return ()
 
-    # Report the scores explicitly — a run whose best_score is None produced no
-    # measurable evidence of improvement, which is worth surfacing loudly.
-    _scored = [r for r in ok if r.best_score is not None]
-    if not _scored:
-        logger.warning(
-            "Stage 13: LLM4AD evolution succeeded but no best_score was "
-            "recovered (no best/metadata.json) — the run has no quantitative "
-            "result to report downstream"
+    if not ok:
+        return _fail_evolution(
+            f"LLM4AD evolution produced no successes ({len(results)} packages attempted)",
+            next((r.error_message for r in results if r.error_message), "n/a"),
         )
-    else:
-        for r in _scored:
-            logger.info(
-                "Stage 13: LLM4AD best score for %s: %.6g (run_id=%s)",
-                r.algo, r.best_score, r.run_id,
+
+    # Require a FINITE best score, not merely a non-None one. llm4ad exits 0 and
+    # reports state=completed on a run where every candidate failed to evaluate,
+    # leaving global_best_score=-inf and an empty best/ — which _resolve_run_best
+    # then falls back to a worktree for, yielding success=True with no score. A
+    # -inf (or NaN) best is not weaker evidence of improvement, it is evidence
+    # that nothing was ever scored, so it must not reach promotion.
+    import math as _math
+
+    _scored = [
+        r for r in ok
+        if r.best_score is not None and _math.isfinite(r.best_score)
+    ]
+    if not _scored:
+        _nonfinite = [
+            r.algo for r in ok
+            if r.best_score is not None and not _math.isfinite(r.best_score)
+        ]
+        return _fail_evolution(
+            "LLM4AD evolution recovered no finite best_score",
+            (
+                f"non-finite best_score for {', '.join(_nonfinite)} — every "
+                "candidate failed to evaluate (check the task package's imports "
+                "and the llm4ad log)"
             )
+            if _nonfinite
+            else (
+                f"no best/metadata.json for {', '.join(r.algo for r in ok)} — "
+                "the run produced no quantitative result to report downstream"
+            ),
+        )
+    for r in _scored:
+        logger.info(
+            "Stage 13: LLM4AD best score for %s: %.6g (run_id=%s)",
+            r.algo, r.best_score, r.run_id,
+        )
 
     # Materialise best evolved code to a stable evolution_results/ dir.
     evo_out = stage_dir / "evolution_results"
