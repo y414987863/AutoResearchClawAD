@@ -676,9 +676,11 @@ def _repair_llm4ad_structure(
     rp_attempts = 0
     for fname, file_problems in targeted.items():
         issues_text = "\n".join(f"- {p}" for p in file_problems)
-        all_files_ctx = "\n\n".join(
-            f"```filename:{f}\n{c}\n```" for f, c in files.items()
-        )
+        # Scope the context to the file being repaired and its imports instead
+        # of every generated file — the full dump pushed single requests past
+        # the model's tolerance and produced 504/429 failures that aborted the
+        # stage after Beast mode had already succeeded.
+        all_files_ctx = _scoped_files_ctx(files, fname)
         rp = _pm.sub_prompt(
             "code_repair",
             fname=fname,
@@ -709,6 +711,115 @@ def _repair_llm4ad_structure(
 
     remaining = _check_llm4ad_structure(files)
     return files, remaining, rp_attempts
+
+
+def _scoped_files_ctx(files: dict[str, str], target: str) -> str:
+    """Build a code_repair context scoped to ``target`` and its local imports.
+
+    The old ``all_files_ctx`` dumped EVERY file the experiment generated into
+    each repair prompt. A stage-10 codebase has a dozen+ modules and several of
+    them are large (a neural-net algorithm, an evaluator, a data generator), so
+    the single ``code_repair`` request routinely ran into the hundreds of KB of
+    input, and the upstream model answered with 504 Gateway Time-out / 429 —
+    the repair loop then burned all retries and failed the STAGE even though the
+    code had already been generated (Beast mode had succeeded).
+
+    For fixing ONE file we only need that file plus the sibling modules it
+    imports. Sending a data generator and every algorithm alongside an ESN is
+    noise that inflates the request for no benefit. Top-level imports are read
+    statically (AST); transitive closures are deliberately NOT followed, because
+    a single repair should be minimal and the re-validation after the prompt
+    re-checks the whole project anyway.
+    """
+    deps: set[str] = set()
+    content = files.get(target, "")
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        tree = None
+    if tree is not None:
+        for node in ast.walk(tree):
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module.split(".")[0]]
+            for name in names:
+                if f"{name}.py" in files:
+                    deps.add(f"{name}.py")
+    ordered = [target] + sorted(deps)
+    return "\n\n".join(
+        f"```filename:{f}\n{files[f]}\n```" for f in ordered if f in files
+    )
+
+
+def _summarize_files_ctx(
+    files: dict[str, str],
+    entry_hint: str = "main.py",
+    full_files: tuple[str, ...] = (),
+) -> str:
+    """Render the project as a bounded context for CROSS-FILE repairs.
+
+    ``_scoped_files_ctx`` is for fixing ONE file in isolation. But ``deep
+    repair`` and ``ablation repair`` ask the model to touch MULTIPLE files
+    (rewriting an ablation class, renaming a config that shadows a stdlib
+    package), so the model must see the whole project — scoping it to one file
+    would make it rewrite a class without knowing the siblings it must stay
+    consistent with, and degrade the result.
+
+    The problem is the same as ``code_repair`` had: dumping every file verbatim
+    into a single request can reach hundreds of KB and 504/429. The fix used by
+    the alignment check is better than a flat truncation: keep the ENTRY point
+    in full (capped), and summarize the rest as imports + signatures. That keeps
+    the cross-file structure visible while bounding the request. Truncating
+    blindly was tried before (BUG-171) and produced false "incomplete" reads,
+    hence the summary, not a ``[:N]`` cap.
+
+    ``full_files`` is the exception to the summary: a repair that must see a
+    method BODY (deep validation reports "identical AST" / "copy-paste
+    ablation", which cannot be judged from a signature alone) passes the files
+    it needs verbatim so the model can actually fix them. Everything else stays
+    summarized to keep the request bounded.
+    """
+    entry = entry_hint if entry_hint in files else "main.py"
+    # Prefer the real entry point: a file with a __main__ guard, main.py first.
+    if entry == "main.py" and "main.py" in files:
+        for _fn, _cd in files.items():
+            if _fn != "main.py" and 'if __name__' in _cd and '__main__' in _cd:
+                if _cd.count("\n") > files["main.py"].count("\n") * 1.5:
+                    entry = _fn
+                    break
+
+    def _sig_preview(fname: str, code: str) -> str:
+        sig_lines = [
+            l for l in code.split("\n")
+            if l.strip().startswith(("def ", "class ", "async def ", "import ", "from "))
+        ]
+        if sig_lines:
+            return f"# --- {fname} (imports + signatures) ---\n" + "\n".join(sig_lines)
+        prev = code[:800]
+        if len(code) > 800:
+            prev += f"\n... [{len(code) - 800} more chars]"
+        return f"# --- {fname} (preview) ---\n{prev}"
+
+    parts: list[str] = []
+    for fname, code in sorted(files.items()):
+        if fname in full_files:
+            block = f"# --- {fname} (FULL) ---\n{code}"
+            if len(block) > 20000:
+                block = block[:20000] + "\n... [truncated at 20000 chars]"
+            parts.append(block)
+        elif fname == entry:
+            block = f"# --- {fname} (FULL entry point) ---\n{code}"
+            if len(block) > 12000:
+                block = block[:12000] + "\n... [entry truncated at 12000 chars]"
+            parts.append(block)
+        else:
+            parts.append(_sig_preview(fname, code))
+    out = "\n\n".join(parts)
+    if len(out) > 30000:
+        out = out[:30000] + "\n... [project truncated]"
+    return out
 
 
 def _dangling_local_imports(files: dict[str, str]) -> list[tuple[str, str]]:
@@ -1958,9 +2069,7 @@ def _execute_code_generation(
                 max_repair,
                 validation.summary(),
             )
-            all_files_ctx = "\n\n".join(
-                f"```filename:{f}\n{c}\n```" for f, c in files.items()
-            )
+            all_files_ctx = _scoped_files_ctx(files, fname)
             rp = _pm.sub_prompt(
                 "code_repair",
                 fname=fname,
@@ -2118,9 +2227,18 @@ def _execute_code_generation(
             len(critical_deep),
         )
         repair_issues = "\n".join(f"- {w}" for w in critical_deep)
-        all_code_ctx = "\n\n".join(
-            f"```filename:{f}\n{c}\n```" for f, c in files.items()
-        )
+        # A deep issue (identical AST, copy-paste ablation, shadows stdlib) can
+        # only be fixed by reading the METHOD BODY, not a signature — so pass
+        # the files those warnings name verbatim via ``full_files``, and
+        # summarize the rest. Names carry the file as ``[<file>[:line]]``.
+        _crit_files = sorted({
+            m.group(1) for w in critical_deep
+            for m in [_re.match(r"\[([^:\]]+)", w)]
+            if m and m.group(1) in files
+        })
+        # Cross-file repair (it may rewrite several classes/imports), so the
+        # model must see the whole project — but summarized, not dumped in full.
+        all_code_ctx = _summarize_files_ctx(files, full_files=tuple(_crit_files))
         repair_prompt = (
             f"CRITICAL CODE QUALITY ISSUES FOUND:\n{repair_issues}\n\n"
             f"Fix ALL these issues in the code below. Return the complete "
@@ -2552,9 +2670,9 @@ def _execute_code_generation(
                     json.dumps(abl_data, indent=2), encoding="utf-8"
                 )
                 # --- Attempt ablation repair ---
-                all_code_ctx = "\n\n".join(
-                    f"```filename:{f}\n{c}\n```" for f, c in files.items()
-                )
+                # Rewrites condition classes project-wide, so keep the whole
+                # project in view — summarized, not full-dumped.
+                all_code_ctx = _summarize_files_ctx(files)
                 dup_details = abl_data.get("details", "unknown")
                 abl_repair_prompt = (
                     f"ABLATION REPAIR REQUIRED — duplicate conditions detected:\n"
