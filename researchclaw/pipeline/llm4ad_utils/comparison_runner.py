@@ -181,11 +181,20 @@ def main() -> int:
         if not isinstance(metrics, dict):
             failures[key] = f"evaluate_instance returned {type(metrics).__name__}, not dict"
             continue
+        # Accept either spelling of the primary metric: evaluate_instance()
+        # may aggregate over seeds and emit ``<PRIMARY_METRIC>_mean`` rather
+        # than the bare name. The task-package evaluator (_write_evaluator)
+        # already tolerates both; this is the path promotion reads, so it must
+        # agree — otherwise a genuinely improved candidate is silently scored
+        # as a failure and never promoted.
         try:
             val = float(metrics[pm])
-        except (KeyError, TypeError, ValueError) as exc:
-            failures[key] = f"primary metric {pm!r} unusable: {exc!r}"
-            continue
+        except (KeyError, TypeError, ValueError):
+            try:
+                val = float(metrics[pm + "_mean"])
+            except (KeyError, TypeError, ValueError) as exc:
+                failures[key] = f"primary metric {pm!r} unusable: {exc!r}"
+                continue
         # A non-finite score is not a win.  Under `minimize`, -inf compares
         # better than every real baseline, so a degenerate candidate would be
         # promoted on the strength of a numerical blow-up.
