@@ -507,6 +507,7 @@ class OpenCodeConfig:
     timeout_sec: int = 600  # Max seconds for opencode run
     max_retries: int = 1
     workspace_cleanup: bool = True
+    debug: bool = False  # Enable verbose logging (--print-logs --log-level DEBUG)
     # When True, an OpenCode (Beast Mode) run that FAILS fails the whole stage
     # instead of silently degrading to the CodeAgent/Legacy fallback. Use this
     # when OpenCode is the intended sole code generator and a half-finished

@@ -1706,6 +1706,7 @@ def _execute_code_generation(
                     timeout_sec=_oc_cfg.timeout_sec,
                     max_retries=_oc_cfg.max_retries,
                     workspace_cleanup=_oc_cfg.workspace_cleanup,
+                    debug=_oc_cfg.debug,
                     # Verify with the interpreter the sandbox will actually use,
                     # so "it ran for the agent" means it runs in Stage 12 too.
                     python_path=config.experiment.sandbox.python_path,
