@@ -1071,7 +1071,7 @@ def _promote_llm4ad_to_experiment_final(
 
     # Enumerating instances has one implementation, shared with the task
     # packager: every file directly under data/, whatever its extension.
-    from researchclaw.pipeline.llm4ad_task_packages import _discover_instances
+    from researchclaw.pipeline.llm4ad_task_packages import _discover_instances, _RESULT_MARKER
     _instance_argv = json.dumps([str(p) for p in _discover_instances(base_exp_dir)])
 
     def _score(algo_name: str, algo_file: Path) -> tuple[dict[str, float] | None, str]:
@@ -1095,7 +1095,26 @@ def _promote_llm4ad_to_experiment_final(
                 f"scoring exited {proc.returncode}: "
                 f"{(proc.stderr or proc.stdout or '').strip()[-200:]}"
             )
-        payload = _safe_json_loads(proc.stdout.strip(), None)
+        # The runner prefixes its payload with the result marker; the
+        # experiment's own `evaluate_instance`/`load_instance` is generated code
+        # that may legitimately print (it is shared with main.py, whose contract
+        # requires it to print its metric), so the line is found by marker rather
+        # than taken as the whole stdout. Should a package emit no marker line,
+        # fall back to the last line so an older runner still scores.
+        _marker = _RESULT_MARKER
+        payload = None
+        for _line in (proc.stdout or "").splitlines():
+            _idx = _line.find(_marker)
+            if _idx == -1:
+                continue
+            payload = _safe_json_loads(_line[_idx + len(_marker):].strip(), None)
+            break
+        if payload is None:
+            _last = ""
+            for _line in (proc.stdout or "").splitlines():
+                if _line.strip():
+                    _last = _line.strip()
+            payload = _safe_json_loads(_last, None)
         if not isinstance(payload, dict):
             return None, "scoring returned unparsable stdout"
         if payload.get("error"):

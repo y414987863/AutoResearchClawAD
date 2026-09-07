@@ -96,8 +96,17 @@ def _load_optimize(algo_file: Path, algo_name: str):
     return fn
 
 
+# Payload marker, identical in spirit to llm4ad_task_packages._RESULT_MARKER.
+# The experiment's own `evaluate_instance`/`load_instance` is generated code and
+# may legitimately print (it is shared with main.py, which is required to print
+# its metric, so per-seed logging on stdout is normal). Prefixing the payload
+# lets the caller pull exactly this line out of a noisy stdout instead of
+# guessing which line is the result. Keep it in step with _RESULT_MARKER.
+_PAYLOAD_MARKER = "@@LLM4AD_RESULT@@"
+
+
 def _emit(payload: dict) -> int:
-    print(json.dumps(payload))
+    print(_PAYLOAD_MARKER + json.dumps(payload))
     return 0
 
 
