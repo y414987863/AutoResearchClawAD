@@ -305,10 +305,23 @@ def _read_algorithms_classification(exp_dir: Path) -> dict[str, str] | None:
         mapping = data
     if not isinstance(mapping, dict) or not mapping:
         return None
-    return {
-        str(algo): str(cat) for algo, cat in mapping.items()
-        if isinstance(cat, str)
-    }
+    # Whitelist the category values. Stage-10's classifier may have been run by
+    # an LLM that invented its own label (e.g. ``"sota"``, ``"custom"``) instead
+    # of the three roles the scope filter understands. Only the three known
+    # categories are usable downstream; anything else makes the classification
+    # unreliable, so treat such an entry as absent (and, if nothing valid
+    # remains, the whole file as absent → the scope filter fails closed).
+    _CATEGORIES = {"proposed", "baseline", "ablation"}
+    cleaned: dict[str, str] = {}
+    for algo, cat in mapping.items():
+        if not isinstance(cat, str):
+            continue
+        _cat = cat.strip().lower()
+        if _cat in _CATEGORIES:
+            cleaned[str(algo)] = _cat
+    if not cleaned:
+        return None
+    return cleaned
 
 
 def _filter_algorithms_by_scope(
@@ -347,19 +360,25 @@ def _filter_algorithms_by_scope(
 
     classification = _read_algorithms_classification(exp_dir)
     if wanted_categories and classification is None:
-        # Fail closed — and loudly. The config asked for a category filter; the
-        # experiment never produced a usable classification. Silently falling
-        # back to the full list would evolve the baselines (destroying the
-        # comparison the paper rests on), and the old silent `return []` just
-        # made the run lose its llm4ad contribution without anyone noticing.
-        raise ValueError(
-            f"llm4ad evolve_scope {evolve_scope} selects algorithms by "
-            f"category, but no readable algorithms_classification.json is under "
-            f"{exp_dir}; refusing to evolve all {len(algorithms)} algorithm(s) "
-            f"(which would include the baselines). Write the file as "
-            '{"classification": {algo: proposed|baseline|ablation}} or drop '
-            "the category filter."
+        # Fail closed — but quietly, not by raising. The config asked for a
+        # category filter and the experiment produced no usable classification
+        # (file missing, unparsable, or only invalid/invented categories after
+        # the whitelist in _read_algorithms_classification). Falling back to the
+        # full list would evolve the baselines and destroy the comparison the
+        # paper rests on; raising would let one empty scope kill the whole run.
+        # Returning [] means the scoped set is empty, so no task package is
+        # generated for this run and evolution is skipped — not silently wrong,
+        # just absent. The caller logs the loss.
+        logger.warning(
+            "llm4ad: evolve_scope %s selects algorithms by category, but no "
+            "readable algorithms_classification.json is under %s (file absent, "
+            "unparsable, or only non-whitelisted categories). Nothing will be "
+            "evolved this run — write the file as "
+            '{"classification": {algo: "proposed"|"baseline"|"ablation"}} or '
+            "drop the category filter to evolve everything.",
+            evolve_scope, exp_dir,
         )
+        return []
     unclassified: list[str] = []
     if classification is not None:
         unclassified = [a for a, _ in algorithms if not str(classification.get(a, ""))]
@@ -521,7 +540,8 @@ def _write_run_single(algo: str, package: Path, primary_metric: str) -> None:
 
 
 def _write_evaluator(
-    algo: str, package: Path, primary_metric: str, metric_direction: str = "MINIMIZE"
+    algo: str, package: Path, primary_metric: str, metric_direction: str = "MINIMIZE",
+    eval_timeout: float = 60.0,
 ) -> None:
     """Write a custom LLM4AD BaseEvaluator that runs run_single.py per instance."""
     cls = _algo_class_name(algo)
@@ -546,6 +566,11 @@ def _write_evaluator(
         f'PRIMARY_METRIC = "{primary_metric}"\n'
         f'ALGO = "{algo}"\n'
         f'MARKER = "{_RESULT_MARKER}"\n'
+        f"# Per-instance evaluation timeout (seconds). This is set by the task-\n"
+        f"# package builder from resources.eval_timeout_sec. llm4ad does not pass\n"
+        f"# a timeout through to a custom evaluator's EvalContext (it defaults to\n"
+        f"# 60s), so cfg.timeout is not trustworthy — the package-level constant is.\n"
+        f"_EVAL_TIMEOUT = {float(eval_timeout)!r}\n"
         "\n"
         "# Force UTF-8 on the child's stdout. Writing to a pipe, Python encodes\n"
         "# with the locale codepage, so a progress line containing a character\n"
@@ -626,14 +651,14 @@ def _write_evaluator(
         "                env=_CHILD_ENV,\n"
         "            )\n"
         "            stdout_bytes, stderr_bytes = await asyncio.wait_for(\n"
-        "                proc.communicate(), timeout=cfg.timeout or 60.0)\n"
+        "                proc.communicate(), timeout=_EVAL_TIMEOUT)\n"
         "        except asyncio.TimeoutError:\n"
         "            proc.kill()\n"
         "            await proc.communicate()\n"
         "            return EvaluationResult(\n"
         "                score=0.0, metrics={}, success=False,\n"
-        f'                error_message=f"Evaluation timed out after {{cfg.timeout}}s",\n'
-        "                duration_ms=(cfg.timeout or 60.0) * 1000,\n"
+        f'                error_message=f"Evaluation timed out after {{_EVAL_TIMEOUT}}s",\n'
+        "                duration_ms=_EVAL_TIMEOUT * 1000,\n"
         "            )\n"
         "        duration_ms = (time.time() - run_start) * 1000\n"
         "        stdout = stdout_bytes.decode(\"utf-8\", errors=\"replace\")\n"
@@ -989,6 +1014,11 @@ def generate_task_packages(
     n_all_algorithms = len(algorithms)
     algorithms = _filter_algorithms_by_scope(algorithms, exp_dir, evolve_scope)
     instances = _discover_instances(exp_dir)
+    # Same value _write_config puts in config.yaml's evaluator.timeout; injected
+    # into the generated evaluator as a package-level constant so the actual
+    # per-instance timeout matches the configured value (llm4ad does not thread
+    # a timeout into a custom evaluator's EvalContext — it defaults to 60s).
+    eval_timeout = float((resources or {}).get("eval_timeout_sec") or 60.0)
 
     manifests: list[PackageManifest] = []
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1040,7 +1070,9 @@ def generate_task_packages(
         _write_run_single(algo, package, primary_metric)
 
         # 5. Write the custom evaluator.
-        _write_evaluator(algo, package, primary_metric, metric_direction)
+        _write_evaluator(
+            algo, package, primary_metric, metric_direction, eval_timeout=eval_timeout,
+        )
 
         # 6. Write config.yaml. When a short run root was supplied, point
         # base_dir at it (each package gets its own subdir so parallel runs do

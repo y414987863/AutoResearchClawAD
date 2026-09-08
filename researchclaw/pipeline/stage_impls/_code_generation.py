@@ -1489,6 +1489,8 @@ def _extract_plan_names(exp_plan: Any) -> tuple[list[str], list[str], list[str]]
 def _classify_algorithms_with_fallback(
     algo_names: list[str],
     exp_plan: Any,
+    *,
+    mark_uncertain: bool = False,
 ) -> dict[str, str]:
     """Deterministic classification used when the LLM is unavailable or fails.
 
@@ -1504,6 +1506,12 @@ def _classify_algorithms_with_fallback(
     that is not a baseline is by construction the method under test. This is
     what keeps a ``{categories: [proposed]}`` scope from silently shrinking to
     zero packages on a topic that never declared ``proposed_methods``.
+
+    With ``mark_uncertain=True``, an algorithm whose category was guessed by the
+    ""-default (i.e. it matched neither the plan's explicit names nor a
+    substring) is recorded in ``result["_llm4ad_uncertain"]`` as a JSON list.
+    Callers use that to let the LLM fill only the genuinely ambiguous names
+    rather than override a plan-backed classification.
     """
     if not algo_names:
         return {}
@@ -1524,6 +1532,7 @@ def _classify_algorithms_with_fallback(
         return None
 
     result: dict[str, str] = {}
+    uncertain: list[str] = []
     for name in algo_names:
         cat = _cat_for(name)
         if cat is None:
@@ -1541,7 +1550,12 @@ def _classify_algorithms_with_fallback(
                     cat = "proposed"
             if cat is None:
                 cat = "proposed"
+                uncertain.append(name)
         result[name] = cat
+    if mark_uncertain and uncertain:
+        # JSON-encoded so the value stays a plain str (the classifier return
+        # type is dict[str, str]); decoded by the caller.
+        result["_llm4ad_uncertain"] = json.dumps(uncertain)
     return result
 
 
@@ -1556,10 +1570,21 @@ def _classify_algorithms(
 
     The plan's split keys and the directory names do not correspond one-to-one
     (a topic may list ``conditions:`` or grid entries, or omit a split entirely)
-    so the classifier operates on *actual* algorithm names and asks the LLM to
-    decide, then falls back to a deterministic matcher when the LLM call fails
-    or returns nothing usable. Never raises: classification is advisory and a
-    missing/partial result only degrades evolve_scope filtering.
+    so the classifier operates on *actual* algorithm names.
+
+    Priority, highest first:
+
+    1. **Stage 9 plan** — a name the plan declares as baseline/ablation, or that
+       resolves by name/substring against it, is authoritative. The plan is the
+       experiment's own design, so it decides what is proposed vs a baseline.
+    2. **LLM, for the otherwise-ambiguous names only** — an algorithm the plan
+       did not identify is offered to the model for a judgment call. Its value is
+       accepted ONLY when it is one of the three allowed categories; anything the
+       model invents (``"sota"``, ``"custom"``, …) is discarded and the fallback
+       guess (``proposed``) stands. The model can never override a plan verdict.
+
+    Never raises: classification is advisory and a missing/partial result only
+    degrades evolve_scope filtering.
     """
     try:
         from researchclaw.pipeline.llm4ad_task_packages import _discover_algorithms
@@ -1570,10 +1595,26 @@ def _classify_algorithms(
     if not algo_names:
         return {}
 
-    fallback = _classify_algorithms_with_fallback(algo_names, exp_plan)
+    fallback = _classify_algorithms_with_fallback(
+        algo_names, exp_plan, mark_uncertain=True,
+    )
+    # Strip the internal marker before any use.
+    _uncertain_raw = fallback.pop("_llm4ad_uncertain", "")
+    _uncertain: list[str] = []
+    if _uncertain_raw:
+        try:
+            _uncertain = json.loads(_uncertain_raw)
+        except (TypeError, ValueError):
+            _uncertain = []
+    uncertain = set(_uncertain)
 
-    if llm is None:
-        logger.info("Stage 10: no LLM — classifying algorithms by plan-name fallback")
+    if llm is None or not uncertain:
+        # No LLM, or the plan already classified every algorithm — the plan is
+        # authoritative, so there is nothing for the model to contribute.
+        logger.info(
+            "Stage 10: classifying %d algorithm(s) by plan-name fallback%s",
+            len(algo_names), " (no ambiguous names for the LLM)" if (llm and not uncertain) else "",
+        )
         return fallback
 
     # Build the prompt from plan names and the *actual* tree, so we never ask
@@ -1595,8 +1636,12 @@ def _classify_algorithms(
         "For EACH actual algorithm, decide whether it is the PROPOSED method, a "
         "BASELINE, or an ABLATION, using your judgment and the plan above. The plan "
         "may not declare all categories or the names may differ from the directory "
-        "names; use code/libary knowledge to decide. Do NOT invent algorithms. If a "
-        "category is not declared, still classify by the nature of the algorithm.\n"
+        "names; use code/library knowledge to decide. Do NOT invent algorithms and "
+        "do NOT invent a category. The SUPPORTED category is EXACTLY one of the "
+        "three strings `proposed`, `baseline`, `ablation` — use ONLY those, "
+        "lowercase, not anything else (e.g. NOT \"sota\", \"state_of_the_art\", "
+        "\"custom\", \"primary\", \"novel\"). If a category is not declared, still "
+        "classify by the nature of the algorithm into one of those three.\n"
         "Return ONLY JSON of shape "
         '{"classification": {"<algo_name>": "proposed"|"baseline"|"ablation"}}, '
         "with every actual algorithm from the list above and no others.\n"
@@ -1623,18 +1668,21 @@ def _classify_algorithms(
                     break
             mapping = parsed.get("classification", {}) if isinstance(parsed, dict) else {}
             if isinstance(mapping, dict) and mapping:
-                result = {
-                    a: str(mapping.get(a, fallback.get(a, "proposed")))
-                    for a in algo_names
-                }
-                # Keep any algorithm the model skipped as the fallback guess;
-                # an algorithm the model labels "unknown" is kept as-is.
-                for a in algo_names:
-                    if a not in result:
-                        result[a] = fallback.get(a, "proposed")
+                # Plan verdicts win. The LLM only fills the names the plan did
+                # not identify, and its value must be one of the three allowed
+                # categories. Anything invented is discarded (fallback stands).
+                _CATEGORIES = {"proposed", "baseline", "ablation"}
+                result = dict(fallback)
+                for a in uncertain:
+                    _v = mapping.get(a)
+                    if isinstance(_v, str):
+                        _v = _v.strip().lower()
+                        if _v in _CATEGORIES:
+                            result[a] = _v
                 logger.info(
-                    "Stage 10: LLM classified %d algorithm(s): %s",
-                    len(algo_names), result,
+                    "Stage 10: plan classified %d algorithm(s); LLM refined "
+                    "%d ambiguous name(s), result: %s",
+                    len(algo_names) - len(uncertain), len(uncertain), result,
                 )
                 return result
             logger.warning(
@@ -2251,10 +2299,25 @@ def _execute_code_generation(
         # ── Legacy single-shot generation ─────────────────────────────────
         topic = config.research.topic
         _md = config.experiment.metric_direction
-        _md_hint = (
-            f"`{_md}` — use direction={'lower' if _md == 'minimize' else 'higher'} "
-            f"in METRIC_DEF. You MUST NOT use the opposite direction."
-        )
+        if _md:
+            # Explicit config override: the experiment MUST declare this direction.
+            _md_hint = (
+                f"`{_md}` — use direction={'lower' if _md == 'minimize' else 'higher'} "
+                f"in METRIC_DEF. You MUST NOT use the opposite direction."
+            )
+        else:
+            # No config override: the metric's own semantics decide. The model
+            # must still declare a direction in METRIC_DEF (downstream
+            # correct_metric_direction reads it back), so instruct it to do so
+            # rather than silently defaulting to minimize.
+            _md_hint = (
+                "direction is NOT pre-set — judge it from how the metric is "
+                "computed (e.g. larger = better means `maximize`, smaller = "
+                "better means `minimize`) and DECLARE it explicitly in "
+                "METRIC_DEF as `\"direction\": \"maximize\"` or "
+                "`\"direction\": \"minimize\"`. Do NOT omit it; the pipeline "
+                "reads this declaration to decide which way is better."
+            )
         _overlay = _get_evolution_overlay(run_dir, "code_generation")
         sp = _pm.for_stage(
             "code_generation",

@@ -95,7 +95,8 @@ def _execute_result_analysis(
                 if not _refine_is_better and _refine_metrics:
                     # Compare primary_metric values to decide
                     _mkey = config.experiment.metric_key or "primary_metric"
-                    _mdir = config.experiment.metric_direction or "maximize"
+                    from researchclaw.pipeline._helpers import resolve_metric_direction
+                    _mdir = resolve_metric_direction(config)
                     _existing_pm: float | None = None
                     _refine_pm: float | None = None
                     # BUG-214: Use exact match first, then substring fallback

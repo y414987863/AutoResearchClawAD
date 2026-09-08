@@ -689,7 +689,12 @@ def _generate_llm4ad_task_packages(
         # sampler feeds to the LLM; the explicit metric_direction overrides the
         # name-based inference so evolution optimises the right way.
         _topic = getattr(getattr(config, "research", None), "topic", "") or ""
-        _direction = getattr(getattr(config, "experiment", None), "metric_direction", "") or ""
+        # Single source of truth for metric direction: config override, else the
+        # generated code's METRIC_DEF declaration (correct_metric_direction has
+        # already populated config by stage 13, so this normally returns the
+        # config value; resolve_metric_direction only kicks in when it is empty).
+        from researchclaw.pipeline._helpers import resolve_metric_direction
+        _direction = resolve_metric_direction(config, Path(_tp_exp))
 
         # Fitness sanity gate (pre-evolution). Score the clean baselines through
         # the very same subprocess promotion uses, BEFORE any LLM budget is
@@ -701,6 +706,12 @@ def _generate_llm4ad_task_packages(
         # The gate is applied to exactly the algorithms evolution will touch
         # (post-scope, matching generate_task_packages), so a category-scoped
         # run checks only its proposed set.
+        #
+        # Soft-fail: a violation logs the precise reason and skips evolution
+        # rather than raising. The point of the gate is to avoid burning LLM
+        # budget on a metric evolution cannot move — that is achieved by not
+        # running evolution, not by failing the whole stage (which the outer
+        # handler would otherwise swallow anyway).
         try:
             from researchclaw.pipeline.llm4ad_task_packages import (
                 _discover_algorithms,
@@ -719,25 +730,33 @@ def _generate_llm4ad_task_packages(
                 _gate_violations = fitness_sanity_gate(
                     Path(_tp_exp),
                     _scoped,
-                    metric_direction=_direction or "minimize",
                 )
                 if _gate_violations:
-                    raise ValueError(
-                        "LLM4AD fitness sanity gate rejected evolution: "
-                        + " | ".join(_gate_violations)
+                    logger.warning(
+                        "Stage 13: LLM4AD fitness sanity gate rejected evolution: %s. "
+                        "Skipping LLM4AD evolution for this experiment rather than "
+                        "burning LLM budget on a metric that cannot be moved. To override, "
+                        "fix the primary metric (or its evaluator) so it differs across "
+                        "algorithms and is finite/deterministic.",
+                        " | ".join(_gate_violations),
                     )
+                    log["task_packages_error"] = (
+                        f"fitness gate: {_gate_violations[0]}"
+                    )
+                    return ()
                 logger.info(
                     "Stage 13: fitness sanity gate passed for %d "
                     "algorithm(s) under %s", len(_scoped), _tp_exp,
                 )
         except Exception as _l4b_gate:
-            # Re-raise as a hard failure, but only after logging with traceback:
-            # the gate is meant to STOP a bad evolution, not silently degrade.
+            # The gate is advisory, not a gatekeeper: if scoring itself breaks
+            # (import error, malformed evaluator, subprocess crash) that must
+            # not silently abort LLM4AD. Log with traceback and continue —
+            # the outer handler still records the failure for the log.
             logger.warning(
-                "Stage 13: LLM4AD fitness sanity gate failed: %s",
+                "Stage 13: LLM4AD fitness sanity gate could not run: %s",
                 _l4b_gate, exc_info=True,
             )
-            raise
 
         # Fresh per-call token: run_dir.name is stable across repeated runs, so
         # a module-level token would reuse the same temp workspace on every re-
@@ -1123,12 +1142,16 @@ def _promote_llm4ad_to_experiment_final(
     from researchclaw.pipeline.llm4ad_task_packages import _discover_instances, _RESULT_MARKER
     _instance_argv = json.dumps([str(p) for p in _discover_instances(base_exp_dir)])
 
-    def _score(algo_name: str, algo_file: Path) -> tuple[dict[str, float] | None, str]:
+    def _score(algo_name: str, algo_file: Path) -> tuple[dict[str, float] | None, str, set[str] | None]:
         """Per-instance primary-metric values via the experiment's own evaluator.
 
-        Returns ``(values, detail)``.  ``values`` is None when scoring could not
-        run at all; ``detail`` explains why, and is surfaced in the comparison
-        artifact so a failure is not mistaken for "no improvement".
+        Returns ``(values, detail, failures)``.  ``values`` is None when scoring
+        could not run at all; ``detail`` explains why and is surfaced in the
+        comparison artifact so a failure is not mistaken for "no improvement".
+        ``failures`` is the set of instance names the evaluator could not score
+        (crashed / non-finite), or None when scoring did not run. It lets the
+        caller report how much of a candidate's loss is due to instances the
+        baseline solved.
         """
         try:
             proc = _sp.run(
@@ -1138,12 +1161,12 @@ def _promote_llm4ad_to_experiment_final(
                 timeout=_SCORING_TIMEOUT_SEC,
             )
         except (OSError, _sp.TimeoutExpired) as _pexc:
-            return None, f"scoring failed to run: {_pexc}"
+            return None, f"scoring failed to run: {_pexc}", None
         if proc.returncode != 0:
             return None, (
                 f"scoring exited {proc.returncode}: "
                 f"{(proc.stderr or proc.stdout or '').strip()[-200:]}"
-            )
+            ), None
         # The runner prefixes its payload with the result marker; the
         # experiment's own `evaluate_instance`/`load_instance` is generated code
         # that may legitimately print (it is shared with main.py, whose contract
@@ -1165,18 +1188,19 @@ def _promote_llm4ad_to_experiment_final(
                     _last = _line.strip()
             payload = _safe_json_loads(_last, None)
         if not isinstance(payload, dict):
-            return None, "scoring returned unparsable stdout"
+            return None, "scoring returned unparsable stdout", None
         if payload.get("error"):
-            return None, str(payload["error"])
+            return None, str(payload["error"]), None
         values = payload.get("values")
+        failures = payload.get("failures")
+        _fset = set(failures.keys()) if isinstance(failures, dict) else None
         if not isinstance(values, dict) or not values:
-            _failed = payload.get("failures") or {}
-            _first = next(iter(_failed.values()), "") if isinstance(_failed, dict) else ""
-            return None, f"no finite primary metric on any instance{f'; e.g. {_first}' if _first else ''}"
+            _first = next(iter(failures.values()), "") if isinstance(failures, dict) else ""
+            return None, f"no finite primary metric on any instance{f'; e.g. {_first}' if _first else ''}", _fset
         try:
-            return {str(k): float(v) for k, v in values.items()}, ""
+            return {str(k): float(v) for k, v in values.items()}, "", _fset
         except (TypeError, ValueError):
-            return None, "scoring returned non-numeric values"
+            return None, "scoring returned non-numeric values", _fset
 
     comparison: dict[str, Any] = {}
     n_promoted = 0
@@ -1225,8 +1249,8 @@ def _promote_llm4ad_to_experiment_final(
             logger.info("Stage 13: %s unchanged — keeping baseline", algo_name)
             continue
 
-        baseline_values, baseline_detail = _score(algo_name, base_algo)
-        evolved_values, evolved_detail = _score(algo_name, evolved_src)
+        baseline_values, baseline_detail, baseline_failures = _score(algo_name, base_algo)
+        evolved_values, evolved_detail, evolved_failures = _score(algo_name, evolved_src)
 
         # A failed/unsaved evolution counts as "no improvement": never degrade.
         # Which side failed matters (different follow-up, and mixing them up
@@ -1272,8 +1296,13 @@ def _promote_llm4ad_to_experiment_final(
         if better:
             _sh_promote.copy2(evolved_src, _dest)
             n_promoted += 1
+        # Direction-agnostic percent change, divided by |baseline| so a negative
+        # baseline (log-likelihood, -MSE, …) does not flip the sign of a genuine
+        # improvement into a negative delta. The sign that matters ("is this an
+        # improvement?") is carried separately by `better` below; delta_pct only
+        # reports how far apart the two are.
         delta_pct = (
-            (evolved_score - baseline_score) / baseline_score * 100.0
+            (evolved_score - baseline_score) / abs(baseline_score) * 100.0
             if baseline_score
             else None
         )
@@ -1285,6 +1314,14 @@ def _promote_llm4ad_to_experiment_final(
             "failed": False,
             "n_instances_compared": len(common),
             "n_instances_total": n_total,
+            # Instances the evolved candidate failed to score but the baseline
+            # solved. Reported, not gated: a candidate may win on the shared
+            # instances while losing some — exposing the count keeps a reviewer
+            # from reading a mean-only delta as "strictly better everywhere".
+            "lost_instances": (
+                len(evolved_failures & set(baseline_values))
+                if evolved_failures else 0
+            ),
             "reason": "improved" if better else "equal or worse than baseline",
         }
         logger.info(
@@ -2308,9 +2345,13 @@ def _execute_iterative_refine(
         # just snapshotted. Rebuild from that clean source.
         _clean_exp = _read_prior_artifact(run_dir, "experiment/")
         if _clean_exp and Path(_clean_exp).is_dir():
-            _metric_direction = getattr(
-                config.experiment, "metric_direction", ""
-            ) or "minimize"
+            # Promote must use the SAME single source of truth as task-package
+            # build (see _generate_llm4ad_task_packages): config override, else
+            # the generated code's METRIC_DEF declaration. Falling back to a
+            # hard-coded "minimize" here would judge a maximize metric that the
+            # evolution optimised the other way, silently discarding real gains.
+            from researchclaw.pipeline._helpers import resolve_metric_direction
+            _metric_direction = resolve_metric_direction(config, Path(_clean_exp))
             _n, _comparison = _promote_llm4ad_to_experiment_final(
                 Path(_clean_exp), _evo_dir, final_dir,
                 metric_direction=_metric_direction,
@@ -2358,6 +2399,16 @@ def _execute_iterative_refine(
                     _promoted_main.read_text(encoding="utf-8"), encoding="utf-8"
                 )
             _write_refinement_log()
+        else:
+            # evolution_results/ exists but there is no clean stage-10 experiment
+            # to overlay onto. This is not "evolution found nothing" — promote
+            # never ran — so say so, or the run reads as an unexplained 0-promoted.
+            logger.warning(
+                "Stage 13: LLM4AD evolution produced results under %s, but no "
+                "clean experiment/ directory was found under %s; promote was "
+                "skipped, so experiment_final/ contains no evolved algorithm.",
+                _evo_dir, run_dir,
+            )
 
     artifacts.extend(
         entry["version_dir"]

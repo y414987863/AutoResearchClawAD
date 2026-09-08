@@ -536,36 +536,17 @@ def correct_metric_direction(run_dir: Path, config: RCConfig) -> RCConfig:
     stage after code generation reads a corrected value through the ordinary
     ``config.experiment.metric_direction`` and needs no lookup of its own.
 
-    ``metric_direction`` in the config is a template default (``minimize``) that
-    nobody judged against the metric the model actually generated. In the
-    rc_full3 run that made promote read ``valid_prediction_time`` (``max(0,
-    baseline - corrected)``, larger is better) as lower-is-better and ship a
-    regression as a -100% "improvement". The code computing the metric is the
-    only thing that knows which way is better, so its declaration wins.
+    ``metric_direction`` in the config is an empty override by default; when it
+    is empty the code that computes the metric is the only thing that knows which
+    way is better, so its declaration wins. In the rc_full3 run that made promote
+    read ``valid_prediction_time`` (``max(0, baseline - corrected)``, larger is
+    better) as lower-is-better and ship a regression as a -100% "improvement".
     """
     exp_dir = _read_prior_artifact(run_dir, "experiment/")
     if not (exp_dir and Path(exp_dir).is_dir()):
         return config
 
-    declared = ""
-    for name in ("evaluator.py", "main.py"):
-        try:
-            # errors="replace": a model-generated file with one stray byte must
-            # not raise UnicodeDecodeError here — this runs before every stage,
-            # so an uncaught decode error would kill the whole run.
-            text = (Path(exp_dir) / name).read_text(
-                encoding="utf-8", errors="replace"
-            )
-        except OSError:
-            continue
-        m = _METRIC_DIRECTION_DICT_RE.search(text)
-        if m:
-            declared = m.group(1).lower()
-            break
-        m = _METRIC_DIRECTION_PRINT_RE.search(text)
-        if m:
-            declared = "maximize" if m.group(1).lower() == "higher" else "minimize"
-            break
+    declared = _detect_metric_direction(Path(exp_dir))
 
     current = str(getattr(config.experiment, "metric_direction", "") or "").lower()
     if not declared or declared == current:
@@ -581,6 +562,55 @@ def correct_metric_direction(run_dir: Path, config: RCConfig) -> RCConfig:
     return replace(
         config, experiment=replace(config.experiment, metric_direction=declared)
     )
+
+
+def resolve_metric_direction(config: RCConfig, exp_dir: Path | None = None) -> str:
+    """Return the effective metric direction for a stage.
+
+    Priority: an explicit ``config.experiment.metric_direction`` wins; otherwise
+    the static declaration in the generated code (``METRIC_DEF``/runtime
+    ``METRIC_DEF:`` line) is read back; otherwise fall back to ``"minimize"``.
+
+    This is the single source of truth for *pre-codegen* stages (9, 10) where an
+    experiment may not exist yet, and the ``or "maximize"``/``or "minimize"``
+    sprinkles scattered across stage code should be collapsed onto it. Stage code
+    after code generation normally reads the already-corrected
+    ``config.experiment.metric_direction`` (see :func:`correct_metric_direction`);
+    this is the fallback when that path did not run.
+    """
+    explicit = str(getattr(config.experiment, "metric_direction", "") or "").strip().lower()
+    if explicit in ("minimize", "maximize"):
+        return explicit
+    if exp_dir is not None:
+        detected = _detect_metric_direction(Path(exp_dir))
+        if detected:
+            return detected
+    return "minimize"
+
+
+def _detect_metric_direction(exp_dir: Path) -> str:
+    """Read the metric direction the generated code declares, or ``""``.
+
+    Prefers the static ``METRIC_DEF = {..., "direction": "..."}`` dict (readable
+    without running code), then the runtime ``METRIC_DEF: ... direction=higher/
+    lower`` print line. Empty when the experiment declares nothing usable.
+    """
+    for name in ("evaluator.py", "main.py"):
+        try:
+            # errors="replace": a model-generated file with one stray byte must
+            # not raise UnicodeDecodeError here.
+            text = (Path(exp_dir) / name).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            continue
+        m = _METRIC_DIRECTION_DICT_RE.search(text)
+        if m:
+            return m.group(1).lower()
+        m = _METRIC_DIRECTION_PRINT_RE.search(text)
+        if m:
+            return "maximize" if m.group(1).lower() == "higher" else "minimize"
+    return ""
 
 
 def _find_prior_file(run_dir: Path, filename: str) -> Path | None:

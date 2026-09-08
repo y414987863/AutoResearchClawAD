@@ -657,7 +657,11 @@ class ExperimentConfig:
     max_iterations: int = 10
     max_refine_duration_sec: int = 0  # 0 = auto (3× time_budget_sec)
     metric_key: str = "primary_metric"
-    metric_direction: str = "minimize"
+    # Empty = let the pipeline resolve the direction from the generated code's
+    # METRIC_DEF declaration (see _helpers.correct_metric_direction, applied to
+    # config before every stage). A non-empty value is an explicit override and
+    # takes precedence over the code's declaration.
+    metric_direction: str = ""
     keep_threshold: float = 0.0
     skip_alignment_check: bool = False  # Skip Stage 10 topic-experiment alignment validation
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
@@ -1424,7 +1428,7 @@ def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
         max_iterations=_safe_int(data.get("max_iterations"), 10),
         max_refine_duration_sec=_safe_int(data.get("max_refine_duration_sec"), 0),
         metric_key=data.get("metric_key", "primary_metric"),
-        metric_direction=data.get("metric_direction", "minimize"),
+        metric_direction=data.get("metric_direction", ""),
         keep_threshold=_safe_float(data.get("keep_threshold"), 0.0),
         sandbox=SandboxConfig(
             python_path=sandbox_data.get("python_path", DEFAULT_PYTHON_PATH),

@@ -47,8 +47,15 @@ _CONSTANT_REL_TOL = 1e-6
 
 
 def _parse_result(stdout: str) -> dict[str, Any] | None:
-    """Pull the ``@@LLM4AD_RESULT@@`` payload out of a noisy subprocess stdout."""
-    marker = "@@LLM4AD_RESULT@@"
+    """Pull the result-marker payload out of a noisy subprocess stdout.
+
+    The marker literal is sourced from llm4ad_task_packages so this (the fitness
+    gate), comparison_runner and the task-package evaluator can never drift
+    apart — any one of them changing the string silently makes promotion parse "no
+    finite primary metric on any instance".
+    """
+    from researchclaw.pipeline.llm4ad_task_packages import _RESULT_MARKER
+    marker = _RESULT_MARKER
     for line in (stdout or "").splitlines():
         idx = line.find(marker)
         if idx == -1:
@@ -170,7 +177,6 @@ def fitness_sanity_gate(
     exp_dir: Path,
     algo_files: list[tuple[str, Path]],
     *,
-    metric_direction: str = "minimize",
     timeout_sec: int = 300,
 ) -> list[str]:
     """Return a list of violations; empty means the metric is evolvable.

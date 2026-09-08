@@ -71,3 +71,28 @@ def evaluate_instance(instance, solve):
     exp = _build_exp(_ALGO, ev, {"i.json": '{"coords":[[0,0],[1,1]]}'})
     r = _evaluate_pkg(exp, 'nm', 'i.json')
     assert r.success and r.score == -2.0
+
+
+def test_generated_evaluator_uses_timeout_constant():
+    """The evaluator must honour the configured eval_timeout_sec.
+
+    llm4ad does not thread a timeout into a custom evaluator's EvalContext (it
+    defaults to 60s), so the generated evaluator carries its own ``_EVAL_TIMEOUT``
+    constant sourced from resources.eval_timeout_sec and must NOT fall back to
+    ``cfg.timeout``. A stray ``cfg.timeout or 60.0`` would silently reset every
+    run's timeout to 60s regardless of config.
+    """
+    exp = _build_exp(_ALGO, 'PRIMARY_METRIC="m"\ndef evaluate_instance(i,s): return {"m":1.0}\n', {"i.json": "{}"})
+    import tempfile as _tf
+    out = Path(_tf.mkdtemp()) / 'o'
+    # 30s configured — inject into resources so _write_config and the evaluator agree.
+    lp.generate_task_packages(exp, out, None, None, {"eval_timeout_sec": 30.0}, background='t', metric_direction='minimize')
+    pkg = out / 'nm'
+    ev_text = (pkg / 'nm_evaluator.py').read_text(encoding='utf-8')
+    assert '_EVAL_TIMEOUT = 30.0' in ev_text
+    # The executable path must use the constant, not cfg.timeout: the comment
+    # explaining *why* may mention cfg.timeout, but the running code may not.
+    code_only = "\n".join(
+        l for l in ev_text.splitlines() if not l.strip().startswith("#")
+    )
+    assert 'cfg.timeout' not in code_only

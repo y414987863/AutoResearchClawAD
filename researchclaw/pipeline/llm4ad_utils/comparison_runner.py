@@ -96,17 +96,36 @@ def _load_optimize(algo_file: Path, algo_name: str):
     return fn
 
 
-# Payload marker, identical in spirit to llm4ad_task_packages._RESULT_MARKER.
+# Payload marker, sourced from llm4ad_task_packages so the two sides can never
+# drift apart (this runner's output marker, the task-package evaluator's marker
+# and the fitness gate all must agree on the literal string). Imported lazily
+# inside main(): this script runs as a subprocess precisely to keep the parent's
+# sys.path clean, so a module-level import of the (heavy) task-package module
+# would partly defeat that.
 # The experiment's own `evaluate_instance`/`load_instance` is generated code and
 # may legitimately print (it is shared with main.py, which is required to print
 # its metric, so per-seed logging on stdout is normal). Prefixing the payload
 # lets the caller pull exactly this line out of a noisy stdout instead of
-# guessing which line is the result. Keep it in step with _RESULT_MARKER.
-_PAYLOAD_MARKER = "@@LLM4AD_RESULT@@"
+# guessing which line is the result.
+_PAYLOAD_MARKER = None  # resolved lazily via _marker()
+
+
+def _marker() -> str:
+    """Return the result marker, resolving it once from the shared source.
+
+    Kept as a function (not a module constant) because this script runs as a
+    subprocess and deliberately does not import the task-package module at
+    module load time. Subsequent calls hit the cached module attribute.
+    """
+    global _PAYLOAD_MARKER
+    if _PAYLOAD_MARKER is None:
+        from researchclaw.pipeline.llm4ad_task_packages import _RESULT_MARKER
+        _PAYLOAD_MARKER = _RESULT_MARKER
+    return _PAYLOAD_MARKER
 
 
 def _emit(payload: dict) -> int:
-    print(_PAYLOAD_MARKER + json.dumps(payload))
+    print(_marker() + json.dumps(payload))
     return 0
 
 
@@ -195,9 +214,12 @@ def main() -> int:
         # ``<PRIMARY_METRIC>_<suffix>`` rather than the bare name. Try known
         # suffixes in preference order: bare name, then _mean (most common),
         # then _median/_best/_final. The task-package evaluator (_write_evaluator)
-        # already tolerates these; promotion must agree — otherwise a genuinely
-        # improved candidate is silently scored as a failure and never promoted.
-        _suffixes = ["", "_mean", "_median", "_best", "_final", "_worst", "_std"]
+        # only tolerates the bare name and _mean, so promotion keeping a wider
+        # net is a deliberate asymmetry in favour of not mis-scoring a genuinely
+        # improved candidate — but NOT _worst/_std, which are not the primary
+        # metric (a std would be a variance proxy, not the objective). Keep this
+        # list in sync with the generated _write_evaluator's accepted keys.
+        _suffixes = ["", "_mean", "_median", "_best", "_final"]
         val = None
         for suffix in _suffixes:
             try:

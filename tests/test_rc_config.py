@@ -316,7 +316,10 @@ def test_experiment_config_defaults_mode_is_simulated():
     defaults = ExperimentConfig()
 
     assert defaults.mode == "simulated"
-    assert defaults.metric_direction == "minimize"
+    # Empty by default: the pipeline resolves the direction from the generated
+    # code's METRIC_DEF (see _helpers.correct_metric_direction). A non-empty
+    # value is an explicit override.
+    assert defaults.metric_direction == ""
 
 
 def test_sandbox_config_defaults_match_expected_values():

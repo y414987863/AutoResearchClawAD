@@ -1406,8 +1406,13 @@ def _promote_best_stage14(run_dir: Path, config: RCConfig) -> None:
     """
     import shutil
 
+    from researchclaw.pipeline._helpers import resolve_metric_direction
     metric_key = config.experiment.metric_key or "primary_metric"
-    metric_dir = config.experiment.metric_direction or "maximize"
+    # Single source of truth: config override, else the generated code's
+    # METRIC_DEF declaration, else minimize. Never default "maximize" here —
+    # with an empty config that inverted the comparison and promoted a worse
+    # higher value as "best" (test_legitimate_minimize_not_skipped).
+    metric_dir = resolve_metric_direction(config)
 
     candidates: list[tuple[float, Path]] = []
     for d in sorted(run_dir.glob("stage-14*")):

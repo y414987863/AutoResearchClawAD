@@ -262,6 +262,14 @@ def _execute_experiment_design(
         _tier1 = "CIFAR-10, CIFAR-100, MNIST, FashionMNIST, STL-10, SVHN"
 
         _overlay = _get_evolution_overlay(run_dir, "experiment_design")
+        _md = config.experiment.metric_direction
+        _md_kw = (
+            _md
+            if _md
+            else "to be declared in the plan — pick it from how the primary "
+                 "metric is defined (larger = better ⇒ maximize; smaller = "
+                 "better ⇒ minimize); the plan must state it"
+        )
         sp = _pm.for_stage(
             "experiment_design",
             evolution_overlay=_overlay,
@@ -271,7 +279,7 @@ def _execute_experiment_design(
             domain_design_context=_domain_design_context,
             time_budget_sec=config.experiment.time_budget_sec,
             metric_key=config.experiment.metric_key,
-            metric_direction=config.experiment.metric_direction,
+            metric_direction=_md_kw,
             hardware_profile=_hw_profile_str,
             per_condition_budget_sec=_per_condition_sec,
             available_tier1_datasets=_tier1,

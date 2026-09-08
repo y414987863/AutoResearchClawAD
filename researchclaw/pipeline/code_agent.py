@@ -187,6 +187,29 @@ class CodeAgent:
         self._log: list[str] = []
         self._sandbox: _SandboxLike | None = None
 
+    def _metric_direction_hint(self) -> str:
+        """The codegen direction hint, consistent with the legacy path.
+
+        An explicit ``experiment.metric_direction`` forces that direction;
+        empty means the direction is not preset and the model must judge it
+        from the metric's own semantics and declare it in ``METRIC_DEF`` (which
+        downstream ``correct_metric_direction`` reads back).
+        """
+        _md = str(getattr(self._exp_config, "metric_direction", "") or "").strip().lower() if self._exp_config is not None else ""
+        if _md in ("minimize", "maximize"):
+            return (
+                f"`{_md}` — use direction={'lower' if _md == 'minimize' else 'higher'} "
+                f"in METRIC_DEF. You MUST NOT use the opposite direction."
+            )
+        return (
+            "direction is NOT pre-set — judge it from how the metric is "
+            "computed (e.g. larger = better means `maximize`, smaller = "
+            "better means `minimize`) and DECLARE it explicitly in "
+            "METRIC_DEF as `\"direction\": \"maximize\"` or "
+            "`\"direction\": \"minimize\"`. Do NOT omit it; the pipeline "
+            "reads this declaration to decide which way is better."
+        )
+
     # ── Public API ────────────────────────────────────────────────────────
 
     def generate(
@@ -1020,6 +1043,7 @@ class CodeAgent:
             metric=metric,
             pkg_hint=hint,
             exp_plan=exp_plan,
+            metric_direction_hint=self._metric_direction_hint(),
         )
         resp = self._chat(sp.system, sp.user, max_tokens=max_tokens)
 
