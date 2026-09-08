@@ -261,10 +261,30 @@ def _read_algorithms_classification(exp_dir: Path) -> dict[str, str] | None:
     """Read stage-10's algorithm classification, if present.
 
     Returns a mapping ``{algo_name: category}`` (category ∈ proposed /
-    baseline / ablation) or ``None`` when the file does not exist. When it does
-    exist but is unreadable the caller treats it as absent, so a malformed file
-    never hard-fails evolution.
+    baseline / ablation) or ``None`` when the file does not exist **or does not
+    carry that per-algorithm category signal**. When ``None`` the caller treats
+    the classification as absent, which the scope filter handles as fail-closed
+    (see :func:`_filter_algorithms_by_scope`) — evolution does not silently fall
+    back to the whole list.
+
+    Two shapes carry the signal:
+
+    - the canonical wrapper ``{"classification": {algo: category}}``;
+    - a flat top-level ``{algo: "category"}`` mapping (no wrapper).
+
+    Anything else is NOT a category classification even though it may be a
+    dict: real products ship ``{"algorithm_types": {"pointwise": [...]}}`` (ml23),
+    ``{"esn": [...], "mlp": [...]}`` (ml25) and ``{"algorithm_families":
+    {...}}`` (tsp). Those are *method-family groupings*, whose values name the
+    algorithm set rather than a proposed/baseline/ablation role, and matching a
+    requested category against them classifies nothing correctly. Earlier this
+    module flattened them into ``{algo: family_name}``, so a
+    ``evolve_scope={"categories": ["proposed"]}`` run matched every algorithm
+    against the literal string ``"proposed"``, got the empty set and silently
+    skipped evolution — the exact silent failure the audit called out. Returning
+    ``None`` for them makes the scope filter raise instead.
     """
+
     cls_path = exp_dir / "algorithms_classification.json"
     if not cls_path.is_file():
         return None
@@ -272,8 +292,18 @@ def _read_algorithms_classification(exp_dir: Path) -> dict[str, str] | None:
         data = json.loads(cls_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    mapping = data.get("classification", {}) if isinstance(data, dict) else {}
-    if not isinstance(mapping, dict):
+    if not isinstance(data, dict):
+        return None
+
+    # 1. Canonical wrapper: {"classification": {algo: category}}.
+    mapping = data.get("classification", {}) if isinstance(data.get("classification"), dict) else {}
+    if not mapping and data and all(isinstance(v, str) for v in data.values()):
+        # 1b. Flat top-level algo→category scalars, e.g. {"nelder_mead": "proposed"}.
+        #     A dict-of-lists grouping ({"esn": ["esn_bestpractice", ...]}) has
+        #     non-string values, so it does NOT enter here and correctly returns
+        #     None below — it carries no category role.
+        mapping = data
+    if not isinstance(mapping, dict) or not mapping:
         return None
     return {
         str(algo): str(cat) for algo, cat in mapping.items()
@@ -317,14 +347,32 @@ def _filter_algorithms_by_scope(
 
     classification = _read_algorithms_classification(exp_dir)
     if wanted_categories and classification is None:
-        logger.warning(
-            "llm4ad: evolve_scope %s selects by category but no algorithms_"
-            "classification.json is readable under %s — skipping evolution "
-            "rather than evolving all %d algorithm(s) (which would include the "
-            "baselines).",
-            evolve_scope, exp_dir, len(algorithms),
+        # Fail closed — and loudly. The config asked for a category filter; the
+        # experiment never produced a usable classification. Silently falling
+        # back to the full list would evolve the baselines (destroying the
+        # comparison the paper rests on), and the old silent `return []` just
+        # made the run lose its llm4ad contribution without anyone noticing.
+        raise ValueError(
+            f"llm4ad evolve_scope {evolve_scope} selects algorithms by "
+            f"category, but no readable algorithms_classification.json is under "
+            f"{exp_dir}; refusing to evolve all {len(algorithms)} algorithm(s) "
+            f"(which would include the baselines). Write the file as "
+            '{"classification": {algo: proposed|baseline|ablation}} or drop '
+            "the category filter."
         )
-        return []
+    unclassified: list[str] = []
+    if classification is not None:
+        unclassified = [a for a, _ in algorithms if not str(classification.get(a, ""))]
+    if wanted_categories and classification is not None and unclassified:
+        # Some algorithms are selected by category but carry no classification.
+        # Skip them (never evolve what we cannot prove belongs to the scope);
+        # report so the loss is not invisible.
+        logger.warning(
+            "llm4ad: evolve_scope %s selects by category, but %d algorithm(s) "
+            "have no classification under %s: %s. They will be left out of "
+            "evolution.",
+            evolve_scope, len(unclassified), exp_dir, ", ".join(sorted(unclassified)),
+        )
     filtered: list[tuple[str, Path]] = []
     for algo, src in algorithms:
         in_names = algo in wanted_names

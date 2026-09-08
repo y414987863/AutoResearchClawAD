@@ -690,6 +690,55 @@ def _generate_llm4ad_task_packages(
         # name-based inference so evolution optimises the right way.
         _topic = getattr(getattr(config, "research", None), "topic", "") or ""
         _direction = getattr(getattr(config, "experiment", None), "metric_direction", "") or ""
+
+        # Fitness sanity gate (pre-evolution). Score the clean baselines through
+        # the very same subprocess promotion uses, BEFORE any LLM budget is
+        # spent, and refuse to start evolution when the primary metric is
+        # degenerate: constant across algorithms (ml23), wall-clock/gameable
+        # (ml03), or non-finite everywhere (TSP instance-contract break). Each
+        # of those previously looked like "evolution ran and improved nothing"
+        # — a modelling failure — when the real defect was the metric itself.
+        # The gate is applied to exactly the algorithms evolution will touch
+        # (post-scope, matching generate_task_packages), so a category-scoped
+        # run checks only its proposed set.
+        try:
+            from researchclaw.pipeline.llm4ad_task_packages import (
+                _discover_algorithms,
+                _filter_algorithms_by_scope,
+            )
+            from researchclaw.pipeline.llm4ad_utils.fitness_gate import (
+                fitness_sanity_gate,
+            )
+
+            _scoped = _filter_algorithms_by_scope(
+                _discover_algorithms(Path(_tp_exp)),
+                Path(_tp_exp),
+                _evo_cfg.get("evolve_scope") if _evo_cfg else None,
+            )
+            if _scoped:
+                _gate_violations = fitness_sanity_gate(
+                    Path(_tp_exp),
+                    _scoped,
+                    metric_direction=_direction or "minimize",
+                )
+                if _gate_violations:
+                    raise ValueError(
+                        "LLM4AD fitness sanity gate rejected evolution: "
+                        + " | ".join(_gate_violations)
+                    )
+                logger.info(
+                    "Stage 13: fitness sanity gate passed for %d "
+                    "algorithm(s) under %s", len(_scoped), _tp_exp,
+                )
+        except Exception as _l4b_gate:
+            # Re-raise as a hard failure, but only after logging with traceback:
+            # the gate is meant to STOP a bad evolution, not silently degrade.
+            logger.warning(
+                "Stage 13: LLM4AD fitness sanity gate failed: %s",
+                _l4b_gate, exc_info=True,
+            )
+            raise
+
         # Fresh per-call token: run_dir.name is stable across repeated runs, so
         # a module-level token would reuse the same temp workspace on every re-
         # entry (including a same-process re-entry after a rollback), making
