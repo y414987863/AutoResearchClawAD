@@ -524,12 +524,44 @@ def _validate_generation_completeness(files: dict[str, str]) -> list[str]:
     return problems
 
 
-def _check_llm4ad_structure(files: dict[str, str]) -> list[str]:
+def _generated_primary_metric(files: dict[str, str]) -> str | None:
+    """Extract the PRIMARY_METRIC the generated experiment actually declares.
+
+    Stage-10's contract puts the declaration in ``evaluator.py`` (and ``main.py``
+    usually re-exports it). The name is the *LLM's* free choice — config's
+    ``metric_key`` is only an advisory passed to the prompt — so this is the
+    ground truth of what evolution/promotion will optimise. ``None`` when no
+    declaration is parseable.
+    """
+    for name in ("evaluator.py", "main.py"):
+        code = files.get(name)
+        if not code:
+            continue
+        # Metric names are not bare identifiers: real ones carry ``@`` (nDCG@10),
+        # dots, dashes, slashes (mse@k, 1-step_mae, recall@5). A word-only class
+        # would silently return None for exactly the metrics that dissent and need
+        # surfacing most. Capture broad-but-safe: any run of the characters that
+        # appear in metric names, stopping at the closing quote.
+        for pat in (
+            r'PRIMARY_METRIC\s*=\s*["\']([A-Za-z0-9_@./-]+)["\']',
+            r'primary_metric\s*=\s*["\']([A-Za-z0-9_@./-]+)["\']',
+        ):
+            m = re.search(pat, code)
+            if m:
+                return m.group(1)
+    return None
+
+
+def _check_llm4ad_structure(files: dict[str, str], metric_key: str = "") -> list[str]:
     """Validate that generated files satisfy the LLM4AD task-package layout.
 
     Returns deficiency strings; empty means the structure is package-ready (one
     evolvable module per algorithm, EVOLVE markers, static data/, and a main.py
     supporting the ``--algorithm`` / importlib / primary-metric contract).
+    ``metric_key`` is the config-declared metric name; when given and the
+    generated PRIMARY_METRIC dissents, a METRIC_MISMATCH problem is appended so
+    evolution is not silently optimising a different number than the pipeline
+    claims to report.
     """
     problems: list[str] = []
 
@@ -728,7 +760,39 @@ def _check_llm4ad_structure(files: dict[str, str]) -> list[str]:
                     f"`instance.get(\"{key}\", ...)`."
                 )
 
+    if metric_key:
+        _mm = _metric_mismatch_problem(files, metric_key)
+        if _mm:
+            problems.append(_mm)
+
     return problems
+
+
+def _metric_mismatch_problem(files: dict[str, str], metric_key: str) -> str | None:
+    """Return a problem when the generated PRIMARY_METRIC differs from metric_key.
+
+    Stage-10's codegen LLM picks the primary metric freely (config's ``metric_key``
+    is only an advisory in the prompt), so the actual optimised metric can dissent
+    from what the pipeline claims to report. Do NOT make this a hard failure: the
+    configured key may be a legacy placeholder. But a *dissent* is exactly the
+    ml25/ml23/ml03 failure signature — evolution optimises one number while the
+    paper reports another — so it must be surfaced for review rather than silent.
+    """
+    declared = _generated_primary_metric(files)
+    requested = (metric_key or "").strip()
+    if not declared or not requested or declared == requested:
+        return None
+    # A generic default ("mean_best_objective_value") carries no topic intent, so
+    # dissent against it is expected and says nothing about the metric being wrong.
+    if requested in ("mean_best_objective_value", "primary_metric", "objective_value"):
+        return None
+    return (
+        f"METRIC_MISMATCH: generated PRIMARY_METRIC is `{declared}`, but config "
+        f"metric_key is `{requested}`. The LLM chose a different metric than the "
+        f"experiment plan declares; evolution and the paper report `{declared}` "
+        "while config claims `{requested}`. Make the generated metric match the "
+        "plan's metric, or update metric_key to the real metric."
+    )
 
 
 def _repair_llm4ad_structure(
@@ -2516,7 +2580,20 @@ def _execute_code_generation(
     # repair attempt(s)". Route them through the same repair channel as syntax
     # defects, re-check after each pass, and only give up at `max_repair`.
     if _is_llm4ad_enabled(config):
-        _l4b_problems = _check_llm4ad_structure(files)
+        _l4b_problems = _check_llm4ad_structure(files, metric_key=metric)
+        # A METRIC_MISMATCH is an advisory, not a structure defect: the metric
+        # NAME is the LLM's free choice (config only hints it), so re-running the
+        # repair loop against it would burn budget "fixing" integer correctness
+        # the LLM cannot see as a bug. Surface it loudly and keep it out of the
+        # repairable set so it does not block the run.
+        _repairable: list[str] = []
+        for _prob in _l4b_problems:
+            if _prob.startswith("METRIC_MISMATCH"):
+                logger.warning("Stage 10: %s", _prob)
+                validation_log.append(_prob)
+            else:
+                _repairable.append(_prob)
+        _l4b_problems = _repairable
         for _prob in _l4b_problems:
             logger.warning("Stage 10: %s", _prob)
             validation_log.append(_prob)
@@ -3477,11 +3554,15 @@ Multi-file experiment project with {len(files)} file(s): {file_list}
                                 "Stage 10: OpenCode repair produced invalid code in %s",
                                 _fn,
                             )
-                    if _is_llm4ad_enabled(config) and not _check_llm4ad_structure(files):
-                        _revalid_ok = False
-                        logger.warning(
-                            "Stage 10: OpenCode repair violated the LLM4AD structure contract"
-                        )
+                    if _is_llm4ad_enabled(config) and not _check_llm4ad_structure(files, metric_key=metric):
+                        # METRIC_MISMATCH is advisory; a naming dissent is not a
+                        # structural defect the repair loop can fix.
+                        if not any(p.startswith("METRIC_MISMATCH")
+                                   for p in _check_llm4ad_structure(files, metric_key=metric)):
+                            _revalid_ok = False
+                            logger.warning(
+                                "Stage 10: OpenCode repair violated the LLM4AD structure contract"
+                            )
                     if not _revalid_ok:
                         logger.warning(
                             "Stage 10: OpenCode repair did not validate — smoke run will retry"

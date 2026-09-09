@@ -1086,12 +1086,41 @@ def _run_llm4ad_evolution(
     return ("evolution_results/",)
 
 
+def _failed_census(attempted_algos: dict[str, str] | None) -> dict[str, Any]:
+    """Map each attempted algorithm to a ``failed:true`` comparison entry.
+
+    Pure mapping over ``attempted_algos`` — no filesystem or comparison-state
+    lookups. Which algorithms belong in the set (all of ``attempted_algos`` plus
+    anything in ``evolution_results/`` that the main promotion loop did not
+    already account for) is the caller's job, because only the caller knows what
+    got processed into ``comparison``. Kept separate so the mapping itself stays
+    unit-testable and the "missing base dir" early return reuses it as-is.
+    """
+    census: dict[str, Any] = {}
+    for algo_name, err in sorted((attempted_algos or {}).items()):
+        census[algo_name] = {
+            "baseline": None, "evolved": None, "delta_pct": None,
+            "promoted": False, "failed": True,
+            "reason": (
+                err.strip()
+                or "no evolution result — package timed out or llm4ad run failed"
+            ),
+        }
+        logger.warning(
+            "Stage 13: %s absent from evolution_results/ (%s); recorded as failed "
+            "in the comparison rather than dropped",
+            algo_name, err.strip() or "no evolution result",
+        )
+    return census
+
+
 def _promote_llm4ad_to_experiment_final(
     base_exp_dir: Path,
     evolution_dir: Path,
     final_dir: Path,
     *,
     metric_direction: str = "minimize",
+    attempted_algos: dict[str, str] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Overlay only genuinely-improved evolved modules onto a clean project.
 
@@ -1108,9 +1137,21 @@ def _promote_llm4ad_to_experiment_final(
 
     ``metric_direction`` ("minimize"/"maximize") decides which score is better.
 
+    ``attempted_algos`` maps every algorithm the run *attempted* to evolve to a
+    per-package error message (or ``""`` when it ran to completion).  Without it
+    this function used to iterate only what ``evolution_results/`` happened to
+    contain, so an algorithm whose evolution failed (package timeout, llm4ad
+    crash, smoke-check rejection) vanished from the comparison entirely — the
+    ml25 run "compared" 3 of 5 algorithms and wrote no ``failed: true`` for esn
+    or gp, so a reviewer read the short list as "evolution skipped those".  The
+    set is the union of ``attempted_algos`` keys and ``evolution_dir`` contents;
+    any algorithm present in the tried set but absent from ``evolution_dir`` is
+    recorded as ``failed: true`` with its error message, so the comparison is a
+    complete census of the run rather than just its successes.
+
     Returns ``(n_promoted, comparison)`` where ``comparison`` is a dict of
     ``{algo: {baseline, evolved, delta_pct, promoted, failed, reason}}`` for
-    every algo present in ``evolution_dir``.
+    every attempted algorithm.
     """
     import shutil as _sh_promote
     import subprocess as _sp
@@ -1128,7 +1169,10 @@ def _promote_llm4ad_to_experiment_final(
             "Stage 13: cannot promote llm4ad results — base experiment dir "
             "missing: %s", base_exp_dir,
         )
-        return 0, {}
+        # Still emit the failed-algorithm census: an experiment whose clean code
+        # vanished is exactly a run where nothing can promote, and dropping the
+        # attempted set here would repeat the "evolution skipped those" reading.
+        return 0, _failed_census(attempted_algos)
 
     # Rebuild final_dir from the clean base (remove errant leftover, if any).
     if final_dir.exists():
@@ -1205,7 +1249,9 @@ def _promote_llm4ad_to_experiment_final(
     comparison: dict[str, Any] = {}
     n_promoted = 0
     if not evolution_dir.is_dir():
-        return 0, comparison
+        # Nothing to promote, but the attempted set still has to be reported:
+        # this is exactly the run where evolution failed wholesale.
+        return 0, _failed_census(attempted_algos)
 
     for algo_pkg in sorted(evolution_dir.iterdir()):
         if not algo_pkg.is_dir():
@@ -1330,6 +1376,23 @@ def _promote_llm4ad_to_experiment_final(
             baseline_score, evolved_score, delta_pct if delta_pct is not None else 0.0,
             len(common), n_total,
         )
+
+    # Completeness census: an algorithm that was attempted but produced no
+    # evolution_results/ entry must not vanish from the comparison. Without this,
+    # a failed-to-evolve algorithm (package timeout, llm4ad internal crash,
+    # smoke-check rejection) is absent from both llm4ad_comparison.json and
+    # experiment_final/ with no trace — the ml25 run silently dropped esn and gp.
+    # The attempted set is the union of what the run tried and what somehow landed
+    # in evolution_results/ (which the loop above already recorded in
+    # ``comparison`` if it promoted/kept it). Anything left over that is not
+    # already in ``comparison`` is recorded as failed with its error message.
+    _census_src: dict[str, str] = dict(attempted_algos or {})
+    if evolution_dir.is_dir():
+        for algo_pkg in sorted(evolution_dir.iterdir()):
+            if algo_pkg.is_dir():
+                _census_src.setdefault(algo_pkg.name, "")
+    _census_src = {k: v for k, v in _census_src.items() if k not in comparison}
+    comparison.update(_failed_census(_census_src))
 
     if not n_promoted:
         logger.warning(
@@ -2352,9 +2415,19 @@ def _execute_iterative_refine(
             # evolution optimised the other way, silently discarding real gains.
             from researchclaw.pipeline._helpers import resolve_metric_direction
             _metric_direction = resolve_metric_direction(config, Path(_clean_exp))
+            # Complete census: every algorithm the run attempted to evolve, keyed
+            # to its per-package error message ("" = ran to completion). Derived
+            # from the evolution log so an algorithm that failed to evolve is
+            # still reported as failed in llm4ad_comparison.json rather than
+            # dropped (see _promote_llm4ad_to_experiment_final).
+            _attempted: dict[str, str] = {}
+            for _r in (log.get("evolution") or {}).get("results", []):
+                if isinstance(_r, dict) and _r.get("algo"):
+                    _attempted[str(_r["algo"])] = str(_r.get("error_message") or "")
             _n, _comparison = _promote_llm4ad_to_experiment_final(
                 Path(_clean_exp), _evo_dir, final_dir,
                 metric_direction=_metric_direction,
+                attempted_algos=_attempted,
             )
             # Persist the per-algo evolvability comparison so reviewers can see
             # which evolved algorithms were actually promoted into experiment_final/.

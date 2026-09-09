@@ -998,6 +998,23 @@ def generate_task_packages(
         A list of PackageManifest describing each generated package."""
     exp_dir = Path(exp_dir)
     out_dir = Path(out_dir)
+    # Never confuse the package output with the experiment source: clearing a
+    # directory that CONTAINS the experiment destroys the very input we read.
+    _out_abs = out_dir.resolve()
+    if _out_abs == exp_dir.resolve() or exp_dir.resolve() in _out_abs.parents:
+        raise ValueError(
+            f"task_packages out_dir {out_dir} must not be the experiment dir or "
+            f"one of its parents; refusing to clear it"
+        )
+    # Clear the WHOLE output dir, not just the packages this run rebuilds. A
+    # stale package left over from a previous (e.g. unscopped or re-scoped) run
+    # still has its own config.yaml, so run_evolution_on_packages globs and runs
+    # it — the ml03 run "built" 4 packages but "ran" 10 because 6 dirs survived
+    # an earlier generation. Dropping every child here makes the package set
+    # exactly the set this invocation generates; the per-package rmtree below
+    # stays as a second line of defence for the rebuild case.
+    if out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)
     primary_metric = _read_primary_metric(exp_dir)
     if metric_direction:
         metric_direction = metric_direction.strip().upper()
