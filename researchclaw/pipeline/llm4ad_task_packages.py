@@ -226,9 +226,9 @@ def _read_primary_metric(exp_dir: Path) -> str:
     # then silently falls through to the default here — after which every
     # individual fails with "Primary metric ... unusable: key absent".
     pats = (
-        r'PRIMARY_METRIC\s*=\s*["\']([a-zA-Z0-9_]+)["\']',
-        r'primary_metric\s*=\s*["\']([a-zA-Z0-9_]+)["\']',
-        r'["\']primary_metric["\']\s*:\s*["\']([a-zA-Z0-9_]+)["\']',
+        r'PRIMARY_METRIC\s*=\s*["\']([A-Za-z0-9_@./-]+)["\']',
+        r'primary_metric\s*=\s*["\']([A-Za-z0-9_@./-]+)["\']',
+        r'["\']primary_metric["\']\s*:\s*["\']([A-Za-z0-9_@./-]+)["\']',
     )
     for name in ("evaluator.py", "main.py"):
         try:
