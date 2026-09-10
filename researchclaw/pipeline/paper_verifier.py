@@ -404,6 +404,45 @@ def _check_condition_names(
     # This is heuristic — we look for unknown names that look like conditions
     known_lower = {name.lower() for name in registry.condition_names}
 
+    def _norm_cond(name: str) -> str:
+        """Fold a condition name to a comparison key.
+
+        Papers spell conditions for humans ("CMA-ES", "Nelder--Mead", "Random
+        Search") while the registry stores machine ids ("cma_es",
+        "nelder_mead", "random_search_baseline").  Comparing the two verbatim
+        turned every correctly formatted table row into a "fabricated
+        condition", and a single fabricated condition forces the whole paper
+        to REJECT.
+        """
+        s = name.lower()
+        s = s.replace("---", "-").replace("--", "-")
+        for _dash in ("‐", "‑", "‒", "–", "—", "−"):
+            s = s.replace(_dash, "-")
+        s = re.sub(r"\\[a-zA-Z]+", "", s)   # drop leftover LaTeX commands
+        s = re.sub(r"[^a-z0-9]+", "", s)    # fold -, _, spaces, dots away
+        return s
+
+    known_norm = {_norm_cond(n) for n in registry.condition_names}
+    known_norm.discard("")
+
+    def _is_known(name: str) -> bool:
+        """True when *name* refers to a condition the registry knows.
+
+        Substring matching in both directions covers the usual suffix/prefix
+        conventions — a paper writes "Random Search" for the registry's
+        "random_search_baseline", or "CMA-ES (ours)" for "cma_es".  Both sides
+        must be >= 4 chars so a short id cannot match everything.
+        """
+        n = _norm_cond(name)
+        if not n:
+            return True
+        if n in known_norm:
+            return True
+        return any(
+            (n in k or k in n) and len(n) >= 4 and len(k) >= 4
+            for k in known_norm
+        )
+
     # Common generic terms that should NOT be flagged as fabricated conditions
     _GENERIC_TERMS = {
         "method", "metric", "condition", "---", "",
@@ -411,19 +450,29 @@ def _check_condition_names(
         "ours", "average", "mean", "std", "total",
         "baseline", "proposed", "ablation", "default",
         "results", "table", "figure", "section",
+        # Table-header vocabulary: these label a column, they never name a run.
+        "optimizer", "algorithm", "objective", "family", "dataset",
+        "problem", "task", "setting", "instance", "seed", "seeds",
+        "runtime", "score", "value", "delta", "change", "improvement",
+        "evolved", "note", "notes", "count", "n",
     }
+
+    # Formula cells ("f(x)", "$\Delta$", "S_\tau(B)") are math, not run names.
+    _MATHY_RE = re.compile(r"[$\\^]|^\w+\([^)]*\)$")
 
     def _is_candidate(name: str) -> bool:
         """Check if a cleaned name looks like a real condition name."""
         return bool(
             name
             and name.lower() not in known_lower
+            and not _is_known(name)
             and name.lower() not in _GENERIC_TERMS
             and not name.startswith("\\")
             and len(name) > 1
             and not name.isdigit()
             # BUG-DA8-15: Reject numeric-looking strings (e.g. "91.5" from \textbf{91.5})
             and not re.match(r'^[\d.eE+\-]+$', name)
+            and not _MATHY_RE.search(name)
         )
 
     def _clean_latex(s: str) -> str:
@@ -436,6 +485,22 @@ def _check_condition_names(
     # 1. Extract potential condition names from TABLE ROWS
     for i, line in enumerate(lines):
         if "&" in line and "\\\\" in line:
+            # The header row labels columns ("Optimizer & Mean & Std"); it is
+            # not a run name.  It is the row immediately before \midrule, and
+            # the converter emits it with every cell wrapped in \textbf{}.
+            _next_nonblank = ""
+            for _j in range(i + 1, min(i + 3, len(lines))):
+                if lines[_j].strip():
+                    _next_nonblank = lines[_j].strip()
+                    break
+            if _next_nonblank.startswith("\\midrule"):
+                continue
+            _cells_raw = [c.strip() for c in line.split("&")]
+            if len(_cells_raw) > 1 and all(
+                c.startswith("\\textbf{") for c in _cells_raw if c
+            ):
+                continue
+
             cells = line.split("&")
             if cells:
                 cand_clean = _clean_latex(cells[0].strip().rstrip("\\").strip())

@@ -16,6 +16,34 @@ from pathlib import Path
 # Root directory for bundled style files
 _STYLES_DIR = Path(__file__).parent / "styles"
 
+# Legacy ``algorithmic`` spellings aliased onto their ``algpseudocode``
+# equivalents.  Templates load algpseudocode (mixed case: \State, \If, \For)
+# because that is what papers are written in; these aliases keep a paper that
+# uses the older ALL-CAPS spellings compiling unchanged.  \providecommand so a
+# style file that already defines any of them wins.
+_ALGORITHMIC_CAPS_ALIASES = "\n".join(
+    [
+        "% Legacy algorithmic ALL-CAPS spellings -> algpseudocode equivalents",
+        "\\providecommand{\\STATE}{\\State}",
+        "\\providecommand{\\REQUIRE}{\\Require}",
+        "\\providecommand{\\ENSURE}{\\Ensure}",
+        "\\providecommand{\\IF}{\\If}",
+        "\\providecommand{\\ELSIF}{\\ElsIf}",
+        "\\providecommand{\\ELSE}{\\Else}",
+        "\\providecommand{\\ENDIF}{\\EndIf}",
+        "\\providecommand{\\FOR}{\\For}",
+        "\\providecommand{\\FORALL}{\\ForAll}",
+        "\\providecommand{\\ENDFOR}{\\EndFor}",
+        "\\providecommand{\\WHILE}{\\While}",
+        "\\providecommand{\\ENDWHILE}{\\EndWhile}",
+        "\\providecommand{\\REPEAT}{\\Repeat}",
+        "\\providecommand{\\UNTIL}{\\Until}",
+        "\\providecommand{\\RETURN}{\\State \\textbf{return} }",
+        "\\providecommand{\\COMMENT}[1]{\\Comment{#1}}",
+        "\\providecommand{\\PRINT}{\\State \\textbf{print} }",
+    ]
+)
+
 
 @dataclass(frozen=True)
 class ConferenceTemplate:
@@ -45,6 +73,15 @@ class ConferenceTemplate:
         # \documentclass[aps,prd,reprint]{revtex4-2}).
         options = f"[{self.style_options}]" if self.style_options else ""
         pkg_lines = "\n".join(f"\\usepackage{{{p}}}" for p in self.extra_packages)
+
+        # algpseudocode supplies the mixed-case commands (\State, \If, ...).
+        # A paper written against legacy algorithmic uses the ALL-CAPS
+        # spellings, so alias those onto the modern ones — otherwise switching
+        # the package would merely relocate the "Undefined control sequence"
+        # errors instead of removing them.  \providecommand keeps this inert if
+        # a style file already defines them.
+        if "algpseudocode" in self.extra_packages:
+            pkg_lines += "\n" + _ALGORITHMIC_CAPS_ALIASES
 
         author_block = self._render_authors(authors)
 
@@ -178,12 +215,24 @@ NEURIPS_2024 = ConferenceTemplate(
         "booktabs",
         "amsfonts",
         "amsmath",
+        # amssymb supplies \triangleq, \lesssim, \nmid, \varnothing and the rest
+        # of the AMS symbol set.  Papers use them in display math freely; without
+        # the package every one is an "Undefined control sequence" that drops the
+        # equation and lets the surrounding text run off the page.
+        "amssymb",
         "nicefrac",
         "microtype",
         "graphicx",
         "natbib",
         "algorithm",
-        "algorithmic",
+        # algpseudocode (algorithmicx), not the legacy "algorithmic".  Papers
+        # write \State/\Require/\For/\ElsIf/\Return — algorithmicx's mixed-case
+        # set.  Legacy algorithmic defines only ALL-CAPS \STATE/\IF/..., so
+        # every line of a pseudocode block was an "Undefined control sequence"
+        # and the algorithm collapsed into one run-on paragraph that overran
+        # the margin.  It still provides the {algorithmic} environment, and
+        # render_preamble() aliases the ALL-CAPS spellings for older papers.
+        "algpseudocode",
         "adjustbox",
     ),
     author_format="neurips",
@@ -206,12 +255,24 @@ ICLR_2025 = ConferenceTemplate(
         "booktabs",
         "amsfonts",
         "amsmath",
+        # amssymb supplies \triangleq, \lesssim, \nmid, \varnothing and the rest
+        # of the AMS symbol set.  Papers use them in display math freely; without
+        # the package every one is an "Undefined control sequence" that drops the
+        # equation and lets the surrounding text run off the page.
+        "amssymb",
         "nicefrac",
         "microtype",
         "graphicx",
         "natbib",
         "algorithm",
-        "algorithmic",
+        # algpseudocode (algorithmicx), not the legacy "algorithmic".  Papers
+        # write \State/\Require/\For/\ElsIf/\Return — algorithmicx's mixed-case
+        # set.  Legacy algorithmic defines only ALL-CAPS \STATE/\IF/..., so
+        # every line of a pseudocode block was an "Undefined control sequence"
+        # and the algorithm collapsed into one run-on paragraph that overran
+        # the margin.  It still provides the {algorithmic} environment, and
+        # render_preamble() aliases the ALL-CAPS spellings for older papers.
+        "algpseudocode",
         "adjustbox",
     ),
     author_format="iclr",
@@ -233,12 +294,24 @@ ICML_2025 = ConferenceTemplate(
         "booktabs",
         "amsfonts",
         "amsmath",
+        # amssymb supplies \triangleq, \lesssim, \nmid, \varnothing and the rest
+        # of the AMS symbol set.  Papers use them in display math freely; without
+        # the package every one is an "Undefined control sequence" that drops the
+        # equation and lets the surrounding text run off the page.
+        "amssymb",
         "nicefrac",
         "microtype",
         "graphicx",
         "natbib",
         "algorithm",
-        "algorithmic",
+        # algpseudocode (algorithmicx), not the legacy "algorithmic".  Papers
+        # write \State/\Require/\For/\ElsIf/\Return — algorithmicx's mixed-case
+        # set.  Legacy algorithmic defines only ALL-CAPS \STATE/\IF/..., so
+        # every line of a pseudocode block was an "Undefined control sequence"
+        # and the algorithm collapsed into one run-on paragraph that overran
+        # the margin.  It still provides the {algorithmic} environment, and
+        # render_preamble() aliases the ALL-CAPS spellings for older papers.
+        "algpseudocode",
         "adjustbox",
     ),
     author_format="icml",
@@ -263,12 +336,24 @@ NEURIPS_2025 = ConferenceTemplate(
         "booktabs",
         "amsfonts",
         "amsmath",
+        # amssymb supplies \triangleq, \lesssim, \nmid, \varnothing and the rest
+        # of the AMS symbol set.  Papers use them in display math freely; without
+        # the package every one is an "Undefined control sequence" that drops the
+        # equation and lets the surrounding text run off the page.
+        "amssymb",
         "nicefrac",
         "microtype",
         "graphicx",
         "natbib",
         "algorithm",
-        "algorithmic",
+        # algpseudocode (algorithmicx), not the legacy "algorithmic".  Papers
+        # write \State/\Require/\For/\ElsIf/\Return — algorithmicx's mixed-case
+        # set.  Legacy algorithmic defines only ALL-CAPS \STATE/\IF/..., so
+        # every line of a pseudocode block was an "Undefined control sequence"
+        # and the algorithm collapsed into one run-on paragraph that overran
+        # the margin.  It still provides the {algorithmic} environment, and
+        # render_preamble() aliases the ALL-CAPS spellings for older papers.
+        "algpseudocode",
         "adjustbox",
     ),
     author_format="neurips",
@@ -291,12 +376,24 @@ ICLR_2026 = ConferenceTemplate(
         "booktabs",
         "amsfonts",
         "amsmath",
+        # amssymb supplies \triangleq, \lesssim, \nmid, \varnothing and the rest
+        # of the AMS symbol set.  Papers use them in display math freely; without
+        # the package every one is an "Undefined control sequence" that drops the
+        # equation and lets the surrounding text run off the page.
+        "amssymb",
         "nicefrac",
         "microtype",
         "graphicx",
         "natbib",
         "algorithm",
-        "algorithmic",
+        # algpseudocode (algorithmicx), not the legacy "algorithmic".  Papers
+        # write \State/\Require/\For/\ElsIf/\Return — algorithmicx's mixed-case
+        # set.  Legacy algorithmic defines only ALL-CAPS \STATE/\IF/..., so
+        # every line of a pseudocode block was an "Undefined control sequence"
+        # and the algorithm collapsed into one run-on paragraph that overran
+        # the margin.  It still provides the {algorithmic} environment, and
+        # render_preamble() aliases the ALL-CAPS spellings for older papers.
+        "algpseudocode",
         "adjustbox",
     ),
     author_format="iclr",
@@ -318,12 +415,24 @@ ICML_2026 = ConferenceTemplate(
         "booktabs",
         "amsfonts",
         "amsmath",
+        # amssymb supplies \triangleq, \lesssim, \nmid, \varnothing and the rest
+        # of the AMS symbol set.  Papers use them in display math freely; without
+        # the package every one is an "Undefined control sequence" that drops the
+        # equation and lets the surrounding text run off the page.
+        "amssymb",
         "nicefrac",
         "microtype",
         "graphicx",
         "natbib",
         "algorithm",
-        "algorithmic",
+        # algpseudocode (algorithmicx), not the legacy "algorithmic".  Papers
+        # write \State/\Require/\For/\ElsIf/\Return — algorithmicx's mixed-case
+        # set.  Legacy algorithmic defines only ALL-CAPS \STATE/\IF/..., so
+        # every line of a pseudocode block was an "Undefined control sequence"
+        # and the algorithm collapsed into one run-on paragraph that overran
+        # the margin.  It still provides the {algorithmic} environment, and
+        # render_preamble() aliases the ALL-CAPS spellings for older papers.
+        "algpseudocode",
         "adjustbox",
         "morefloats",
     ),
@@ -495,6 +604,7 @@ GENERIC = ConferenceTemplate(
         "booktabs",
         "amsfonts",
         "amsmath",
+        "amssymb",
         "graphicx",
         "natbib",
         "geometry",

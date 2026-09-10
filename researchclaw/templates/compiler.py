@@ -308,6 +308,19 @@ def fix_common_latex_errors(
                     cat = unicodedata.category(char)
                     replacement = " " if cat.startswith("Z") else ""
                     fixed = fixed.replace(char, replacement)
+                    # Also drop any VARIATION SELECTOR / ZWJ still in the file.
+                    # pdflatex names one codepoint per error line, so removing an
+                    # emoji's base character can leave its modifier behind as a
+                    # separate offender on a later pass.  A selector has no
+                    # standalone meaning once its base is gone.
+                    if replacement == "":
+                        fixed = "".join(
+                            c
+                            for c in fixed
+                            if not (
+                                0xFE00 <= ord(c) <= 0xFE0F or ord(c) == 0x200D
+                            )
+                        )
                     fixes.append(
                         f"Replaced Unicode U+{cp_match.group(1)} "
                         f"({'space' if replacement == ' ' else 'removed'})"
@@ -615,6 +628,23 @@ def _sanitize_tex_unicode(tex_path: Path) -> None:
         "\u2028",  # LINE SEPARATOR
         "\u2029",  # PARAGRAPH SEPARATOR
     )
+    # Non-breaking punctuation \u2192 ASCII equivalent.
+    #
+    # These typeset correctly and raise no error, which is why they survive
+    # unnoticed: U+2011 measures the same 23.05pt as an ASCII "-".  What they
+    # remove is the line break TeX would otherwise be free to take at a hyphen.
+    # Measured in a 2.2cm column, "reconstruction<U+2011>calibration" overflows
+    # by 49.74pt where the ASCII spelling overflows by 3.05pt.
+    #
+    # LLMs emit these when restating text copied from rendered web pages, and
+    # they land in titles -- ml03's is "Empirical Equal<U+2011>Budget CPU
+    # Benchmarking of Nelder--Mead, Powell, and CMA<U+2011>ES" -- which are set
+    # large and centred and therefore have to wrap.
+    _UNICODE_HYPHENS = (
+        "\u2010",  # HYPHEN
+        "\u2011",  # NON-BREAKING HYPHEN
+        "\u2012",  # FIGURE DASH
+    )
 
     changed = False
     for ch in _UNICODE_SPACES:
@@ -625,6 +655,80 @@ def _sanitize_tex_unicode(tex_path: Path) -> None:
         if ch in text:
             text = text.replace(ch, "")
             changed = True
+    for ch in _UNICODE_HYPHENS:
+        if ch in text:
+            text = text.replace(ch, "-")
+            changed = True
+
+    # Emoji / pictographs → replace up front.
+    #
+    # pdflatex under standard inputenc cannot set these at all, and the character
+    # is dropped from the PDF.  _is_fatal_error() deliberately classes "Unicode
+    # character" as non-fatal (BUG-197, correctly -- a valid PDF is still
+    # produced), so the retry loop exits successfully and the reactive repair in
+    # fix_common_latex_errors() never runs for these.  Nothing warns the reader.
+    #
+    # Observed in ml23: paper_final.md carries "1. ⚠️ [pipeline] Research decision
+    # was REFINE" and the shipped paper.tex has no ⚠ at all.  That run only lost
+    # the glyph visibly because four *fatal* structural errors forced repair
+    # attempts that stripped it in passing; with those fixed, the same input
+    # would compile first try and drop the character silently.
+    #
+    # Ranges cover pictographic blocks only.  Math operators and arrows are
+    # already mapped to LaTeX by converter.py's _UNICODE_GREEK_TO_LATEX /
+    # _UNICODE_TO_ASCII, and U+2300-U+23FF is left alone because it holds
+    # \lceil and friends.
+    _PICTOGRAPH_RANGES = (
+        (0x2500, 0x257F),  # box drawing
+        (0x2580, 0x259F),  # block elements
+        (0x25A0, 0x25FF),  # geometric shapes
+        (0x2600, 0x26FF),  # misc symbols (☀ ⚠ ⚡ …)
+        (0x2700, 0x27BF),  # dingbats (✓ ✗ ✦ …)
+        (0x2B00, 0x2BFF),  # misc symbols & arrows (⭐ …)
+        (0xFE00, 0xFE0F),  # VARIATION SELECTORs
+        (0x1F000, 0x1FAFF),  # emoji planes
+    )
+    # Spell out the few that carry meaning instead of dropping them silently:
+    # a blank where a table said "✓" reads as missing data, not as a clean
+    # removal.  Everything else in the ranges above is decoration.
+    _PICTOGRAPH_TEXT = {
+        "✓": "yes",
+        "✔": "yes",
+        "✗": "no",
+        "✘": "no",
+        "⚠": "WARNING:",
+        "★": "*",
+        "☆": "*",
+        "▪": "-",
+        "▶": "->",
+        # Filled/hollow pairs are the standard "supported / not supported"
+        # notation in comparison tables.  Map them to a visible token that keeps
+        # the two apart rather than to text that asserts a meaning they may not
+        # have in a given table.
+        "●": "*",
+        "○": "o",
+        "■": "*",
+        "□": "o",
+        "◆": "*",
+        "◇": "o",
+        "▲": "^",
+    }
+
+    def _has_pictograph(src: str) -> bool:
+        return any(
+            any(lo <= ord(ch) <= hi for lo, hi in _PICTOGRAPH_RANGES) for ch in src
+        )
+
+    if _has_pictograph(text):
+        _out: list[str] = []
+        for ch in text:
+            cp = ord(ch)
+            if any(lo <= cp <= hi for lo, hi in _PICTOGRAPH_RANGES):
+                _out.append(_PICTOGRAPH_TEXT.get(ch, ""))
+            else:
+                _out.append(ch)
+        text = "".join(_out)
+        changed = True
 
     # BUG-201: Transliterate any Cyrillic that leaked into .tex (from bib
     # entries inlined by bibtex, or from LLM-generated text).

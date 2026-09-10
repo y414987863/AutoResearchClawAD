@@ -57,6 +57,11 @@ def _get_review_compiled_pdf():
     return _review_compiled_pdf
 
 
+def _get_collect_llm4ad_comparison():
+    from researchclaw.pipeline.stage_impls._paper_writing import _collect_llm4ad_comparison
+    return _collect_llm4ad_comparison
+
+
 # ---------------------------------------------------------------------------
 # _collect_experiment_evidence
 # ---------------------------------------------------------------------------
@@ -128,6 +133,63 @@ def _collect_experiment_evidence(run_dir: Path) -> str:
         "\n\n## Actual Experiment Evidence\n"
         "Use the evidence below to verify the paper's methodology claims.\n\n"
         + "\n\n".join(evidence_parts)
+    )
+
+
+def _llm4ad_was_run(run_dir: Path) -> bool:
+    """True when this run produced an LLM4AD baseline-vs-evolved comparison."""
+    for _p in run_dir.glob("stage-13*/llm4ad_comparison.json"):
+        try:
+            _d = json.loads(_p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(_d, dict) and _d.get("algorithms"):
+            return True
+    return False
+
+
+def _llm4ad_preservation_notice(run_dir: Path, *, audience: str) -> str:
+    """Tell downstream stages the LLM4AD section is approved scope, not drift.
+
+    Stage 17 injects a baseline-vs-evolved comparison table because the LLM4AD
+    evolution loop is part of the executed experiment. Reviewers, seeing a
+    table whose protocol differs from the main results table, have called it
+    "a major drift" and Stage 19 then deleted the section outright — after
+    which Stage 22 regenerated the paper from the already-stripped revision,
+    so the contribution disappeared from every final artifact.
+
+    *audience* selects the wording: ``"reviewer"`` (do not flag it),
+    ``"reviser"`` / ``"exporter"`` (do not delete it).
+    """
+    if not _llm4ad_was_run(run_dir):
+        return ""
+
+    _shared = (
+        "This run included an LLM4AD evolutionary search over the experiment's "
+        "algorithms, and the paper reports it as its own self-contained table "
+        "(algorithm | baseline | evolved | relative change). Its baseline and "
+        "evolved values are per-instance means under a common evaluator, which "
+        "is a DIFFERENT aggregate from the main results table. The two "
+        "therefore disagree in magnitude by design, and neither is wrong."
+    )
+    if audience == "reviewer":
+        return (
+            "\n\n## Approved Scope: LLM4AD Evolution Section\n"
+            f"{_shared}\n"
+            "Do NOT report the presence of this table, or its disagreement "
+            "with the main results table, as scope drift, inconsistency, or "
+            "fabrication. It is an executed, approved part of the work. You may "
+            "still critique how clearly its protocol is explained.\n"
+        )
+    return (
+        "\n\n## MANDATORY: Preserve the LLM4AD Evolution Section\n"
+        f"{_shared}\n"
+        "You MUST keep this table, its caption, its Method sentence, and its "
+        "Discussion paragraph. Do NOT delete, merge, or shorten them away, even "
+        "if a review calls the section scope drift or inconsistent with the "
+        "main table — that objection has been reviewed and rejected. If the "
+        "section is missing from the input you were given, RESTORE it from the "
+        "data supplied below.\n"
     )
 
 
@@ -211,7 +273,11 @@ def _execute_peer_review(
         # prompt bank (ML bank -> NeurIPS/ICML referees, HEP bank -> HEP
         # theorist/phenomenologist/experimentalist). No adapter overlay.
         _review_system = sp.system
-        _review_user = sp.user + _quality_suffix
+        _review_user = (
+            sp.user
+            + _quality_suffix
+            + _llm4ad_preservation_notice(run_dir, audience="reviewer")
+        )
         resp = _chat_with_prompt(
             _review_llm,
             _review_system,
@@ -292,6 +358,20 @@ def _execute_paper_revision(
             "you do not have, state 'Due to computational constraints, "
             "this analysis was not conducted' instead of fabricating data.\n"
         )
+
+    # Reviewers have called the LLM4AD comparison table "scope drift" and this
+    # stage obeyed, deleting the contribution from the paper for good. Re-supply
+    # the notice AND the source numbers so the section survives — or is restored
+    # when the review already talked the draft out of it.
+    _llm4ad_keep_revision = _llm4ad_preservation_notice(run_dir, audience="reviser")
+    if _llm4ad_keep_revision:
+        try:
+            _llm4ad_keep_revision += _get_collect_llm4ad_comparison()(
+                run_dir, metric_direction=config.experiment.metric_direction
+            )
+        except Exception as _l4_exc:  # noqa: BLE001
+            logger.debug("Stage 19: LLM4AD block unavailable: %s", _l4_exc)
+        data_integrity_revision += _llm4ad_keep_revision
 
     if llm is not None:
         _pm = prompts or PromptManager()
@@ -791,6 +871,8 @@ Generated: {_utcnow_iso()}
 def _sanitize_fabricated_data(
     paper: str,
     run_dir: Path,
+    *,
+    metric_direction: str = "maximize",
 ) -> tuple[str, dict[str, Any]]:
     """Replace unverified numerical data in markdown tables with '---'.
 
@@ -868,6 +950,43 @@ def _sanitize_fabricated_data(
     # pass them because they were in the refinement log.  Now that Stage 17
     # also uses only the promoted best data (BUG-222), there is no need to
     # whitelist all sandbox metrics here.
+
+    # Seed from the SAME registry the verifier uses, so one artifact cannot be
+    # accepted by Stage 20/22 verification and simultaneously blanked here.
+    # Two things the raw scrape above misses:
+    #   * derived forms — the registry also registers rounded (1-4dp) and
+    #     x100 variants, so a table showing 0.9483 still matches a stored
+    #     0.948271 instead of being blanked to "---";
+    #   * LLM4AD numbers — baseline/evolved values live in
+    #     stage-13*/llm4ad_comparison.json, never in experiment_summary*.json,
+    #     so the restored evolution table would otherwise be wiped cell by cell.
+    # best_only=True is preserved: this widens the set of *representations* of
+    # promoted values, it does not re-admit regressed iterations.
+    _registry_value_count = 0
+    try:
+        from researchclaw.pipeline.verified_registry import (
+            VerifiedRegistry as _VRSan,
+        )
+
+        _san_reg = _VRSan.from_run_dir(
+            run_dir, metric_direction=metric_direction, best_only=True
+        )
+        import math as _math_reg
+
+        for _rv in _san_reg.values:
+            try:
+                _rvf = float(_rv)
+            except (TypeError, ValueError):
+                continue
+            if _math_reg.isfinite(_rvf):
+                verified_values.add(_rvf)
+                _registry_value_count += 1
+    except Exception as _reg_exc:  # noqa: BLE001
+        logger.warning(
+            "Stage 22: sanitizer could not load VerifiedRegistry (%s) — "
+            "falling back to experiment_summary scrape only",
+            _reg_exc,
+        )
 
     if not verified_values:
         report: dict[str, Any] = {
@@ -968,6 +1087,57 @@ def _sanitize_fabricated_data(
         replaced_values.append(num_str + pct)
         return "---"
 
+    # A "mean ± std" cell is ONE claim and must be judged as one.  Verifying
+    # each number independently yields cells like "0.901549 ± ---" (mean in
+    # the registry, std not) or "--- ± 0.022106", which is the half-filled
+    # cell readers report as "some cells have data, some don't".
+    # Policy: judge the mean; keep both numbers, or blank the pair with a
+    # single "---" placeholder.
+    # NB: no trailing ``\s*`` — consuming the space after the std collapses
+    # "| 0.5 ± 0.1 | 3 |" into "| ---| 3 |" and wrecks column alignment.
+    _CELL_PM_RE = _re_san.compile(
+        r"(-?\d+\.?\d*(?:[eE][+-]?\d+)?)\s*(%?)\s*"
+        r"(?:±|\$?\\pm\$?|\+/-|\+-)\s*"
+        r"(-?\d+\.?\d*(?:[eE][+-]?\d+)?)(%?)"
+    )
+
+    def _sanitize_cell(cell: str) -> str:
+        """Sanitize one table cell, treating ``mean ± std`` atomically."""
+
+        def _pair(m: _re_san.Match[str]) -> str:
+            nonlocal numbers_replaced, numbers_kept
+            try:
+                mean_val = float(m.group(1))
+            except ValueError:
+                return m.group(0)
+            if (
+                mean_val in _SANITIZER_ALWAYS_ALLOWED
+                or (mean_val == int(mean_val) and abs(mean_val) <= 20)
+                or _is_verified(mean_val)
+            ):
+                numbers_kept += 2
+                return m.group(0)
+            numbers_replaced += 2
+            replaced_values.append(
+                f"{m.group(1)}{m.group(2)}±{m.group(3)}{m.group(4)}"
+            )
+            return "---"
+
+        if not _CELL_PM_RE.search(cell):
+            return num_pat.sub(_replace_num, cell)
+        # Stash resolved pairs so the plain-number pass cannot re-enter them.
+        _stash: list[str] = []
+
+        def _stash_pair(m: _re_san.Match[str]) -> str:
+            _stash.append(_pair(m))
+            return f"\x00PM{len(_stash) - 1}\x00"
+
+        tmp = _CELL_PM_RE.sub(_stash_pair, cell)
+        tmp = num_pat.sub(_replace_num, tmp)
+        for _idx, _val in enumerate(_stash):
+            tmp = tmp.replace(f"\x00PM{_idx}\x00", _val)
+        return tmp
+
     def _sanitize_table(match: _re_san.Match[str]) -> str:
         nonlocal numbers_replaced, numbers_kept, tables_processed
         table_text = match.group(0)
@@ -1064,9 +1234,7 @@ def _sanitize_fabricated_data(
                 if ci <= 1 or not cell.strip() or ci in _hp_cols:
                     sanitized_cells.append(cell)
                 else:
-                    sanitized_cells.append(
-                        num_pat.sub(_replace_num, cell)
-                    )
+                    sanitized_cells.append(_sanitize_cell(cell))
             sanitized_lines.append("|".join(sanitized_cells))
         return "\n".join(sanitized_lines)
 
@@ -1164,7 +1332,7 @@ def _sanitize_fabricated_data(
                     # First cell is method/condition name — preserve
                     sanitized_cells.append(cell)
                 else:
-                    sanitized_cells.append(num_pat.sub(_replace_num, cell))
+                    sanitized_cells.append(_sanitize_cell(cell))
             result_parts.append("&".join(sanitized_cells))
 
         return "".join(result_parts)
@@ -1184,10 +1352,19 @@ def _sanitize_fabricated_data(
         r"(%|\\%)?",
         _re_san.IGNORECASE,
     )
-    # Only process lines in Results/Experiments sections
+    # Mean +/- std claims ("ListMLE-lite (0.593883 +/- 0.026725)") carry no
+    # reporting verb, so the pattern above never saw them.  That is how a paper
+    # ended up with a fully-populated abstract quoting one protocol and a
+    # Results table blanked to "---": the table was sanitized, the abstract
+    # sentence stating the same numbers was not.
+    _pm_pattern = _re_san.compile(
+        r"(\d+\.\d+)\s*(?:±|\\pm|\+/-)\s*(\d+\.\d+)"
+    )
+    # Process Results/Experiments sections AND the Abstract.  The abstract
+    # states the headline result, so leaving it unchecked defeats the point.
     _in_results_section = False
     _results_headers = _re_san.compile(
-        r"^#{1,3}\s*(Results|Experiments|Experimental|Evaluation|Ablation)",
+        r"^#{1,3}\s*(Abstract|Results|Experiments|Experimental|Evaluation|Ablation)",
         _re_san.IGNORECASE,
     )
     _any_header = _re_san.compile(r"^#{1,3}\s+")
@@ -1218,9 +1395,55 @@ def _sanitize_fabricated_data(
                     return m.group(0)
                 prose_numbers_replaced += 1
                 return m.group(0).replace(num_str + (m.group(2) or ""), "[value removed]")
+            def _replace_pm_claim(m: _re_san.Match[str]) -> str:
+                # Judge the pair by its mean only.  Std/CI half-widths are
+                # often absent from the registry, and blanking a std whose
+                # mean is verified would re-create the "half-empty cell"
+                # artefact this sanitizer exists to avoid.
+                nonlocal prose_numbers_replaced
+                try:
+                    mean_val = float(m.group(1))
+                except ValueError:
+                    return m.group(0)
+                if _is_verified(mean_val):
+                    return m.group(0)
+                prose_numbers_replaced += 1
+                return "[value removed]"
+
             _line = _prose_pattern.sub(_replace_prose_num, _line)
+            _line = _pm_pattern.sub(_replace_pm_claim, _line)
         _sanitized_lines.append(_line)
     sanitized = "\n".join(_sanitized_lines)
+
+    # --- Diagnostic: rows whose every data cell was blanked ---
+    # One stray "---" is a single unverifiable number.  A row (or a whole
+    # table) blanked end-to-end means the paper quoted a protocol that is not
+    # in the registry at all — the pre-refinement scrape, say — and the reader
+    # sees a table of dashes.  Surface it instead of failing quietly.
+    fully_blanked_rows = 0
+    for _ln in sanitized.split("\n"):
+        _s = _ln.strip()
+        if _s.startswith("|"):
+            _dc = [c.strip().strip("*").strip() for c in _s.split("|")[1:-1]][1:]
+        elif "&" in _s and _s.endswith("\\\\"):
+            _dc = [
+                c.strip().strip("$").replace("\\textbf{", "").rstrip("}").strip()
+                for c in _s.rstrip("\\").split("&")
+            ][1:]
+        else:
+            continue
+        _dc = [c for c in _dc if c]
+        if not _dc or all(set(c) <= set("-: ") for c in _dc):
+            continue  # separator row
+        # Drop structural cells (seed/run counts) before judging: a row like
+        # "| listmle_lite | --- | 3 |" reads as blank even though the n=3
+        # column survived, and that is precisely the case worth reporting.
+        _metric_cells = [
+            c for c in _dc
+            if not _re_san.fullmatch(r"-?\d{1,3}", c)
+        ]
+        if _metric_cells and all(c == "---" for c in _metric_cells):
+            fully_blanked_rows += 1
 
     report = {
         "sanitized": numbers_replaced > 0 or prose_numbers_replaced > 0,
@@ -1228,7 +1451,9 @@ def _sanitize_fabricated_data(
         "numbers_replaced": numbers_replaced,
         "numbers_kept": numbers_kept,
         "prose_numbers_replaced": prose_numbers_replaced,
+        "fully_blanked_rows": fully_blanked_rows,
         "verified_values_count": len(verified_values),
+        "registry_values_merged": _registry_value_count,
         "replaced_samples": replaced_values[:20],
         "generated": _utcnow_iso(),
     }
@@ -1527,6 +1752,19 @@ def _execute_export_publish(
         _export_user = sp.user
         if _export_guidance:
             _export_user = _export_guidance + "\n\n" + _export_user
+        # This stage regenerates the paper from the Stage 19 revision. When that
+        # revision already dropped the LLM4AD section, nothing downstream ever
+        # put it back, so the contribution was absent from paper.tex, the PDF,
+        # and the deliverables. Re-inject the notice and the numbers here.
+        _llm4ad_keep_export = _llm4ad_preservation_notice(run_dir, audience="exporter")
+        if _llm4ad_keep_export:
+            try:
+                _llm4ad_keep_export += _get_collect_llm4ad_comparison()(
+                    run_dir, metric_direction=config.experiment.metric_direction
+                )
+            except Exception as _l4x_exc:  # noqa: BLE001
+                logger.debug("Stage 22: LLM4AD block unavailable: %s", _l4x_exc)
+            _export_user += _llm4ad_keep_export
         resp = _chat_with_prompt(
             llm,
             sp.system,
@@ -1556,16 +1794,27 @@ def _execute_export_publish(
 
     # Sanitize unverified data in tables — always-on, not just degraded mode
     final_paper, _san_report = _sanitize_fabricated_data(
-        final_paper, run_dir
+        final_paper, run_dir,
+        metric_direction=config.experiment.metric_direction,
     )
     (stage_dir / "sanitization_report.json").write_text(
         json.dumps(_san_report, indent=2), encoding="utf-8"
     )
     if _san_report.get("numbers_replaced", 0) > 0:
         logger.info(
-            "Stage 22: Fabrication sanitization — %d numbers replaced, %d kept",
+            "Stage 22: Fabrication sanitization — %d numbers replaced, %d kept "
+            "(registry contributed %d values)",
             _san_report.get("numbers_replaced", 0),
             _san_report.get("numbers_kept", 0),
+            _san_report.get("registry_values_merged", 0),
+        )
+    if _san_report.get("fully_blanked_rows", 0) > 0:
+        logger.warning(
+            "Stage 22: %d table row(s) were blanked end-to-end — the paper "
+            "quoted numbers absent from the verified registry (likely a "
+            "pre-refinement protocol). Readers will see a table of '---'. "
+            "Check stage-17's metric block against experiment_summary_best.json.",
+            _san_report["fully_blanked_rows"],
         )
 
     # Graceful degradation: insert notice only when quality gate was degraded

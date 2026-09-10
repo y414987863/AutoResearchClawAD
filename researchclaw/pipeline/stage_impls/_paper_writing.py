@@ -149,13 +149,106 @@ def _execute_paper_outline(
     )
 
 
+def _collect_promoted_experiment_metrics(run_dir: Path) -> tuple[str, bool]:
+    """Build the paper-writing metric block from the promoted best summary.
+
+    ``experiment_summary_best.json`` is written by ``_promote_best_stage14()``
+    and records the iteration that was actually promoted.  Stage 12
+    ``runs/*.json`` payloads are *pre*-refinement, so scraping them makes the
+    paper cite numbers no downstream consumer can verify: the registry
+    (``best_only=True``) and the Stage 22 sanitizer both read the promoted
+    summary, so pre-refinement values are flagged unverified and blanked to
+    ``---`` — the paper then shows a full abstract and an empty Results table.
+
+    Returns ``("", False)`` when no usable promoted summary exists, letting the
+    caller fall back to the raw scrape (single-iteration runs without REFINE).
+    """
+    best_path = run_dir / "experiment_summary_best.json"
+    if not best_path.exists():
+        return "", False
+    try:
+        data = json.loads(best_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return "", False
+    if not isinstance(data, dict):
+        return "", False
+
+    conds = data.get("condition_summaries")
+    if not isinstance(conds, dict) or not conds:
+        return "", False
+
+    lines: list[str] = []
+    for cond_name in sorted(conds):
+        entry = conds[cond_name]
+        if not isinstance(entry, dict):
+            continue
+        metrics = entry.get("metrics")
+        if not isinstance(metrics, dict) or not metrics:
+            continue
+        lines.append(f"## Condition: {cond_name}")
+        for mk in sorted(metrics):
+            mv = metrics[mk]
+            if isinstance(mv, (int, float)) and not isinstance(mv, bool):
+                lines.append(f"  - {mk}: {mv}")
+        for extra in ("n_seeds", "ci95_low", "ci95_high"):
+            if isinstance(entry.get(extra), (int, float)):
+                lines.append(f"  - {extra}: {entry[extra]}")
+    if not lines:
+        return "", False
+
+    # Paired comparisons (Stage 14 writes these when seeds are matched)
+    paired = data.get("paired_comparisons")
+    if isinstance(paired, list) and paired:
+        lines.append("## Paired comparisons")
+        for pc in paired[:20]:
+            if isinstance(pc, dict):
+                lines.append(
+                    "  - "
+                    + ", ".join(
+                        f"{k}: {v}"
+                        for k, v in pc.items()
+                        if isinstance(v, (int, float, str)) and not isinstance(v, bool)
+                    )
+                )
+
+    n_runs = data.get("total_runs")
+    run_count = n_runs if isinstance(n_runs, int) and n_runs > 0 else 1
+
+    return (
+        f"\n\nACTUAL EXPERIMENT DATA (promoted best iteration, from "
+        f"{run_count} run(s) — use ONLY these numbers):\n"
+        "```\n"
+        + "\n".join(lines[:200])
+        + "\n```\n"
+        "CRITICAL: Every number in the Results table MUST come from the data "
+        "above. These are the PROMOTED post-refinement values — they are the "
+        "only values the verifier and the export sanitizer will accept. Do NOT "
+        "cite numbers from earlier iterations, do NOT round excessively, do NOT "
+        "invent numbers, do NOT change values.\n"
+        f"The experiment ran {run_count} time(s) — state this accurately in the "
+        "methodology.\n"
+        "NEVER paste raw metric paths (like 'condition/env/step/metric: value') "
+        "into the paper. Always convert to formatted LaTeX tables or inline "
+        "prose.\n"
+    ), True
+
+
 def _collect_raw_experiment_metrics(run_dir: Path) -> tuple[str, bool]:
     """Collect raw experiment metric lines from stdout for paper writing.
 
     Returns a tuple of (formatted block, has_parsed_metrics).
     ``has_parsed_metrics`` is True when at least one run had a non-empty
     ``metrics`` dict in its JSON payload — a reliable signal of real data.
+
+    When a promoted best summary exists it wins outright: the raw Stage 12
+    scrape below reports *pre*-refinement numbers that the verifier and the
+    Stage 22 sanitizer both reject, which is what produced papers whose prose
+    cited one protocol and whose tables were blanked to ``---``.
     """
+    _promoted_block, _promoted_ok = _collect_promoted_experiment_metrics(run_dir)
+    if _promoted_ok:
+        return _promoted_block, True
+
     metric_lines: list[str] = []
     run_count = 0
     has_parsed_metrics = False

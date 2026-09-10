@@ -375,6 +375,12 @@ def _preprocess_markdown(md: str) -> str:
     # 2. Remove standalone horizontal rules (---, ***, ___)
     text = re.sub(r"^\s*[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
 
+    # 2-bis. Drop title-less heading markers ("#" alone on a line).  Stage 19's
+    # figure/section edits can leave these behind.  They carry no content, and
+    # any downstream heading matcher that treats the marker as opening a
+    # heading will attach the next non-blank line to it.
+    text = re.sub(r"^[ \t]*#{1,6}[ \t]*$", "", text, flags=re.MULTILINE)
+
     # 2a. Strip HTML entities that LLMs inject into markdown
     text = text.replace("&nbsp;", " ")
     text = text.replace("&amp;", "&")
@@ -499,7 +505,12 @@ class _Section:
         self.heading_lower = self.heading.strip().lower()
 
 
-_HEADING_RE = re.compile(r"^(#{1,4})\s+(.+)$", re.MULTILINE)
+# NB: horizontal whitespace only.  ``\s+`` also matches newlines, so a
+# title-less marker ("#" alone on its line) would swallow the next non-blank
+# line as its title — turning an image line into
+# ``\section{![Figure 3: ...](charts/...)}``, a ~90-char section title that
+# runs straight off the page and drops the figure.
+_HEADING_RE = re.compile(r"^(#{1,4})[ \t]+(.+)$", re.MULTILINE)
 
 # Known section heading names used to separate heading from concatenated body
 _KNOWN_SECTION_NAMES = {
@@ -902,16 +913,24 @@ def _deduplicate_tables(body: str) -> str:
 # ---------------------------------------------------------------------------
 
 # Patterns for block-level structures
-_DISPLAY_MATH_RE = re.compile(r"^\\\[(.+?)\\\]$", re.MULTILINE | re.DOTALL)
+# Leading/trailing horizontal whitespace is tolerated: LLMs indent display
+# math that follows a list item, and an unstashed block falls through to
+# _LATEX_SPECIAL escaping, which rewrites "f_{\min}(B)" as "f\_\{\min\}(B)"
+# and yields "Undefined control sequence" for every command inside it.
+_DISPLAY_MATH_RE = re.compile(
+    r"^[ \t]*\\\[(.+?)\\\][ \t]*$", re.MULTILINE | re.DOTALL
+)
 # $$...$$ display math (single- or multi-line)
 _DISPLAY_MATH_DOLLAR_RE = re.compile(
-    r"^\$\$\s*\n?(.*?)\n?\s*\$\$$", re.MULTILINE | re.DOTALL
+    r"^[ \t]*\$\$\s*\n?(.*?)\n?\s*\$\$[ \t]*$", re.MULTILINE | re.DOTALL
 )
 _FENCED_CODE_RE = re.compile(r"^```(\w*)\n(.*?)^```", re.MULTILINE | re.DOTALL)
 _TABLE_SEP_RE = re.compile(r"^\|[-:| ]+\|$")
 
 # Markdown image pattern: ![caption](path)
-_IMAGE_RE = re.compile(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$")
+# Indentation tolerated for the same reason as display math: an unmatched
+# image line degrades into escaped literal markdown in the body text.
+_IMAGE_RE = re.compile(r"^[ \t]*!\[([^\]]*)\]\(([^)]+)\)\s*$")
 
 # Bullet / numbered list patterns
 _BULLET_RE = re.compile(r"^(\s*)-\s+(.+)")
@@ -925,7 +944,9 @@ def _convert_block(text: str) -> str:
 
     def _stash_math(m: re.Match[str]) -> str:
         idx = len(math_blocks)
-        math_blocks.append(m.group(0))  # Keep \\[...\\] as-is
+        # Re-emit without the source indentation rather than keeping group(0)
+        # verbatim, so an indented block lands at column 0 like any other.
+        math_blocks.append(f"\\[{m.group(1)}\\]")
         return f"%%MATH_BLOCK_{idx}%%"
 
     def _stash_dollar_math(m: re.Match[str]) -> str:
@@ -1455,6 +1476,15 @@ def _render_figure(caption: str, path: str) -> str:
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _ITALIC_RE = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)")
 _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
+# Code spans as they appear in the *source*, matched before any Unicode
+# punctuation rewriting.  Requirements, each load-bearing:
+#   (?<!`) / (?!`)  a lone backtick on each side, so the LaTeX quote digraphs
+#                   ``...'' produced from U+201C/U+201D are never delimiters;
+#   [^`\n]+         no newlines, so a stray tick cannot open a span that runs
+#                   across paragraphs.
+_INLINE_CODE_SRC_RE = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
+_CODE_OPEN = "\x00CODEA\x00"
+_CODE_CLOSE = "\x00CODEB\x00"
 _LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
 # Characters that need escaping in LaTeX (but NOT inside math or \cite)
@@ -1472,6 +1502,19 @@ def _convert_inline(text: str) -> str:
     - ``\\cite{...}`` references
     - Display math markers (already handled at block level)
     """
+    # Mark genuine code spans FIRST.  The Unicode rewrite immediately below
+    # turns U+201C/U+201D into the LaTeX digraphs ``/'' -- synthetic backticks
+    # that a later `...` match cannot tell apart from real delimiters.  In one
+    # observed paper the abstract's curly-quoted "ranking-aware" became
+    # ``ranking-aware'' and the code-span regex, unable to open on the doubled
+    # tick, opened on the second one and closed on a `---` two sections away:
+    # one \texttt{} spanning from the abstract into a later note, which typeset
+    # the whole abstract in typewriter font, threw ~20 overfull hboxes and an
+    # "Extra }" error.
+    text = _INLINE_CODE_SRC_RE.sub(
+        lambda m: _CODE_OPEN + m.group(1) + _CODE_CLOSE, text
+    )
+
     # Normalize Unicode punctuation to LaTeX equivalents
     text = text.replace("\u2014", "---")          # em-dash —
     text = text.replace("\u2013", "--")            # en-dash –
@@ -1548,8 +1591,11 @@ def _convert_inline(text: str) -> str:
     # Convert italic *text* → \textit{text}
     text = _ITALIC_RE.sub(r"\\textit{\1}", text)
 
-    # Convert inline code `text` → \texttt{text}
-    text = _INLINE_CODE_RE.sub(r"\\texttt{\1}", text)
+    # Close the code spans marked at the top of this function.  The sentinels
+    # rode through _LATEX_SPECIAL, so the span's contents got the same escaping
+    # they always did; only the delimiters were shielded.  Any backtick still
+    # present here came from the Unicode quote rewrite and is left alone.
+    text = text.replace(_CODE_OPEN, "\\texttt{").replace(_CODE_CLOSE, "}")
 
     # Links and images were already converted+protected before escaping.
 
