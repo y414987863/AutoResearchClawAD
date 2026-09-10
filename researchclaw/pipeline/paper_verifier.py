@@ -425,23 +425,63 @@ def _check_condition_names(
     known_norm = {_norm_cond(n) for n in registry.condition_names}
     known_norm.discard("")
 
+    def _cond_tokens(name: str) -> frozenset[str]:
+        """Split a condition name into order-free comparison tokens.
+
+        ``_norm_cond`` concatenates, so it only matches when the paper and the
+        registry order their parts the same way.  Naming conventions routinely
+        disagree: a registry id is ``<family>_<method>`` while papers write
+        ``<method>-<family>``.  "GFN2-xTB" against the id "xtb_gfn2" folds to
+        "gfn2xtb" vs "xtbgfn2" — neither contains the other, so the row was
+        reported as a fabricated condition, and one fabricated condition is
+        enough to REJECT the whole paper.
+        """
+        s = name.lower()
+        s = s.replace("---", "-").replace("--", "-")
+        for _dash in ("‐", "‑", "‒", "–", "—", "−"):
+            s = s.replace(_dash, "-")
+        s = re.sub(r"\\[a-zA-Z]+", "", s)
+        return frozenset(t for t in re.split(r"[^a-z0-9]+", s) if t)
+
+    known_tokens = [_cond_tokens(n) for n in registry.condition_names]
+    known_tokens = [t for t in known_tokens if t]
+
     def _is_known(name: str) -> bool:
         """True when *name* refers to a condition the registry knows.
 
-        Substring matching in both directions covers the usual suffix/prefix
-        conventions — a paper writes "Random Search" for the registry's
-        "random_search_baseline", or "CMA-ES (ours)" for "cma_es".  Both sides
-        must be >= 4 chars so a short id cannot match everything.
+        Three rules, cheapest first: exact match on the folded key, then
+        substring in either direction, then order-free token containment.
+
+        Substring matching covers the usual suffix/prefix conventions — a paper
+        writes "Random Search" for the registry's "random_search_baseline", or
+        "CMA-ES (ours)" for "cma_es".  Token containment covers reordering,
+        which substring matching cannot see.
+
+        Both rules require >= 4 characters of overlap so a short id cannot
+        match everything.  That threshold is deliberately permissive: this
+        guard exists to catch invented conditions, and a false positive here
+        rejects a paper whose tables are correct, which is the more expensive
+        error.
         """
         n = _norm_cond(name)
         if not n:
             return True
         if n in known_norm:
             return True
-        return any(
+        if any(
             (n in k or k in n) and len(n) >= 4 and len(k) >= 4
             for k in known_norm
-        )
+        ):
+            return True
+        toks = _cond_tokens(name)
+        if not toks:
+            return True
+        for known in known_tokens:
+            if toks <= known or known <= toks:
+                smaller = toks if toks <= known else known
+                if sum(len(t) for t in smaller) >= 4:
+                    return True
+        return False
 
     # Common generic terms that should NOT be flagged as fabricated conditions
     _GENERIC_TERMS = {
