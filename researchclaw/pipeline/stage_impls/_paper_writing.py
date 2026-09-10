@@ -1329,6 +1329,145 @@ def _detect_result_contradictions(
     return advisories
 
 
+def _collect_llm4ad_comparison(run_dir: Path, metric_direction: str = "") -> str:
+    """Build the LLM4AD-evolution block from ``stage-13*/llm4ad_comparison.json``.
+
+    Returns ``""`` when no comparison artifact exists (no LLM4AD run, or it
+    produced no promotion). Reads *every* ``stage-13*`` version so a rollback
+    that re-ran the stage does not lose the newest comparison.
+
+    The paper writer gets numbers from many sources (stage-12 runs, refinement
+    log, experiment_summary); this block is the ONLY place baseline-vs-evolved
+    deltas live, so it is injected with an explicit instruction to report them
+    as the LLM4AD contribution. ``delta_pct`` is a *signed* value whose sign
+    already encodes the score change (negative = the number got smaller), so it
+    must be presented per ``metric_direction``: under MINIMIZE a negative delta
+    is an improvement ("reduced by 41%"), under MAXIMIZE a positive one is. The
+    raw signed number is always kept for the schema, never reinterpreted.
+    """
+    import json as _json_l4b
+
+    _direction = (metric_direction or "").strip().upper()
+    best = None
+    best_path = None
+    # Latest version wins: a re-run after rollback writes stage-13_vN/ but the
+    # comparison then lives in the newest dir, not the plain stage-13/.
+    for _p in sorted(run_dir.glob("stage-13*/llm4ad_comparison.json"), reverse=True):
+        try:
+            _data = _json_l4b.loads(_p.read_text(encoding="utf-8"))
+        except (OSError, _json_l4b.JSONDecodeError):
+            continue
+        if isinstance(_data, dict) and _data.get("algorithms"):
+            best = _data
+            best_path = _p
+    if best is None:
+        return ""
+
+    # The file carries its own direction; only override from the caller when
+    # the artifact is silent (older builds wrote no metric_direction).
+    if not _direction and best.get("metric_direction"):
+        _direction = str(best["metric_direction"]).strip().upper()
+    _minimize = _direction == "MINIMIZE"
+
+    algos = best.get("algorithms", {})
+    if not isinstance(algos, dict):
+        return ""
+
+    # Stable sort: promoted (real improvements) first, then the rest.
+    _entries = []
+    for name, a in algos.items():
+        if not isinstance(a, dict):
+            continue
+        _b = a.get("baseline")
+        _e = a.get("evolved")
+        _d = a.get("delta_pct")
+        _promoted = bool(a.get("promoted"))
+        _failed = bool(a.get("failed"))
+        # A failed/incomplete candidate must still be REPORTED, not dropped:
+        # an algorithm evolution could not score is itself a finding (it means
+        # the run produced no usable result for it). Only skip when there is
+        # genuinely nothing to say (no baseline and no evolved and not failed).
+        if _b is None and _e is None and not _failed:
+            continue
+        try:
+            _b = float(_b) if _b is not None else None
+            _e = float(_e) if _e is not None else None
+            _d = float(_d) if _d is not None else None
+        except (TypeError, ValueError):
+            continue
+        _entries.append((name, _b, _e, _d, _promoted, _failed, str(a.get("reason", ""))))
+    _entries.sort(key=lambda t: (not t[4], t[0]))  # promoted first, alpha
+
+    if not _entries:
+        return ""
+
+    _lines: list[str] = []
+    _improved = 0
+    for name, _b, _e, _d, _promoted, _failed, _reason in _entries:
+        if _promoted:
+            _improved += 1
+        if _failed:
+            _status = "failed (evolution did not improve this algorithm)"
+        elif _promoted:
+            # Direction-aware phrase, so a negative minimize delta reads as an
+            # improvement rather than a regression. The signed delta is kept.
+            if _d is not None:
+                _improve_phrase = (
+                    f"reduced by {abs(_d):.1f}%" if _minimize
+                    else f"improved by {abs(_d):.1f}%"
+                )
+                _status = f"improved ({_improve_phrase}, d={_d:+.1f}%)"
+            else:
+                _status = "improved"
+        else:
+            _status = "no improvement over baseline"
+
+        # reason is usually the literal string "improved" when promoted, which
+        # would read as "improved (improved)"; only surface a non-generic reason.
+        _shown_reason = _reason if (_reason and _reason.lower() not in ("improved", "")) else ""
+
+        _b_str = f"{_b:.6g}" if _b is not None else "n/a"
+        _e_str = f"{_e:.6g}" if _e is not None else "n/a"
+        _rows = (
+            f"- **{name}**: baseline={_b_str} -> evolved={_e_str}",
+            f"  {_status}"
+            + (f" ({_shown_reason})" if _shown_reason else ""),
+        )
+        _lines.append("\n".join(_rows))
+
+    _dir_note = (
+        f"This experiment's primary metric is {_direction} ({'lower' if _minimize else 'higher'} is better). "
+        if _direction
+        else ""
+    )
+    _block = (
+        "\n\n## LLM4AD EVOLUTION IMPROVEMENTS (MANDATORY in Results/Discussion)\n"
+        f"An LLM4AD evolutionary loop was run over the algorithms, and {_improved} "
+        f"of {len(_entries)} improved on the clean baseline.\n"
+        f"{_dir_note}"
+        "The algorithm was evolved from a clean implementation by an LLM-guided "
+        "search (evolutionary algorithm with an LLM coder/mutator); each 'evolved' "
+        "score below is the best candidate found, scored under the SAME evaluator "
+        "and instances as the baseline.\n"
+        "Report these as the automated-algorithm-discovery contribution:\n"
+        "- In **Results**: a small table (algorithm | baseline | evolved | "
+        "relative change) with a descriptive caption like 'Table N: Effect of "
+        "LLM4AD evolution. All evolved scores are measured on the same instances "
+        "as their baseline.'\n"
+        "- In **Method**: one sentence describing the loop (seed algorithm -> LLM "
+        "crossover/mutation -> evaluate -> keep best).\n"
+        "- In **Discussion**: one paragraph on which algorithms benefited most.\n"
+        "Use ONLY the numbers below. Do NOT change them.\n\n"
+        + "\n".join(_lines)
+        + "\n"
+    )
+    logger.info(
+        "Stage 17: injected LLM4AD comparison from %s (%d algorithms, %d promoted)",
+        best_path, len(_entries), _improved,
+    )
+    return _block
+
+
 def _execute_paper_draft(
     stage_dir: Path,
     run_dir: Path,
@@ -1936,6 +2075,15 @@ def _execute_paper_draft(
         "  without repeating apologies or disclaimers about missing conditions\n"
         "- Any table cell without real data must show '\u2014' (not a plausible number)\n"
         "- FORBIDDEN: generating numbers that 'look right' based on your training data\n"
+    )
+
+    # LLM4AD evolution comparison (if any) — the only source of baseline vs
+    # evolved deltas. Injected after the data-integrity block so the "use only
+    # verified numbers" rule also governs it. Always reads the artifact's own
+    # metric_direction; the paper writer must present the delta per that
+    # direction (a negative reduce reads as an improvement under MINIMIZE).
+    exp_metrics_instruction += _collect_llm4ad_comparison(
+        run_dir, metric_direction=config.experiment.metric_direction,
     )
 
     # IMP-6 + FA: Inject chart references into paper draft prompt

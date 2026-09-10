@@ -243,6 +243,46 @@ class VerifiedRegistry:
         return reg
 
     @classmethod
+    def from_llm4ad_comparison(
+        cls,
+        comparison: dict[str, Any],
+        *,
+        metric_direction: str = "maximize",
+    ) -> VerifiedRegistry:
+        """Build a registry from a ``llm4ad_comparison.json`` artifact.
+
+        Every ``baseline`` / ``evolved`` / ``delta_pct`` is a real, evaluated
+        number, so registering them here makes them verifiable in the paper —
+        without it, a ``-41.46%`` improvement claim lands in
+        :func:`paper_verifier` as an "unverified numeric claim" and is blocked.
+        ``delta_pct`` is registered both signed and absolute, because the paper
+        may legitimately express the improvement either way.
+        """
+        reg = cls(metric_direction=metric_direction)
+        algos = comparison.get("algorithms", {})
+        if not isinstance(algos, dict):
+            return reg
+        for name, a in algos.items():
+            if not isinstance(a, dict):
+                continue
+            _b = a.get("baseline")
+            _e = a.get("evolved")
+            _d = a.get("delta_pct")
+            for val, label in ((_b, "baseline"), (_e, "evolved"), (_d, "delta_pct")):
+                if isinstance(val, (int, float)) and _is_finite(val):
+                    reg.add_value(float(val), f"llm4ad.{name}.{label}")
+            if isinstance(_d, (int, float)) and _is_finite(_d):
+                reg.add_value(abs(float(_d)), f"llm4ad.{name}.|delta_pct|")
+            if isinstance(_b, (int, float)) and _is_finite(_b):
+                # Register the improvement ratio too, so a "improved X%" claim
+                # against the baseline matches a proven number.
+                if _b and abs(_b) > 1e-9:
+                    _ratio = abs(float(_d)) if isinstance(_d, (int, float)) and _is_finite(_d) else None
+                    if _ratio is not None:
+                        reg.add_value(_ratio, f"llm4ad.{name}.|improve_pct|")
+        return reg
+
+    @classmethod
     def from_run_dir(
         cls,
         run_dir: Path,
@@ -337,6 +377,11 @@ class VerifiedRegistry:
             if cond.std is not None and cond.std > 0:
                 target.add_value(cond.std, f"{cond.name}.std")
 
+        # LLM4AD evolution numbers (promotion) are real evaluated values and must
+        # be verifiable like any other source — otherwise a -41.46% "improved"
+        # claim is rejected by paper_verifier as unverified.
+        _enrich_from_llm4ad_dir(target, run_dir)
+
         logger.info(
             "VerifiedRegistry.from_run_dir(%s): %d values, %d conditions (%s)",
             "best_only" if best_only else "all",
@@ -362,6 +407,32 @@ class VerifiedRegistry:
         if refinement_log_path and refinement_log_path.exists():
             ref_data = json.loads(refinement_log_path.read_text(encoding="utf-8"))
         return cls.from_experiment(exp_data, ref_data, metric_direction=metric_direction)
+
+
+def _enrich_from_llm4ad_dir(target: VerifiedRegistry, run_dir: Path) -> None:
+    """Merge every ``stage-13*/llm4ad_comparison.json`` into *target*.
+
+    The promotion step writes the comparison artifact only when evolution ran;
+    absent it, this is a no-op. Scans all ``stage-13*`` versions so a rollback
+    re-run does not lose the newest comparison.
+    """
+    import json as _json_l4b
+
+    found = sorted(run_dir.glob("stage-13*/llm4ad_comparison.json"), reverse=True)
+    if not found:
+        return
+    for p in found:
+        try:
+            data = _json_l4b.loads(p.read_text(encoding="utf-8"))
+        except (OSError, _json_l4b.JSONDecodeError, Exception):  # noqa: BLE001
+            continue
+        if not isinstance(data, dict) or not isinstance(data.get("algorithms"), dict):
+            continue
+        _dir = str(data.get("metric_direction") or target.metric_direction or "maximize")
+        sub = VerifiedRegistry.from_llm4ad_comparison(data, metric_direction=_dir)
+        if sub.values:
+            _merge_into(target, sub)
+            logger.info("from_run_dir: merged llm4ad comparison %s (%d values)", p.name, len(sub.values))
 
 
 def _merge_into(target: VerifiedRegistry, source: VerifiedRegistry) -> None:
