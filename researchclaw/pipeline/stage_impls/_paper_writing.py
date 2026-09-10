@@ -1344,6 +1344,17 @@ def _collect_llm4ad_comparison(run_dir: Path, metric_direction: str = "") -> str
     must be presented per ``metric_direction``: under MINIMIZE a negative delta
     is an improvement ("reduced by 41%"), under MAXIMIZE a positive one is. The
     raw signed number is always kept for the schema, never reinterpreted.
+
+    These scores come from a DIFFERENT protocol than the main results table.
+    The main table is backed by ``stage-14/experiment_summary.json``, which
+    ``_execute_result_analysis`` replaces with the best *refinement sandbox*
+    iteration when that beat the stage-12 run; the numbers here are clean
+    ``stage-10`` baseline code vs its evolved candidate, averaged per instance
+    by ``comparison_runner.py``. The two therefore disagree in magnitude — in
+    one ML03 run the main table reports a nelder_mead mean of 7.88 while the
+    clean baseline here is 44.44 — and neither is wrong. Without an explicit
+    scope note the writer either reconciles them (and fabricates an explanation)
+    or presents the baseline as contradicting its own table.
     """
     import json as _json_l4b
 
@@ -1449,11 +1460,27 @@ def _collect_llm4ad_comparison(run_dir: Path, metric_direction: str = "") -> str
         "search (evolutionary algorithm with an LLM coder/mutator); each 'evolved' "
         "score below is the best candidate found, scored under the SAME evaluator "
         "and instances as the baseline.\n"
+        "MEASUREMENT SCOPE - read this before using any number below:\n"
+        "Each baseline/evolved pair below is a per-instance mean of the clean, "
+        "unevolved implementation and of its evolved candidate, produced by a "
+        "dedicated scoring pass over the experiment's instances. This is a "
+        "DIFFERENT aggregate from the main results table, which reports the best "
+        "result the experiment's run/refinement pipeline produced. The same "
+        "algorithm therefore has two legitimate and different values in this "
+        "paper, and the baseline below will NOT equal the corresponding number in "
+        "the main table. Do not present the two as the same quantity, do not treat "
+        "the difference as a discrepancy or an error, and do not invent an "
+        "explanation for it. Report this table as its own self-contained "
+        "comparison: baseline vs evolved under one common protocol.\n"
         "Report these as the automated-algorithm-discovery contribution:\n"
         "- In **Results**: a small table (algorithm | baseline | evolved | "
-        "relative change) with a descriptive caption like 'Table N: Effect of "
-        "LLM4AD evolution. All evolved scores are measured on the same instances "
-        "as their baseline.'\n"
+        "relative change) placed as its OWN table, never merged into or appended "
+        "to the main results table, with a caption that names its protocol, e.g. "
+        "'Table N: Effect of LLM4AD evolution on the primary metric. Baseline and "
+        "evolved values are per-instance means of the clean implementation and its "
+        "evolved candidate under a common evaluator; this table is reported "
+        "separately from the main results table and its values are not directly "
+        "comparable to it.'\n"
         "- In **Method**: one sentence describing the loop (seed algorithm -> LLM "
         "crossover/mutation -> evaluate -> keep best).\n"
         "- In **Discussion**: one paragraph on which algorithms benefited most.\n"
