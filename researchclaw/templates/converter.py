@@ -1475,7 +1475,6 @@ def _render_figure(caption: str, path: str) -> str:
 # Order matters: process bold before italic to avoid conflicts.
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _ITALIC_RE = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)")
-_INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 # Code spans as they appear in the *source*, matched before any Unicode
 # punctuation rewriting.  Requirements, each load-bearing:
 #   (?<!`) / (?!`)  a lone backtick on each side, so the LaTeX quote digraphs

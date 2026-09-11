@@ -1423,11 +1423,13 @@ def _detect_result_contradictions(
 
 
 def _collect_llm4ad_comparison(run_dir: Path, metric_direction: str = "") -> str:
-    """Build the LLM4AD-evolution block from ``stage-13*/llm4ad_comparison.json``.
+    """Build the LLM4AD-evolution block from ``stage-13/llm4ad_comparison.json``.
 
     Returns ``""`` when no comparison artifact exists (no LLM4AD run, or it
-    produced no promotion). Reads *every* ``stage-13*`` version so a rollback
-    that re-ran the stage does not lose the newest comparison.
+    produced no promotion). Reads only the *live* ``stage-13/`` via
+    :func:`load_llm4ad_comparison` — ``stage-13_vN/`` hold superseded attempts
+    that a rollback replaced, and a promotion that was rolled back must not
+    reappear in the paper.
 
     The paper writer gets numbers from many sources (stage-12 runs, refinement
     log, experiment_summary); this block is the ONLY place baseline-vs-evolved
@@ -1449,21 +1451,10 @@ def _collect_llm4ad_comparison(run_dir: Path, metric_direction: str = "") -> str
     scope note the writer either reconciles them (and fabricates an explanation)
     or presents the baseline as contradicting its own table.
     """
-    import json as _json_l4b
+    from researchclaw.pipeline.verified_registry import load_llm4ad_comparison
 
     _direction = (metric_direction or "").strip().upper()
-    best = None
-    best_path = None
-    # Latest version wins: a re-run after rollback writes stage-13_vN/ but the
-    # comparison then lives in the newest dir, not the plain stage-13/.
-    for _p in sorted(run_dir.glob("stage-13*/llm4ad_comparison.json"), reverse=True):
-        try:
-            _data = _json_l4b.loads(_p.read_text(encoding="utf-8"))
-        except (OSError, _json_l4b.JSONDecodeError):
-            continue
-        if isinstance(_data, dict) and _data.get("algorithms"):
-            best = _data
-            best_path = _p
+    best = load_llm4ad_comparison(run_dir)
     if best is None:
         return ""
 
@@ -1582,8 +1573,9 @@ def _collect_llm4ad_comparison(run_dir: Path, metric_direction: str = "") -> str
         + "\n"
     )
     logger.info(
-        "Stage 17: injected LLM4AD comparison from %s (%d algorithms, %d promoted)",
-        best_path, len(_entries), _improved,
+        "Stage 17: injected LLM4AD comparison from stage-13/ "
+        "(%d algorithms, %d promoted)",
+        len(_entries), _improved,
     )
     return _block
 

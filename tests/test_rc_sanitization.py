@@ -564,3 +564,115 @@ def test_sanitize_preserves_common_hp_values(run_dir: Path) -> None:
     assert "0.7" in sanitized, "BUG-224: q=0.7 was incorrectly sanitized"
     # 0.5 should also be preserved
     assert "0.5" in sanitized
+
+
+# --- Registry seeding (Stage 22 seeds verified_values from VerifiedRegistry) ---
+#
+# What this does NOT add: rounded / x100 forms.  _is_verified already absorbs
+# those via its 1% tolerance and its BUG-R5-20 percentage cross-match, so a
+# table showing 0.9483 or 94.83 for a stored 0.948271 was never at risk.
+#
+# What it genuinely adds is LLM4AD numbers.  The raw scrape above reads only
+# experiment_summary*.json; baseline/evolved/delta live in
+# stage-13/llm4ad_comparison.json and matched nothing, so the evolution table
+# Stage 22 had just been ordered to restore was then blanked cell by cell.
+#
+# best_only=True is load-bearing: it keeps from_run_dir off the refinement logs,
+# so this does not reopen the BUG-222 loophole (regressed REFINE iterations
+# becoming quotable).  The second test pins that.
+
+
+def _write_llm4ad_comparison(run_dir: Path, baseline: float, evolved: float) -> None:
+    stage13 = run_dir / "stage-13"
+    stage13.mkdir(parents=True, exist_ok=True)
+    (stage13 / "llm4ad_comparison.json").write_text(
+        json.dumps({
+            "metric_direction": "MINIMIZE",
+            "algorithms": {
+                "nelder_mead": {
+                    "baseline": baseline,
+                    "evolved": evolved,
+                    "delta_pct": -41.46,
+                    "promoted": True,
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_sanitize_keeps_llm4ad_evolution_table(run_dir: Path) -> None:
+    """The evolution table's numbers must survive — they are evaluated values."""
+    _write_experiment_summary(run_dir, {
+        "condition_summaries": {
+            "nelder_mead": {"metrics": {"score_mean": 7.88}, "n_seeds": 3},
+        },
+        "metrics_summary": {"score": 7.88},
+    })
+    _write_llm4ad_comparison(run_dir, baseline=44.44, evolved=26.02)
+    paper = (
+        "## Results\n\n"
+        "| Algorithm | Baseline | Evolved |\n"
+        "| --- | --- | --- |\n"
+        "| nelder_mead | 44.44 | 26.02 |\n"
+    )
+    sanitized, _ = _sanitize_fabricated_data(paper, run_dir)
+    assert "44.44" in sanitized and "26.02" in sanitized
+
+
+def test_sanitize_seeding_does_not_admit_refinement_log(run_dir: Path) -> None:
+    """BUG-222 must stay closed: regressed REFINE numbers remain unquotable."""
+    _write_experiment_summary(run_dir, {
+        "condition_summaries": {
+            "ours": {"metrics": {"accuracy_mean": 0.85}, "n_seeds": 3},
+        },
+        "metrics_summary": {"accuracy": 0.85},
+    })
+    stage13 = run_dir / "stage-13"
+    stage13.mkdir(parents=True, exist_ok=True)
+    (stage13 / "refinement_log.json").write_text(
+        json.dumps({"iterations": [{"metrics": {"accuracy": 0.6137}}]}),
+        encoding="utf-8",
+    )
+    paper = (
+        "## Results\n\n"
+        "| Method | Accuracy |\n"
+        "| --- | --- |\n"
+        "| Ours | 0.85 |\n"
+        "| Regressed iteration | 0.6137 |\n"
+    )
+    sanitized, report = _sanitize_fabricated_data(paper, run_dir)
+    assert "0.85" in sanitized
+    assert "0.6137" not in sanitized
+    assert report["numbers_replaced"] >= 1
+
+
+def test_sanitize_mean_pm_std_cell_is_atomic(run_dir: Path) -> None:
+    """"mean +/- std" is ONE claim: keep both numbers or blank the pair.
+
+    Verifying each half independently produced "0.901549 +/- ---", the
+    half-filled cell readers report as "some cells have data, some don't".
+    """
+    _write_experiment_summary(run_dir, {
+        "condition_summaries": {
+            "ours": {"metrics": {"score_mean": 0.901549}, "n_seeds": 3},
+        },
+        "metrics_summary": {"score": 0.901549},
+    })
+    paper = (
+        "## Results\n\n"
+        "| Method | Score | Seeds |\n"
+        "| --- | --- | --- |\n"
+        "| Ours | 0.901549 ± 0.022106 | 3 |\n"
+        "| Invented | 0.712345 ± 0.033333 | 3 |\n"
+    )
+    sanitized, _ = _sanitize_fabricated_data(paper, run_dir)
+    # Verified mean carries its (unregistered) std along.
+    assert "0.901549 ± 0.022106" in sanitized
+    # Unverified mean blanks the whole pair, not just half of it.
+    assert "0.712345" not in sanitized and "0.033333" not in sanitized
+    assert "± ---" not in sanitized and "--- ±" not in sanitized
+    # Column alignment survives: the trailing seed column is still there.
+    assert all(
+        ln.count("|") == 4 for ln in sanitized.splitlines() if ln.strip().startswith("|")
+    )

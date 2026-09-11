@@ -35,6 +35,7 @@ from researchclaw.pipeline._helpers import (
     reconcile_figure_refs,
 )
 from researchclaw.pipeline.stages import Stage, StageStatus
+from researchclaw.pipeline.verified_registry import load_llm4ad_comparison
 from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
@@ -137,15 +138,15 @@ def _collect_experiment_evidence(run_dir: Path) -> str:
 
 
 def _llm4ad_was_run(run_dir: Path) -> bool:
-    """True when this run produced an LLM4AD baseline-vs-evolved comparison."""
-    for _p in run_dir.glob("stage-13*/llm4ad_comparison.json"):
-        try:
-            _d = json.loads(_p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(_d, dict) and _d.get("algorithms"):
-            return True
-    return False
+    """True when *this* run produced an LLM4AD baseline-vs-evolved comparison.
+
+    Must agree exactly with ``_collect_llm4ad_comparison``, which supplies the
+    numbers: if this returns True while that returns "", Stages 19/22 are
+    ordered to RESTORE a section and handed no data to restore it from.  Both
+    go through :func:`load_llm4ad_comparison`, so a stale ``stage-13_vN/``
+    from a rolled-back attempt can no longer make them disagree.
+    """
+    return load_llm4ad_comparison(run_dir) is not None
 
 
 def _llm4ad_preservation_notice(run_dir: Path, *, audience: str) -> str:
@@ -953,15 +954,15 @@ def _sanitize_fabricated_data(
 
     # Seed from the SAME registry the verifier uses, so one artifact cannot be
     # accepted by Stage 20/22 verification and simultaneously blanked here.
-    # Two things the raw scrape above misses:
-    #   * derived forms — the registry also registers rounded (1-4dp) and
-    #     x100 variants, so a table showing 0.9483 still matches a stored
-    #     0.948271 instead of being blanked to "---";
-    #   * LLM4AD numbers — baseline/evolved values live in
-    #     stage-13*/llm4ad_comparison.json, never in experiment_summary*.json,
-    #     so the restored evolution table would otherwise be wiped cell by cell.
-    # best_only=True is preserved: this widens the set of *representations* of
-    # promoted values, it does not re-admit regressed iterations.
+    # What this adds over the scrape above is LLM4AD numbers: baseline/evolved
+    # values live in stage-13/llm4ad_comparison.json, never in
+    # experiment_summary*.json, so the evolution table this stage was just told
+    # to preserve would otherwise be wiped cell by cell.
+    # (It does NOT exist for rounded/x100 forms — _is_verified's 1% tolerance
+    # and its BUG-R5-20 percentage cross-match already cover those.)
+    # best_only=True is load-bearing, not incidental: it keeps from_run_dir off
+    # the refinement logs, so this does not reopen the BUG-222 loophole of
+    # regressed REFINE iterations becoming quotable.
     _registry_value_count = 0
     try:
         from researchclaw.pipeline.verified_registry import (

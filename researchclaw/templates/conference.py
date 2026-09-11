@@ -44,6 +44,38 @@ _ALGORITHMIC_CAPS_ALIASES = "\n".join(
     ]
 )
 
+# Package set shared by every ML-conference template.  Kept in one place so the
+# six of them cannot drift apart — they were copies, and a fix applied to five
+# of six is indistinguishable from no fix at all in the artifacts.
+#
+# amssymb supplies \triangleq, \lesssim, \nmid, \varnothing and the rest of the
+# AMS symbol set.  Papers use them in display math freely; without the package
+# every one is an "Undefined control sequence" that drops the equation and lets
+# the surrounding text run off the page.
+#
+# algpseudocode (algorithmicx), not the legacy "algorithmic".  Papers write
+# \State/\Require/\For/\ElsIf/\Return — algorithmicx's mixed-case set.  Legacy
+# algorithmic defines only ALL-CAPS \STATE/\IF/..., so every line of a
+# pseudocode block was an "Undefined control sequence" and the algorithm
+# collapsed into one run-on paragraph that overran the margin.  algpseudocode
+# still provides the {algorithmic} environment, and render_preamble() aliases
+# the ALL-CAPS spellings above for older papers.
+_ML_BASE_PACKAGES: tuple[str, ...] = (
+    "hyperref",
+    "url",
+    "booktabs",
+    "amsfonts",
+    "amsmath",
+    "amssymb",
+    "nicefrac",
+    "microtype",
+    "graphicx",
+    "natbib",
+    "algorithm",
+    "algpseudocode",
+    "adjustbox",
+)
+
 
 @dataclass(frozen=True)
 class ConferenceTemplate:
@@ -209,32 +241,7 @@ NEURIPS_2024 = ConferenceTemplate(
     document_class="article",
     style_package="neurips_2024",
     style_options="preprint",
-    extra_packages=(
-        "hyperref",
-        "url",
-        "booktabs",
-        "amsfonts",
-        "amsmath",
-        # amssymb supplies \triangleq, \lesssim, \nmid, \varnothing and the rest
-        # of the AMS symbol set.  Papers use them in display math freely; without
-        # the package every one is an "Undefined control sequence" that drops the
-        # equation and lets the surrounding text run off the page.
-        "amssymb",
-        "nicefrac",
-        "microtype",
-        "graphicx",
-        "natbib",
-        "algorithm",
-        # algpseudocode (algorithmicx), not the legacy "algorithmic".  Papers
-        # write \State/\Require/\For/\ElsIf/\Return — algorithmicx's mixed-case
-        # set.  Legacy algorithmic defines only ALL-CAPS \STATE/\IF/..., so
-        # every line of a pseudocode block was an "Undefined control sequence"
-        # and the algorithm collapsed into one run-on paragraph that overran
-        # the margin.  It still provides the {algorithmic} environment, and
-        # render_preamble() aliases the ALL-CAPS spellings for older papers.
-        "algpseudocode",
-        "adjustbox",
-    ),
+    extra_packages=_ML_BASE_PACKAGES,
     author_format="neurips",
     bib_style="plainnat",
     columns=1,
@@ -249,32 +256,7 @@ ICLR_2025 = ConferenceTemplate(
     document_class="article",
     style_package="iclr2025_conference",
     style_options="",
-    extra_packages=(
-        "hyperref",
-        "url",
-        "booktabs",
-        "amsfonts",
-        "amsmath",
-        # amssymb supplies \triangleq, \lesssim, \nmid, \varnothing and the rest
-        # of the AMS symbol set.  Papers use them in display math freely; without
-        # the package every one is an "Undefined control sequence" that drops the
-        # equation and lets the surrounding text run off the page.
-        "amssymb",
-        "nicefrac",
-        "microtype",
-        "graphicx",
-        "natbib",
-        "algorithm",
-        # algpseudocode (algorithmicx), not the legacy "algorithmic".  Papers
-        # write \State/\Require/\For/\ElsIf/\Return — algorithmicx's mixed-case
-        # set.  Legacy algorithmic defines only ALL-CAPS \STATE/\IF/..., so
-        # every line of a pseudocode block was an "Undefined control sequence"
-        # and the algorithm collapsed into one run-on paragraph that overran
-        # the margin.  It still provides the {algorithmic} environment, and
-        # render_preamble() aliases the ALL-CAPS spellings for older papers.
-        "algpseudocode",
-        "adjustbox",
-    ),
+    extra_packages=_ML_BASE_PACKAGES,
     author_format="iclr",
     bib_style="iclr2025_conference",
     columns=1,
@@ -288,32 +270,7 @@ ICML_2025 = ConferenceTemplate(
     document_class="article",
     style_package="icml2025",
     style_options="",
-    extra_packages=(
-        "hyperref",
-        "url",
-        "booktabs",
-        "amsfonts",
-        "amsmath",
-        # amssymb supplies \triangleq, \lesssim, \nmid, \varnothing and the rest
-        # of the AMS symbol set.  Papers use them in display math freely; without
-        # the package every one is an "Undefined control sequence" that drops the
-        # equation and lets the surrounding text run off the page.
-        "amssymb",
-        "nicefrac",
-        "microtype",
-        "graphicx",
-        "natbib",
-        "algorithm",
-        # algpseudocode (algorithmicx), not the legacy "algorithmic".  Papers
-        # write \State/\Require/\For/\ElsIf/\Return — algorithmicx's mixed-case
-        # set.  Legacy algorithmic defines only ALL-CAPS \STATE/\IF/..., so
-        # every line of a pseudocode block was an "Undefined control sequence"
-        # and the algorithm collapsed into one run-on paragraph that overran
-        # the margin.  It still provides the {algorithmic} environment, and
-        # render_preamble() aliases the ALL-CAPS spellings for older papers.
-        "algpseudocode",
-        "adjustbox",
-    ),
+    extra_packages=_ML_BASE_PACKAGES,
     author_format="icml",
     bib_style="icml2025",
     columns=2,
@@ -330,32 +287,7 @@ NEURIPS_2025 = ConferenceTemplate(
     document_class="article",
     style_package="neurips_2025",
     style_options="preprint",
-    extra_packages=(
-        "hyperref",
-        "url",
-        "booktabs",
-        "amsfonts",
-        "amsmath",
-        # amssymb supplies \triangleq, \lesssim, \nmid, \varnothing and the rest
-        # of the AMS symbol set.  Papers use them in display math freely; without
-        # the package every one is an "Undefined control sequence" that drops the
-        # equation and lets the surrounding text run off the page.
-        "amssymb",
-        "nicefrac",
-        "microtype",
-        "graphicx",
-        "natbib",
-        "algorithm",
-        # algpseudocode (algorithmicx), not the legacy "algorithmic".  Papers
-        # write \State/\Require/\For/\ElsIf/\Return — algorithmicx's mixed-case
-        # set.  Legacy algorithmic defines only ALL-CAPS \STATE/\IF/..., so
-        # every line of a pseudocode block was an "Undefined control sequence"
-        # and the algorithm collapsed into one run-on paragraph that overran
-        # the margin.  It still provides the {algorithmic} environment, and
-        # render_preamble() aliases the ALL-CAPS spellings for older papers.
-        "algpseudocode",
-        "adjustbox",
-    ),
+    extra_packages=_ML_BASE_PACKAGES,
     author_format="neurips",
     bib_style="plainnat",
     columns=1,
@@ -370,32 +302,7 @@ ICLR_2026 = ConferenceTemplate(
     document_class="article",
     style_package="iclr2026_conference",
     style_options="",
-    extra_packages=(
-        "hyperref",
-        "url",
-        "booktabs",
-        "amsfonts",
-        "amsmath",
-        # amssymb supplies \triangleq, \lesssim, \nmid, \varnothing and the rest
-        # of the AMS symbol set.  Papers use them in display math freely; without
-        # the package every one is an "Undefined control sequence" that drops the
-        # equation and lets the surrounding text run off the page.
-        "amssymb",
-        "nicefrac",
-        "microtype",
-        "graphicx",
-        "natbib",
-        "algorithm",
-        # algpseudocode (algorithmicx), not the legacy "algorithmic".  Papers
-        # write \State/\Require/\For/\ElsIf/\Return — algorithmicx's mixed-case
-        # set.  Legacy algorithmic defines only ALL-CAPS \STATE/\IF/..., so
-        # every line of a pseudocode block was an "Undefined control sequence"
-        # and the algorithm collapsed into one run-on paragraph that overran
-        # the margin.  It still provides the {algorithmic} environment, and
-        # render_preamble() aliases the ALL-CAPS spellings for older papers.
-        "algpseudocode",
-        "adjustbox",
-    ),
+    extra_packages=_ML_BASE_PACKAGES,
     author_format="iclr",
     bib_style="iclr2026_conference",
     columns=1,
@@ -409,33 +316,7 @@ ICML_2026 = ConferenceTemplate(
     document_class="article",
     style_package="icml2026",
     style_options="",
-    extra_packages=(
-        "hyperref",
-        "url",
-        "booktabs",
-        "amsfonts",
-        "amsmath",
-        # amssymb supplies \triangleq, \lesssim, \nmid, \varnothing and the rest
-        # of the AMS symbol set.  Papers use them in display math freely; without
-        # the package every one is an "Undefined control sequence" that drops the
-        # equation and lets the surrounding text run off the page.
-        "amssymb",
-        "nicefrac",
-        "microtype",
-        "graphicx",
-        "natbib",
-        "algorithm",
-        # algpseudocode (algorithmicx), not the legacy "algorithmic".  Papers
-        # write \State/\Require/\For/\ElsIf/\Return — algorithmicx's mixed-case
-        # set.  Legacy algorithmic defines only ALL-CAPS \STATE/\IF/..., so
-        # every line of a pseudocode block was an "Undefined control sequence"
-        # and the algorithm collapsed into one run-on paragraph that overran
-        # the margin.  It still provides the {algorithmic} environment, and
-        # render_preamble() aliases the ALL-CAPS spellings for older papers.
-        "algpseudocode",
-        "adjustbox",
-        "morefloats",
-    ),
+    extra_packages=_ML_BASE_PACKAGES + ("morefloats",),
     author_format="icml",
     bib_style="icml2026",
     columns=2,
@@ -608,6 +489,14 @@ GENERIC = ConferenceTemplate(
         "graphicx",
         "natbib",
         "geometry",
+        # GENERIC is the fallback when no conference is configured, so it has to
+        # set the same content the ML templates do.  Without these two any paper
+        # with a pseudocode block failed on "Undefined control sequence" for
+        # \begin{algorithm} — the fallback was strictly weaker than every
+        # template it stands in for.  render_preamble() adds the ALL-CAPS
+        # aliases automatically once algpseudocode is present.
+        "algorithm",
+        "algpseudocode",
         "adjustbox",
     ),
     author_format="neurips",

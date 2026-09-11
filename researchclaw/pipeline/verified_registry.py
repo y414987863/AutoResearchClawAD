@@ -8,6 +8,7 @@ generated papers contain ONLY numbers grounded in real experiment data.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -16,6 +17,13 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Stage 13 (ITERATIVE_REFINE) writes llm4ad_comparison.json into its own live
+# stage dir.  ``_snapshot_stages()`` renames the PREVIOUS stage-13/ to
+# stage-13_v{attempt}/ before a rollback re-run, so the unsuffixed directory is
+# always the current run's final artifact and the _vN dirs are dead history.
+# Every consumer reads this one path — see load_llm4ad_comparison().
+_LLM4AD_COMPARISON_REL = Path("stage-13") / "llm4ad_comparison.json"
 
 # Infrastructure metric keys — allowed in paper without verification
 _INFRA_KEYS: set[str] = {
@@ -273,13 +281,6 @@ class VerifiedRegistry:
                     reg.add_value(float(val), f"llm4ad.{name}.{label}")
             if isinstance(_d, (int, float)) and _is_finite(_d):
                 reg.add_value(abs(float(_d)), f"llm4ad.{name}.|delta_pct|")
-            if isinstance(_b, (int, float)) and _is_finite(_b):
-                # Register the improvement ratio too, so a "improved X%" claim
-                # against the baseline matches a proven number.
-                if _b and abs(_b) > 1e-9:
-                    _ratio = abs(float(_d)) if isinstance(_d, (int, float)) and _is_finite(_d) else None
-                    if _ratio is not None:
-                        reg.add_value(_ratio, f"llm4ad.{name}.|improve_pct|")
         return reg
 
     @classmethod
@@ -409,30 +410,51 @@ class VerifiedRegistry:
         return cls.from_experiment(exp_data, ref_data, metric_direction=metric_direction)
 
 
+def load_llm4ad_comparison(run_dir: Path) -> dict[str, Any] | None:
+    """Load this run's ``stage-13/llm4ad_comparison.json``, or ``None``.
+
+    Single source of truth for "did LLM4AD evolution produce a comparison, and
+    what does it say".  Three consumers depend on agreeing exactly:
+    :func:`~researchclaw.pipeline.stage_impls._paper_writing._collect_llm4ad_comparison`
+    (Stage 17 injects the numbers), ``_llm4ad_was_run`` (Stages 18/19/22 decide
+    whether to order the section preserved), and :func:`_enrich_from_llm4ad_dir`
+    (the registry makes the numbers verifiable).  When they disagree, Stage 19
+    gets told to RESTORE a section for which no data is supplied — which is a
+    direct invitation to fabricate.
+
+    Only the unsuffixed ``stage-13/`` is read.  ``stage-13_vN/`` are snapshots
+    of superseded attempts (see :data:`_LLM4AD_COMPARISON_REL`); a promotion
+    that was rolled back must not resurface in the paper.
+
+    Returns ``None`` when the file is absent, unreadable, or carries no
+    ``algorithms`` mapping — i.e. evolution did not run, or produced nothing.
+    """
+    path = run_dir / _LLM4AD_COMPARISON_REL
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("algorithms"), dict):
+        return None
+    return data
+
+
 def _enrich_from_llm4ad_dir(target: VerifiedRegistry, run_dir: Path) -> None:
-    """Merge every ``stage-13*/llm4ad_comparison.json`` into *target*.
+    """Merge this run's ``stage-13/llm4ad_comparison.json`` into *target*.
 
     The promotion step writes the comparison artifact only when evolution ran;
-    absent it, this is a no-op. Scans all ``stage-13*`` versions so a rollback
-    re-run does not lose the newest comparison.
+    absent it, this is a no-op.
     """
-    import json as _json_l4b
-
-    found = sorted(run_dir.glob("stage-13*/llm4ad_comparison.json"), reverse=True)
-    if not found:
+    data = load_llm4ad_comparison(run_dir)
+    if data is None:
         return
-    for p in found:
-        try:
-            data = _json_l4b.loads(p.read_text(encoding="utf-8"))
-        except (OSError, _json_l4b.JSONDecodeError, Exception):  # noqa: BLE001
-            continue
-        if not isinstance(data, dict) or not isinstance(data.get("algorithms"), dict):
-            continue
-        _dir = str(data.get("metric_direction") or target.metric_direction or "maximize")
-        sub = VerifiedRegistry.from_llm4ad_comparison(data, metric_direction=_dir)
-        if sub.values:
-            _merge_into(target, sub)
-            logger.info("from_run_dir: merged llm4ad comparison %s (%d values)", p.name, len(sub.values))
+    _dir = str(data.get("metric_direction") or target.metric_direction or "maximize")
+    sub = VerifiedRegistry.from_llm4ad_comparison(data, metric_direction=_dir)
+    if sub.values:
+        _merge_into(target, sub)
+        logger.info(
+            "from_run_dir: merged llm4ad comparison (%d values)", len(sub.values)
+        )
 
 
 def _merge_into(target: VerifiedRegistry, source: VerifiedRegistry) -> None:
