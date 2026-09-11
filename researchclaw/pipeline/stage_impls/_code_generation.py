@@ -1368,400 +1368,13 @@ and surgical.
     return repair_guidance
 
 
-def _normalize_plan_items(value: Any) -> list[str]:
-    """Flatten a plan field (list[str] / list[dict] / dict[str, str]) to names.
-
-    S9 plans do not share a fixed schema for how methods/baselines/ablations are
-    declared: a value can be a list of strings, a list of dicts (each with
-    ``name``/``class_name``/``citation``/``description``), a dict keyed by names,
-    or a prose string. We only need a bag of name candidates, so any string leaf
-    is kept and the original structure is discarded deliberately (classification
-    is per-algorithm, not per-plan-row).
-    """
-    out: list[str] = []
-    # English prose stopwords: a description like "pointwise_linear is the
-    # primary baseline" would otherwise leak "is"/"the"/"primary" into the name
-    # bag and the LLM prompt. Only applied to the prose branch below, never to a
-    # name in a list/dict key or value, so real algorithm names are never
-    # filtered out.
-    _STOPWORDS = {
-        "a", "an", "and", "as", "at", "be", "by", "for", "from", "in", "is",
-        "it", "of", "on", "or", "that", "the", "this", "to", "with", "we",
-        "our", "method", "methods", "baseline", "baselines", "primary",
-        "main", "proposed", "ablation", "ablations",
-    }
-    if value is None:
-        return out
-    if isinstance(value, str):
-        # A description phrase ("pointwise_linear is the primary baseline") is
-        # not a name; keep only plausible identifier-like tokens so the LLM and
-        # the fallback matcher are not flooded with prose.
-        for tok in re.split(r"[\s,;:()\"']+", value):
-            tok = tok.strip()
-            if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.\-]*", tok) and tok.lower() not in _STOPWORDS:
-                out.append(tok)
-        return out
-    if isinstance(value, list):
-        for item in value:
-            out.extend(_normalize_plan_items(item))
-        return out
-    if isinstance(value, dict):
-        for k, v in value.items():
-            out.append(str(k))
-            out.extend(_normalize_plan_items(v))
-        return out
-    out.append(str(value))
-    return out
-
-
-def _plan_field_category(key: str) -> str | None:
-    """Classify a plan key to {proposed,baseline,ablation} by semantic prefix.
-
-    The stage-9 generator does not emit a fixed schema: the split may be
-    ``proposed_methods`` / ``baselines`` / ``ablations``, or ``conditions``,
-    ``method``, ``baseline_1`` / ``baseline_2``, or a topic-specific spelling.
-    Rather than enumerate keys, we match on a stable prefix so any spelling a
-    future prompt produces is still sorted into the right bag. The priority
-    (baseline over ablation over proposed) is applied later in the classifier;
-    here we only decide which bag a key feeds.
-    """
-    k = (key or "").strip().lower()
-    if not k:
-        return None
-    if k.startswith("baseline") or k.startswith("base_"):
-        return "baseline"
-    if k.startswith("ablat"):
-        return "ablation"
-    if (
-        k.startswith("propos")
-        or k.startswith("method")
-        or k.startswith("condition")
-        or k in ("ours", "main")
-    ):
-        return "proposed"
-    return None
-
-
-def _is_algorithm_row(value: Any) -> bool:
-    """True when a dict is an experiment row, not a nested config/prose group.
-
-    The S9 generator models each method/baseline/ablation as a dict carrying a
-    ``name`` (or ``class_name``) plus prose fields like ``description`` /
-    ``implementation_spec`` / ``expected_effect``. That dict is a *row*, and only
-    its ``name``/``class_name`` are algorithm names worth extracting; recursing
-    into the prose would flood the name bag with natural-language tokens. A dict
-    without either field (e.g. ``compute_budget``, ``metrics``, a keyed-by-name
-    map) is not a row and is flattened normally.
-    """
-    if not isinstance(value, dict):
-        return False
-    return "name" in value or "class_name" in value
-
-
-def _collect_plan_names(value: Any) -> list[str]:
-    """Flatten a plan field value into a list of name-candidate strings.
-
-    ``value`` may be a list[str], list[dict], dict[str, ...], str, None, or a
-    nested mix of these. Recursion flattens whatever the plan puts under a given
-    key, except that a dict *row* (a method/baseline/ablation declaration) only
-    contributes its ``name``/``class_name`` — its prose fields are not names.
-    Callers decide which bag the result feeds by the key it was found under.
-    """
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return _normalize_plan_items(value)
-    if isinstance(value, list):
-        out: list[str] = []
-        for item in value:
-            out.extend(_collect_plan_names(item))
-        return out
-    if isinstance(value, dict):
-        if _is_algorithm_row(value):
-            row = [value.get("name"), value.get("class_name")]
-            return [n for n in row if isinstance(n, str) and n.strip()]
-        out = []
-        for k, v in value.items():
-            # For a row {'name': 'cma_es_default'} the key is a field name, not an
-            # algorithm name — do not add it. A dict keyed BY algorithm name
-            # ({'cma_es_default': {...}}) should contribute that key; we cannot
-            # tell the two apart without knowing the schema, and adding an extra
-            # candidate is harmless because the classifier only keeps names that
-            # match a real algorithm dir.
-            out.append(str(k))
-            out.extend(_collect_plan_names(v))
-        return out
-    return [str(value)]
-
-
-def _extract_plan_names(exp_plan: Any) -> tuple[list[str], list[str], list[str]]:
-    """Return (proposed, baselines, ablations) name bags from the S9 plan.
-
-    ``exp_plan`` is the parsed YAML dict (or str). We do NOT assume any fixed
-    set of keys: the whole plan tree is walked, and every key is routed into a
-    bag by the semantic prefix of its name (see :func:`_plan_field_category`).
-    Anything under a key that looks like a baseline is a baseline, etc. This
-    makes the classifier tolerant of every schema the generator has produced
-    (proposed_methods / conditions / method / baseline_1 ...) and of future
-    paraphrases, instead of failing when it meets a key it never saw.
-    """
-    if isinstance(exp_plan, str):
-        if not exp_plan.strip():
-            return [], [], []
-        parsed = None
-        try:
-            import yaml as _yaml
-            parsed = _yaml.safe_load(exp_plan)
-        except Exception:  # noqa: BLE001 - prose plan, not YAML
-            parsed = None
-        if not isinstance(parsed, dict):
-            return [], [], []
-    elif isinstance(exp_plan, dict):
-        parsed = exp_plan
-    else:
-        return [], [], []
-
-    proposed: list[str] = []
-    baselines: list[str] = []
-    ablations: list[str] = []
-
-    def _walk(node: Any) -> None:
-        if isinstance(node, dict):
-            for key, val in node.items():
-                cat = _plan_field_category(key)
-                if cat is None:
-                    # Unclassified key (e.g. metadata, datasets, metrics): drill
-                    # into it so any nested algorithm names still surface, but
-                    # contribute nothing itself.
-                    _walk(val)
-                    continue
-                # The top-level key is authoritative for its value's category,
-                # e.g. ``proposed_methods:`` makes every row below it proposed.
-                # Do not recurse: the value's inner field keys (``name``,
-                # ``description`` ...) are not themselves category keys, and
-                # recursing would re-read their values into the wrong bag.
-                bag = proposed if cat == "proposed" else baselines if cat == "baseline" else ablations
-                bag.extend(_collect_plan_names(val))
-        elif isinstance(node, list):
-            for item in node:
-                _walk(item)
-
-    _walk(parsed)
-    return proposed, baselines, ablations
-
-
-def _classify_algorithms_with_fallback(
-    algo_names: list[str],
-    exp_plan: Any,
-    *,
-    mark_uncertain: bool = False,
-) -> dict[str, str]:
-    """Deterministic classification used when the LLM is unavailable or fails.
-
-    Exact name match is authoritative (a name listed under ``proposed_methods``
-    is proposed). Substring match (an ``esn_N200`` grid entry inside ``esn``)
-    falls back to that name's category, with ties resolved by a stable
-    ``proposed > baseline > ablation`` priority so the outcome does not depend
-    on dict iteration order.
-
-    An algorithm that matches no declared baseline or ablation is **proposed**,
-    not "unknown": the stage-9 plan models the experiment as ``conditions:``
-    (the methods being tested) plus separately-declared baselines, so anything
-    that is not a baseline is by construction the method under test. This is
-    what keeps a ``{categories: [proposed]}`` scope from silently shrinking to
-    zero packages on a topic that never declared ``proposed_methods``.
-
-    With ``mark_uncertain=True``, an algorithm whose category was guessed by the
-    ""-default (i.e. it matched neither the plan's explicit names nor a
-    substring) is recorded in ``result["_llm4ad_uncertain"]`` as a JSON list.
-    Callers use that to let the LLM fill only the genuinely ambiguous names
-    rather than override a plan-backed classification.
-    """
-    if not algo_names:
-        return {}
-    proposed, baselines, ablations = _extract_plan_names(exp_plan)
-
-    def _cat_for(name: str) -> str | None:
-        # baselines/ablations are the stricter label: a method can appear under
-        # ``conditions:`` (which we fold into proposed) AND be named as a
-        # baseline in prose ("pointwise_linear is the primary baseline"). A name
-        # explicitly declared a baseline must stay a baseline, so check those
-        # before the proposed bag.
-        if name in baselines:
-            return "baseline"
-        if name in ablations:
-            return "ablation"
-        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.\-]*", name or "") and name in proposed:
-            return "proposed"
-        return None
-
-    result: dict[str, str] = {}
-    uncertain: list[str] = []
-    for name in algo_names:
-        cat = _cat_for(name)
-        if cat is None:
-            # Substring candidates: match the algorithm's stem against any plan
-            # name. ``esn`` matches ``esn_N200``; stem is the directory name.
-            stem = re.sub(r"[\d_.\-]+$", "", name).strip("_")
-            cand_names = [n for n in proposed + baselines + ablations if stem and stem in n]
-            if cand_names:
-                # Same baseline > ablation > proposed priority as exact match.
-                if any(n in baselines for n in cand_names):
-                    cat = "baseline"
-                elif any(n in ablations for n in cand_names):
-                    cat = "ablation"
-                elif any(n in proposed for n in cand_names):
-                    cat = "proposed"
-            if cat is None:
-                cat = "proposed"
-                uncertain.append(name)
-        result[name] = cat
-    if mark_uncertain and uncertain:
-        # JSON-encoded so the value stays a plain str (the classifier return
-        # type is dict[str, str]); decoded by the caller.
-        result["_llm4ad_uncertain"] = json.dumps(uncertain)
-    return result
-
-
-def _classify_algorithms(
-    exp_dir: Path,
-    exp_plan: Any,
-    llm: LLMClient | None,
-    *,
-    max_attempts: int = 2,
-) -> dict[str, str]:
-    """Classify the generated algorithm tree as proposed/baseline/ablation.
-
-    The plan's split keys and the directory names do not correspond one-to-one
-    (a topic may list ``conditions:`` or grid entries, or omit a split entirely)
-    so the classifier operates on *actual* algorithm names.
-
-    Priority, highest first:
-
-    1. **Stage 9 plan** — a name the plan declares as baseline/ablation, or that
-       resolves by name/substring against it, is authoritative. The plan is the
-       experiment's own design, so it decides what is proposed vs a baseline.
-    2. **LLM, for the otherwise-ambiguous names only** — an algorithm the plan
-       did not identify is offered to the model for a judgment call. Its value is
-       accepted ONLY when it is one of the three allowed categories; anything the
-       model invents (``"sota"``, ``"custom"``, …) is discarded and the fallback
-       guess (``proposed``) stands. The model can never override a plan verdict.
-
-    Never raises: classification is advisory and a missing/partial result only
-    degrades evolve_scope filtering.
-    """
-    try:
-        from researchclaw.pipeline.llm4ad_task_packages import _discover_algorithms
-        discovered = _discover_algorithms(exp_dir)
-        algo_names = [a for a, _ in discovered]
-    except Exception:  # noqa: BLE001
-        algo_names = []
-    if not algo_names:
-        return {}
-
-    fallback = _classify_algorithms_with_fallback(
-        algo_names, exp_plan, mark_uncertain=True,
-    )
-    # Strip the internal marker before any use.
-    _uncertain_raw = fallback.pop("_llm4ad_uncertain", "")
-    _uncertain: list[str] = []
-    if _uncertain_raw:
-        try:
-            _uncertain = json.loads(_uncertain_raw)
-        except (TypeError, ValueError):
-            _uncertain = []
-    uncertain = set(_uncertain)
-
-    if llm is None or not uncertain:
-        # No LLM, or the plan already classified every algorithm — the plan is
-        # authoritative, so there is nothing for the model to contribute.
-        logger.info(
-            "Stage 10: classifying %d algorithm(s) by plan-name fallback%s",
-            len(algo_names), " (no ambiguous names for the LLM)" if (llm and not uncertain) else "",
-        )
-        return fallback
-
-    # Build the prompt from plan names and the *actual* tree, so we never ask
-    # the model to imagine algorithms that are not in the directory.
-    proposed, baselines, ablations = _extract_plan_names(exp_plan)
-    _plan_section = (
-        f"proposed_methods: {proposed or '(<not declared>)'}\n"
-        f"baselines: {baselines or '(<not declared> or free-form prose in plan>)'}\n"
-        f"ablations: {ablations or '(<not declared>)'}\n"
-    )
-    _algo_section = "\n".join(f"- {a}" for a in algo_names)
-
-    user_prompt = (
-        "The following experimental algorithms were generated in the pipeline.\n\n"
-        "PLAN (from the experiment design stage):\n"
-        f"{_plan_section}\n\n"
-        "ACTUAL ALGORITHM DIRECTORIES (names are authoritative):\n"
-        f"{_algo_section}\n\n"
-        "For EACH actual algorithm, decide whether it is the PROPOSED method, a "
-        "BASELINE, or an ABLATION, using your judgment and the plan above. The plan "
-        "may not declare all categories or the names may differ from the directory "
-        "names; use code/library knowledge to decide. Do NOT invent algorithms and "
-        "do NOT invent a category. The SUPPORTED category is EXACTLY one of the "
-        "three strings `proposed`, `baseline`, `ablation` — use ONLY those, "
-        "lowercase, not anything else (e.g. NOT \"sota\", \"state_of_the_art\", "
-        "\"custom\", \"primary\", \"novel\"). If a category is not declared, still "
-        "classify by the nature of the algorithm into one of those three.\n"
-        "Return ONLY JSON of shape "
-        '{"classification": {"<algo_name>": "proposed"|"baseline"|"ablation"}}, '
-        "with every actual algorithm from the list above and no others.\n"
-    )
-    system_prompt = (
-        "You classify machine-learning / optimization experiment algorithms."
-    )
-
-    for attempt in range(max_attempts):
-        try:
-            resp = _chat_with_prompt(llm, system_prompt, user_prompt, max_tokens=2048)
-            raw = resp.content or ""
-            parsed = None
-            _yaml_block = _extract_yaml_block(raw)
-            for candidate in (raw, _yaml_block):
-                if not candidate or not candidate.strip():
-                    continue
-                try:
-                    candidate_parsed = _safe_json_loads(candidate, None)
-                except Exception:  # noqa: BLE001
-                    candidate_parsed = None
-                if isinstance(candidate_parsed, dict):
-                    parsed = candidate_parsed
-                    break
-            mapping = parsed.get("classification", {}) if isinstance(parsed, dict) else {}
-            if isinstance(mapping, dict) and mapping:
-                # Plan verdicts win. The LLM only fills the names the plan did
-                # not identify, and its value must be one of the three allowed
-                # categories. Anything invented is discarded (fallback stands).
-                _CATEGORIES = {"proposed", "baseline", "ablation"}
-                result = dict(fallback)
-                for a in uncertain:
-                    _v = mapping.get(a)
-                    if isinstance(_v, str):
-                        _v = _v.strip().lower()
-                        if _v in _CATEGORIES:
-                            result[a] = _v
-                logger.info(
-                    "Stage 10: plan classified %d algorithm(s); LLM refined "
-                    "%d ambiguous name(s), result: %s",
-                    len(algo_names) - len(uncertain), len(uncertain), result,
-                )
-                return result
-            logger.warning(
-                "Stage 10: algorithm classification attempt %d returned no usable "
-                "JSON (got %r) — %s", attempt + 1, raw[:200], "retrying" if attempt + 1 < max_attempts else "falling back",
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Stage 10: algorithm classification call %d raised %s — %s",
-                attempt + 1, exc,
-                "retrying" if attempt + 1 < max_attempts else "falling back",
-            )
-        if attempt + 1 < max_attempts:
-            time.sleep(2 * (attempt + 1))
-    return fallback
+# Algorithm classification lives in one shared module: the stage-13 scope filter
+# reads exactly what stage 10 writes, and splitting the pair across two files let
+# the formats drift (one wrote {algo: family}, the other matched {algo: role}).
+from researchclaw.pipeline.llm4ad_utils.classification import (  # noqa: E402
+    classify_algorithms as _classify_algorithms,
+    filter_by_scope as _filter_algorithms_by_scope,
+)
 
 
 def _maybe_classify_algorithms(
@@ -1770,48 +1383,57 @@ def _maybe_classify_algorithms(
     config: Any,
     llm: LLMClient | None,
 ) -> None:
-    """Best-effort write of ``experiment/algorithms_classification.json``.
+    """Write ``experiment/algorithms_classification.json`` — unconditionally.
 
-    Runs only when LLM4AD boost is enabled — the file is only consumed by the
-    evolution scoping filter, so without boost it would be dead output. Does
-    not raise; an absent file means the stage-13 filter treats evolution scope
-    as "everything".
+    Runs whenever LLM4AD boost is enabled, and always overwrites whatever the
+    generation model may have written to that same path.
+
+    Both of those are load-bearing:
+
+    * **Unconditional**, not "only when the config selects by category". The scope
+      may be read at stage 13 from a config the stage-10 process never saw (a
+      resumed run, an edited config, :func:`_filter_algorithms_by_scope` called by
+      the stage-12 fitness gate). Classifying only when *this* stage's config
+      happens to ask for it means the file is missing exactly when someone later
+      needs it, which the filter handles by evolving nothing.
+    * **Always overwriting**, rather than writing only when our own file is
+      absent. The prompt tells the generation model to produce this filename and
+      gives it no schema, so it authors the file in its own shape
+      (``{"algorithm_types": {...}}``, family groupings) — which names no role.
+      Our classification is the only writer that assigns one.
+
+    Never raises: if the classification fails the scope filter sees a missing file
+    and skips evolution, which is the safe direction.
     """
     _l4b = getattr(getattr(config, "experiment", None), "llm4ad_boost", None)
     if _l4b is None or not getattr(_l4b, "enabled", False):
         return
     _evo = getattr(_l4b, "evolution", None)
     _scope = getattr(_evo, "evolve_scope", None) if _evo is not None else None
-    if not _scope or not isinstance(_scope, dict):
-        # No category filtering requested — no need to burn an LLM call.
-        return
 
     try:
-        if exp_plan_text and not exp_plan_text.strip():
-            plan = None
-        elif exp_plan_text:
-            try:
-                import yaml as _yaml
-                plan = _yaml.safe_load(exp_plan_text)
-            except Exception:  # noqa: BLE001
-                plan = exp_plan_text
-        else:
-            plan = None
-        result = _classify_algorithms(exp_dir, plan, llm)
-        payload = {
-            "generated": _utcnow_iso(),
-            "source": "stage-10 llm" if llm is not None else "stage-10 plan fallback",
-            "classification": result,
-        }
-        (exp_dir / "algorithms_classification.json").write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False),
-            encoding="utf-8",
+        # The classifier reads the plan as text; passing it through unparsed keeps
+        # a free-form plan usable and costs the model nothing.
+        result = _classify_algorithms(exp_dir, exp_plan_text, llm)
+        if not result:
+            logger.warning(
+                "Stage 10: no algorithm tree under %s — %s not written",
+                exp_dir, "algorithms_classification.json",
+            )
+            return
+
+        _kept = _filter_algorithms_by_scope(
+            [(n, exp_dir / "algorithms" / n / f"{n}.py") for n in sorted(result)],
+            exp_dir,
+            _scope,
         )
-        logger.info("Stage 10: wrote algorithms_classification.json (n=%d)", len(result))
+        logger.info(
+            "Stage 10: wrote algorithms_classification.json (n=%d, scope=%s, "
+            "evolve_scope keeps %d)",
+            len(result), _scope or "all", len(_kept),
+        )
     except Exception as exc:  # noqa: BLE001 - advisory, never fail the stage
-        logger.warning(
-            "Stage 10: algorithm classification skipped (non-fatal): %s", exc,
-        )
+        logger.warning("Stage 10: algorithm classification skipped (non-fatal): %s", exc)
 
 
 def _execute_code_generation(
@@ -3699,8 +3321,8 @@ Multi-file experiment project with {len(files)} file(s): {file_list}
     # drift apart. Classify here (both the plan and the final tree are in scope,
     # after all fix/regeneration loops have settled) and freeze the result to
     # algorithms_classification.json, which stage-13 reads to apply
-    # evolution.evolve_scope. Advisory: on failure the file simply is not
-    # written and evolution falls back to evolving everything.
+    # evolution.evolve_scope. The write is unconditional and overwrites the
+    # generation model's own file at that path — see _maybe_classify_algorithms.
     _maybe_classify_algorithms(exp_dir, exp_plan, config, llm)
     if (exp_dir / "algorithms_classification.json").is_file():
         artifacts.append("experiment/algorithms_classification.json")

@@ -1,1 +1,43 @@
 """Helpers for comparing LLM4AD-evolved algorithms against a clean baseline."""
+
+from researchclaw.pipeline.llm4ad_utils.classification import (
+    ABLATION,
+    BASELINE,
+    CATEGORIES,
+    CATEGORY_LIST,
+    CLASSIFICATION_FILENAME,
+    DEFAULT_CATEGORY,
+    PROPOSED,
+    classify_algorithms,
+    discover_algorithms,
+    discover_algorithm_names,
+    filter_by_scope,
+    missing_from,
+    normalize_category,
+    read_classification,
+    scope_categories,
+    scope_is_selective,
+    scope_names,
+    write_classification,
+)
+
+__all__ = [
+    "ABLATION",
+    "BASELINE",
+    "CATEGORIES",
+    "CATEGORY_LIST",
+    "CLASSIFICATION_FILENAME",
+    "DEFAULT_CATEGORY",
+    "PROPOSED",
+    "classify_algorithms",
+    "discover_algorithms",
+    "discover_algorithm_names",
+    "filter_by_scope",
+    "missing_from",
+    "normalize_category",
+    "read_classification",
+    "scope_categories",
+    "scope_is_selective",
+    "scope_names",
+    "write_classification",
+]

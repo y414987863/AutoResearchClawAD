@@ -1601,16 +1601,90 @@ def _parse_opencode_config(data: dict[str, Any]) -> OpenCodeConfig:
     )
 
 
+def _parse_evolve_scope(data: Any) -> dict[str, Any]:
+    """Validate ``llm4ad_boost.evolution.evolve_scope``.
+
+    The scope decides whether evolution touches the baselines, so a value that is
+    silently dropped is the dangerous outcome: evolution then runs over *every*
+    algorithm, the evolved baseline replaces the fixed one in the comparison, and
+    the paper's main result is quietly invalid. A key that is misspelled
+    (``nams``) or a ``names`` list given as a bare string would have loaded as
+    "no scope" without a word. Both are rejected here instead — at config load,
+    where the config author can still see the message.
+
+    ``categories`` values are canonicalised to the three roles the classifier
+    emits; ``names`` values must be strings (algorithm directory names contain no
+    dynamic component, but the run that generates them does, so they are checked
+    for type and shape, never against a known list).
+    """
+    if data is None or data == {}:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"experiment.llm4ad_boost.evolution.evolve_scope must be a mapping "
+            f"with 'categories' and/or 'names', got {type(data).__name__}"
+        )
+    unknown = sorted(set(data) - {"categories", "names"})
+    if unknown:
+        raise ValueError(
+            "experiment.llm4ad_boost.evolution.evolve_scope has unknown key(s) "
+            f"{unknown}; supported keys are 'categories' (roles: proposed, "
+            "baseline, ablation) and 'names' (algorithm directory names)"
+        )
+    from researchclaw.pipeline.llm4ad_utils.classification import normalize_category
+
+    scope: dict[str, Any] = {}
+    for key in ("categories", "names"):
+        if key not in data:
+            continue
+        raw = data[key]
+        if isinstance(raw, str):
+            raise ValueError(
+                f"experiment.llm4ad_boost.evolution.evolve_scope.{key} must be a "
+                f"list, got the bare string {raw!r} — write it as [{raw!r}]"
+            )
+        if not isinstance(raw, (list, tuple)):
+            raise ValueError(
+                f"experiment.llm4ad_boost.evolution.evolve_scope.{key} must be a "
+                f"list, got {type(raw).__name__}"
+            )
+        if key == "categories":
+            values: list[str] = []
+            for item in raw:
+                cat = normalize_category(item)
+                if cat is None:
+                    raise ValueError(
+                        f"evolve_scope.categories entry {item!r} is not a known "
+                        "role; use 'proposed', 'baseline' or 'ablation'"
+                    )
+                if cat not in values:
+                    values.append(cat)
+            if not values:
+                raise ValueError(
+                    "evolve_scope.categories is empty — omit evolve_scope "
+                    "entirely to evolve every algorithm"
+                )
+            scope["categories"] = values
+        else:
+            values = [str(item).strip() for item in raw if str(item).strip()]
+            if not values:
+                raise ValueError(
+                    "evolve_scope.names is empty — omit evolve_scope entirely to "
+                    "evolve every algorithm"
+                )
+            scope["names"] = values
+    if not scope:
+        raise ValueError(
+            "evolve_scope must set 'categories' and/or 'names'; to evolve every "
+            "algorithm omit evolve_scope entirely"
+        )
+    return scope
+
+
 def _parse_llm4ad_evolution_config(data: dict[str, Any]) -> Llm4adEvolutionConfig:
     if not data:
         return Llm4adEvolutionConfig()
     island = data.get("island") or {}
-    # evolve_scope is free-form (dict-shaped) so it needs no schema revision
-    # when a topic labels methods differently; an absent/invalid value stays
-    # empty, which the downstream filter treats as "evolve everything".
-    evolve_scope = data.get("evolve_scope")
-    if not isinstance(evolve_scope, dict):
-        evolve_scope = {}
     return Llm4adEvolutionConfig(
         method=str(data.get("method", "island_ga")),
         max_generations=_safe_int(data.get("max_generations"), 2),
@@ -1618,7 +1692,7 @@ def _parse_llm4ad_evolution_config(data: dict[str, Any]) -> Llm4adEvolutionConfi
         mutation_rate=_safe_float(data.get("mutation_rate"), 0.6),
         crossover_rate=_safe_float(data.get("crossover_rate"), 0.3),
         island=dict(island) if isinstance(island, dict) else {},
-        evolve_scope=dict(evolve_scope),
+        evolve_scope=_parse_evolve_scope(data.get("evolve_scope")),
     )
 
 
