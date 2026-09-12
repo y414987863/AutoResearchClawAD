@@ -343,8 +343,15 @@ method or dataset.
 5. Use multi-seed evaluation (seeds 0, 1, 2) and report mean ± std.
 6. Each ablation/condition MUST be genuinely different — not a copy-paste with
    a renamed variable.
-7. Implement a time guard: stop gracefully at 80% of the time budget
-   ({time_budget_sec} seconds).
+7. Implement a time guard that never drops a condition ({time_budget_sec}
+   seconds total). The deadline belongs INSIDE one (condition, instance, seed)
+   run: give each run its own slice,
+   `per_run_budget = total_budget / n_runs`, and check it there. NEVER break out
+   of the loop over conditions — that silently discards every condition still to
+   come, and an experiment missing a baseline cannot be repaired downstream.
+   Print each result as soon as it is computed, so stopping part-way still
+   leaves the finished conditions on stdout. If you truly cannot run everything,
+   first print `SKIPPED_CONDITIONS: <names>` naming what did not run.
 8. Write `requirements.txt` listing any extra pip packages needed — UNLESS
    `GUIDANCE.md` forbids it (offline runs cannot pip install; then use only the
    preinstalled packages it lists).

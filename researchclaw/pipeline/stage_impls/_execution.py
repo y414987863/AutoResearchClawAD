@@ -1778,6 +1778,90 @@ def _execute_iterative_refine(
             _wf.parent.mkdir(parents=True, exist_ok=True)
             _wf.write_text(code, encoding="utf-8")
 
+    def _restore_evolve_markers(
+        new_files: dict[str, str], old_files: dict[str, str],
+    ) -> list[str]:
+        """Re-wrap `optimize` in EVOLVE markers that a refine rewrite dropped.
+
+        Stage 10 puts `# EVOLVE_START` / `# EVOLVE_END` around each algorithm's
+        `optimize` so the evolution stage can replace that function. Refining the
+        project legitimately rewrites an algorithm — but this loop's prompt is
+        about improving the implementation, and a model that rewrites the body
+        rarely remembers to re-emit the markers. When they vanish, LLM4AD's
+        analyzer finds zero evolvable blocks, every candidate is skipped with
+        "InitSampler requires analyzed_repository with at least one evolvable
+        block", and evolution produces nothing after burning the whole stage.
+
+        Re-wrapping rather than reverting keeps whatever the refinement actually
+        improved; reverting would throw that away to fix a formatting loss. A
+        file whose `optimize` no longer parses is left alone — there is nothing
+        to wrap, and the caller's validation reports it.
+
+        Returns the file names that were fixed.
+        """
+        import ast as _ast_markers
+
+        fixed: list[str] = []
+        for fname, code in list(new_files.items()):
+            if "/" not in fname or not fname.endswith(".py"):
+                continue
+            prior = old_files.get(fname, "")
+            had = "EVOLVE_START" in prior and "EVOLVE_END" in prior
+            has = "EVOLVE_START" in code and "EVOLVE_END" in code
+            # Only rescue a marker pair this refine step dropped. A file that
+            # never had markers is left as generated — inventing a block there
+            # would make an helper module evolvable.
+            if not had or has:
+                continue
+
+            # splitlines(keepends=True) leaves the last line without a newline
+            # when the file does not end in one; appending a marker after it
+            # would merge the two into `}# EVOLVE_END`. Normalise first.
+            lines = code.splitlines(keepends=True)
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] = lines[-1] + "\n"
+            lines = [ln if ln.endswith("\n") else ln + "\n" for ln in lines]
+            try:
+                tree = _ast_markers.parse(code)
+            except SyntaxError:
+                continue
+            fn = next(
+                (
+                    n for n in _ast_markers.walk(tree)
+                    if isinstance(n, _ast_markers.FunctionDef) and n.name == "optimize"
+                ),
+                None,
+            )
+            if fn is None:
+                continue
+            # Markers go OUTSIDE the function, as the reference task packages
+            # lay them out: the whole `def ... return` is the evolvable unit.
+            start_line = fn.lineno - 1          # 0-based, the `def` line
+            end_line = fn.end_lineno            # 0-based index just past the body
+            # Leave any decorator above `def` outside the block (Python 3.8+).
+            for dec in getattr(fn, "decorator_list", []):
+                start_line = min(start_line, dec.lineno - 1)
+            if not (0 <= start_line < end_line <= len(lines)):
+                continue
+            patched = (
+                lines[:start_line]
+                + ["# EVOLVE_START\n"]
+                + lines[start_line:end_line]
+                + ["# EVOLVE_END\n"]
+                + lines[end_line:]
+            )
+            new_files[fname] = "".join(patched)
+            fixed.append(fname)
+
+        if fixed:
+            logger.warning(
+                "Stage 13: restored dropped EVOLVE markers in %d file(s): %s — "
+                "a rewrite without them is not evolvable, and would have left "
+                "Stage 13 with nothing to evolve.",
+                len(fixed), ", ".join(fixed),
+            )
+        return fixed
+
     # --- Helper: format all files for LLM context ---
     def _files_to_context(
         project_files: dict[str, str],
@@ -2069,6 +2153,10 @@ def _execute_iterative_refine(
         candidate_files = dict(best_files)
         if extracted_files:
             candidate_files.update(extracted_files)
+        # A refine rewrite that drops the EVOLVE markers leaves LLM4AD with zero
+        # evolvable blocks, which silently wastes the whole evolution stage.
+        # Restore them before this iteration is written or run.
+        _restore_evolve_markers(candidate_files, best_files)
         # If LLM returned nothing at all, candidate_files == best_files (unchanged)
 
         # BUG-R6-02: Preserve entry point when LLM strips main() function.

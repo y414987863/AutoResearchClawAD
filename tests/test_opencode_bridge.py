@@ -704,3 +704,79 @@ class TestCountHistoricalFailures:
         (d / "stage_health.json").write_text(json.dumps({"status": "FAILED"}))
         (d / "validation_report.md").write_text("FAILED after 3 repairs")
         assert count_historical_failures(tmp_path) == 1
+
+
+# ============================================================
+# TASK.md contract — the instructions the agent actually reads
+# ============================================================
+
+
+class TestTaskMdContract:
+    """TASK.md is the agent's task statement; it must state the whole contract.
+
+    These are the requirements that failed in real runs when TASK.md was silent
+    or self-contradictory, so each is pinned here rather than left to prose.
+    """
+
+    @staticmethod
+    def _rendered(metric: str = "ndcg_at_10", budget: int = 300) -> str:
+        from researchclaw.pipeline.opencode_bridge import _TASK_MD_TEMPLATE
+
+        return (
+            _TASK_MD_TEMPLATE
+            .replace("{python}", "/usr/bin/python3")
+            .replace("{metric}", metric)
+            .replace("{time_budget_sec}", str(budget))
+        )
+
+    def test_no_unfilled_placeholders(self):
+        body = self._rendered()
+        assert "{python}" not in body
+        assert "{metric}" not in body
+        assert "{time_budget_sec}" not in body
+
+    def test_time_guard_must_not_drop_conditions(self):
+        """The old wording said only "stop gracefully at 80%", which licenses a
+        `break` out of the condition loop — one real run lost a baseline that
+        way and produced a 3-of-4 comparison nobody noticed."""
+        body = self._rendered()
+        # Collapse wrapping so a phrase split across lines still matches.
+        flat = " ".join(body.split())
+        assert "never drops a condition" in flat
+        assert "NEVER break out of the loop over conditions" in flat
+        assert "SKIPPED_CONDITIONS" in flat
+        # The superseded phrasing must be gone, not merely supplemented.
+        assert "stop gracefully at 80% of the time budget" not in flat
+
+    def test_main_py_contract_is_explicit(self):
+        """`--algorithm`/`importlib` are hard requirements the validator
+        enforces, so they belong in the requirements and not only as an aside."""
+        body = self._rendered()
+        assert "--algorithm <name>" in body
+        assert "importlib" in body
+        assert "if __name__" in body
+
+    def test_argparse_is_not_blanket_forbidden(self):
+        """The blanket ban contradicted the required selector."""
+        body = self._rendered()
+        assert "Do NOT use argparse" not in body
+
+    def test_structural_self_check_covers_the_failure_modes(self):
+        body = self._rendered()
+        assert "Structural self-check" in body
+        # EVOLVE markers, and the per-algorithm standalone run.
+        assert "EVOLVE_START" in body
+        assert "Every algorithm module is evolvable" in body
+        assert "Every key an algorithm reads off" in body
+        assert "single-algorithm contract" in body
+
+    def test_no_run_specific_hardcoding(self):
+        # Render with a neutral metric: any topic token still present in the
+        # output is genuinely baked into the template.
+        body = self._rendered(metric="score").lower()
+        for token in (
+            "cma_es", "nelder", "powell", "ridge", "ndcg", "listmle",
+            "ranknet", "pointwise", "ackley", "rastrigin", "rosenbrock",
+            "ml03", "ml23", "tsp", "esn",
+        ):
+            assert token not in body, f"TASK.md hardcodes {token!r}"
