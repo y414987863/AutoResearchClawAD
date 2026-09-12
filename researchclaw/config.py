@@ -561,6 +561,16 @@ class Llm4adBoostConfig:
     fail_silently: bool = True  # on failure, warn and keep Stage 13 best
     evolution: Llm4adEvolutionConfig = field(default_factory=Llm4adEvolutionConfig)
     resources: Llm4adResourcesConfig = field(default_factory=Llm4adResourcesConfig)
+    #: Run llm4ad's evolution inside each task package (``<package>/runs``)
+    #: instead of a temp directory, so the worktrees, checkpoints, ``best/`` and
+    #: the live ``logs/llm4ad.log`` are all inspectable in the artifact tree
+    #: while the run is still going.
+    #:
+    #: Off by default because llm4ad cuts a git worktree per candidate and the
+    #: nested path can pass Windows' 260-character limit, where every worktree
+    #: then dies with ``fatal: '$GIT_DIR' too big``. Linux and macOS have no
+    #: such limit, so production deployments there can enable it safely.
+    run_evolution_in_package: bool = False
 
 
 @dataclass(frozen=True)
@@ -1715,6 +1725,7 @@ def _parse_llm4ad_boost_config(data: dict[str, Any]) -> Llm4adBoostConfig:
         fail_silently=bool(data.get("fail_silently", True)),
         evolution=_parse_llm4ad_evolution_config(data.get("evolution") or {}),
         resources=_parse_llm4ad_resources_config(data.get("resources") or {}),
+        run_evolution_in_package=bool(data.get("run_evolution_in_package", False)),
     )
 
 

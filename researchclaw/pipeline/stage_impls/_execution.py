@@ -764,13 +764,36 @@ def _generate_llm4ad_task_packages(
         # _resolve_run_best read a stale best. Generating it here ties gen +
         # collect to the same new token per package-generation call.
         _l4b_token = uuid.uuid4().hex[:8]
-        # Kept in a variable so the finally block below can delete it. llm4ad
-        # cuts a git worktree per candidate under here; nothing else removes
-        # them, so a long-lived machine accumulates one full checkout per
-        # individual per generation per run.
-        _l4b_runs_dir = (
-            Path(tempfile.gettempdir()) / "rc_llm4ad" / run_dir.name / f"run_{_l4b_token}"
+        # Where llm4ad writes its per-candidate worktrees.
+        #
+        # Default: a temp dir. It is kept in a variable so the finally block
+        # below can delete it — llm4ad cuts a git worktree per candidate and
+        # nothing else removes them, so a long-lived machine would otherwise
+        # accumulate one full checkout per individual per generation per run.
+        #
+        # Opt-in: keep everything inside the package (`<package>/runs`) so the
+        # worktrees, checkpoints, `best/` and the live `logs/llm4ad.log` are
+        # inspectable in the artifact tree while the run is in progress. The
+        # reason this is not the default is the Windows 260-character path
+        # limit — a nested worktree path can trip it, and llm4ad then fails
+        # every candidate with `fatal: '$GIT_DIR' too big`. Linux/macOS have no
+        # equivalent limit, so production on those platforms can enable it.
+        _in_package_runs = bool(
+            getattr(_l4b, "run_evolution_in_package", False)
         )
+        _l4b_runs_dir: Path | None = None
+        if not _in_package_runs:
+            _l4b_runs_dir = (
+                Path(tempfile.gettempdir()) / "rc_llm4ad" / run_dir.name
+                / f"run_{_l4b_token}"
+            )
+        else:
+            logger.info(
+                "Stage 13: run_evolution_in_package=true — llm4ad worktrees "
+                "stay under %s (inspectable, not cleaned up). This needs a "
+                "filesystem without Windows' 260-character path limit.",
+                _tp_out,
+            )
         _manifests = generate_task_packages(
             Path(_tp_exp), _tp_out, _llm_config, _evo_cfg, _res_cfg,
             background=_topic, metric_direction=_direction,
@@ -778,8 +801,8 @@ def _generate_llm4ad_task_packages(
             # algorithms. Category membership is resolved against the per-run
             # algorithms_classification.json stage-10 wrote.
             evolve_scope=_evo_cfg.get("evolve_scope") if _evo_cfg else None,
-            # Worktrees live under the temp dir (not task_packages/, whose deep
-            # path hits Windows' 260-char limit), scoped to this invocation.
+            # None => llm4ad writes under each package's own ./runs; a path =>
+            # worktrees live there instead, scoped to this invocation.
             runs_base_dir=_l4b_runs_dir,
             run_id=_l4b_token,
         )

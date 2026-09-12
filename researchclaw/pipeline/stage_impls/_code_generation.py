@@ -291,6 +291,46 @@ def _check_rl_compatibility(code: str) -> list[str]:
     return errors
 
 
+#: Calls that return the argument they were given (or a shallow/deep copy of
+#: it), so `x = f(instance)` does keep `x` an instance. Anything else —
+#: `metrics = score_model(instance, ...)` — returns a different object that
+#: merely happened to take the instance as an argument, and treating it as an
+#: alias made the check accuse correct code of a missing data field.
+_ALIAS_PRESERVING_CALLS: frozenset[str] = frozenset({"dict", "copy", "deepcopy"})
+
+
+def _alias_source(value: ast.AST) -> str | None:
+    """Return the name ``value`` aliases, or ``None`` when it is not an alias.
+
+    Recognises only the value-preserving spellings generated code uses to carry
+    an instance around: ``x = instance``, ``x = dict(instance)``,
+    ``x = copy(instance)``, ``x = deepcopy(instance)`` and ``x = {**instance}``.
+
+    A constructor — ``x = Wrapper(instance)`` — is deliberately NOT recognised,
+    and neither is any other call: both return a new object that merely took the
+    instance as an argument, so counting them as aliases invents instance reads
+    that are not there. Staying narrow costs at most a missed alias, which only
+    weakens the check; being broad makes it report a defect in correct code, and
+    that is the failure that matters because it sends the repair loop after
+    working code.
+    """
+    if isinstance(value, ast.Name):
+        return value.id
+    if isinstance(value, ast.Dict) and len(value.keys) == 1 and value.keys[0] is None:
+        # ``{**instance}`` — the single value is the unpacked mapping.
+        inner = value.values[0]
+        return inner.id if isinstance(inner, ast.Name) else None
+    if isinstance(value, ast.Call) and value.args:
+        fn = value.func
+        name = fn.id if isinstance(fn, ast.Name) else (
+            fn.attr if isinstance(fn, ast.Attribute) else ""
+        )
+        if name in _ALIAS_PRESERVING_CALLS:
+            first = value.args[0]
+            return first.id if isinstance(first, ast.Name) else None
+    return None
+
+
 def _hard_indexed_instance_keys(code: str) -> set[str]:
     """Keys an algorithm reads as ``instance["k"]`` with no fallback.
 
@@ -330,12 +370,8 @@ def _hard_indexed_instance_keys(code: str) -> set[str]:
             target = node.targets[0]
             if not isinstance(target, ast.Name):
                 continue
-            src = node.value
-            if isinstance(src, ast.Call) and src.args:
-                src = src.args[0]
-            elif isinstance(src, ast.Dict) and len(src.keys) == 1 and src.keys[0] is None:
-                src = src.values[0]
-            if isinstance(src, ast.Name) and src.id in aliases:
+            src = _alias_source(node.value)
+            if src is not None and src in aliases:
                 aliases.add(target.id)
 
     keys: set[str] = set()
@@ -652,16 +688,38 @@ def _check_llm4ad_structure(files: dict[str, str], metric_key: str = "") -> list
             "LLM4AD_STRUCTURE: missing `main.py` entry point."
         )
     else:
+        # The metric-output needle is the metric this experiment actually
+        # reports, not the literal string "primary_metric": the generator picks
+        # the metric name freely (``ndcg_at_10``, ``accuracy``, …), and
+        # ``primary_metric`` is only a legacy placeholder. Searching for the
+        # placeholder made a correct `print(f"ndcg_at_10: {v}")` look like a
+        # missing output, which sent the repair loop after working code.
+        #
+        # Accept ANY plausible name — the evaluator's declared PRIMARY_METRIC,
+        # the config's metric_key, and the legacy placeholder — because the
+        # requirement is that `main.py` prints *its* metric; a mismatch between
+        # the two names is already reported by `_metric_mismatch_problem`.
+        _metric_names = sorted({
+            n for n in (
+                _generated_primary_metric(files),
+                (metric_key or "").strip(),
+                "primary_metric",
+            ) if n
+        })
         for needle, label in (
             ("--algorithm", "`--algorithm` CLI argument"),
             ("importlib", "dynamic `importlib` loading"),
-            ("primary_metric", "`primary_metric` output"),
             ('if __name__ == "__main__":', "`if __name__ == \"__main__\":` entry guard"),
         ):
             if needle not in main_code:
                 problems.append(
                     f"LLM4AD_STRUCTURE: `main.py` missing {label}."
                 )
+        if not any(n in main_code for n in _metric_names):
+            problems.append(
+                "LLM4AD_STRUCTURE: `main.py` missing the primary-metric output — "
+                f"it must print `<metric>: <value>` using one of {_metric_names}."
+            )
 
     # Stage-13's package runner imports these two symbols BY NAME and nothing
     # else; a missing export fails every algorithm at package-build time (after

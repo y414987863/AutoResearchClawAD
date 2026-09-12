@@ -931,11 +931,17 @@ def generate_task_packages(
         # 6. Write config.yaml. When a short run root was supplied, point
         # base_dir at it (each package gets its own subdir so parallel runs do
         # not collide) — see run_evolution_on_packages for why.
-        _base_dir = str(package / "runs")
+        #
+        # Both branches use as_posix(): `_write_config` emits base_dir inside a
+        # YAML *double-quoted* scalar, where a backslash starts an escape
+        # sequence. A Windows path written with str() renders as
+        # `base_dir: "C:\Users\..."`, and `\U` is not a valid YAML escape, so
+        # the config fails to parse. The temp-root branch always used as_posix();
+        # the package-relative default did not — which is exactly why running
+        # evolution inside the package would break on Windows while the temp
+        # path worked.
+        _base_dir = (package / "runs").as_posix()
         if runs_base_dir is not None:
-            # POSIX separators: backslashes inside a YAML double-quoted scalar
-            # are read as escapes (``\U``/``\T``), so as_posix() keeps the path
-            # parseable on any platform.
             _base_dir = (runs_base_dir / algo).resolve().as_posix()
         _write_config(
             algo, package, primary_metric, providers_yaml, evolution, resources,
