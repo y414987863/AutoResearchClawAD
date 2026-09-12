@@ -742,11 +742,33 @@ class TestTaskMdContract:
         body = self._rendered()
         # Collapse wrapping so a phrase split across lines still matches.
         flat = " ".join(body.split())
-        assert "never drops a condition" in flat
         assert "NEVER break out of the loop over conditions" in flat
         assert "SKIPPED_CONDITIONS" in flat
         # The superseded phrasing must be gone, not merely supplemented.
         assert "stop gracefully at 80% of the time budget" not in flat
+
+    def test_algorithms_must_not_read_the_clock(self):
+        """A metric that depends on elapsed time is rejected before evolution.
+
+        Scoring the same (algorithm, instance, seed) twice must give the same
+        number. A loop bounded by `time.time()` does a different amount of work
+        on a loaded machine, so the metric drifts; the Stage-13 fitness gate then
+        refuses to spend LLM budget on it and the whole evolution is skipped —
+        which is what happened to two real runs, both flagged on the same
+        instance.
+
+        The rule is absolute for algorithm files: even a timing measurement is
+        refused there, because a checker can see the call but not what it is used
+        for. Runtime figures belong in `main.py`.
+        """
+        body = self._rendered()
+        flat = " ".join(body.split())
+        assert "NEVER read the clock inside an algorithm" in flat
+        # The count-bounded replacement must be shown, not just described.
+        assert "max_evals" in flat
+        assert "while evals < max_evals" in flat
+        # And the deadline slice that caused the drift must be gone.
+        assert "per_run_budget = total_budget / n_runs" not in flat
 
     def test_main_py_contract_is_explicit(self):
         """`--algorithm`/`importlib` are hard requirements the validator

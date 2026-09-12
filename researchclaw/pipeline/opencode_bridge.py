@@ -343,11 +343,34 @@ method or dataset.
 5. Use multi-seed evaluation (seeds 0, 1, 2) and report mean ± std.
 6. Each ablation/condition MUST be genuinely different — not a copy-paste with
    a renamed variable.
-7. Implement a time guard that never drops a condition ({time_budget_sec}
-   seconds total). The deadline belongs INSIDE one (condition, instance, seed)
-   run: give each run its own slice,
-   `per_run_budget = total_budget / n_runs`, and check it there. NEVER break out
-   of the loop over conditions — that silently discards every condition still to
+7. Budget every run by a COUNT, never by the clock ({time_budget_sec} seconds
+   total). The primary metric MUST be a deterministic function of (algorithm,
+   instance, seed): scoring the same combination twice must produce the same
+   number.
+
+   **NEVER read the clock inside an algorithm.** `time.time()`,
+   `time.perf_counter()` and `time.monotonic()` must NOT appear in
+   `algorithms/<algo>/<algo>.py` — not to bound a loop, not to decide when to
+   stop, and not even to measure duration. A loop that stops on elapsed time
+   does a different amount of work on a busy machine, so the same algorithm
+   scores differently on every run; such a metric cannot be optimised and the
+   run is rejected before it starts. If you want a runtime figure, measure it in
+   `main.py` around the call.
+
+       # RIGHT — same inputs, same result, every time
+       max_evals = int(instance["max_evals"])     # a number, not a duration
+       while evals < max_evals:
+           evals += 1
+
+       # WRONG — the amount of work, and so the score, depends on the clock
+       deadline = time.time() + budget
+       if time.time() > deadline:
+           break
+
+   A time guard in `main.py` is still required, but it must protect the whole
+   run without entering the algorithms: it may skip a whole (condition,
+   instance, seed) unit and record that it did, and it must NEVER break out of
+   the loop over conditions — that silently discards every condition still to
    come, and an experiment missing a baseline cannot be repaired downstream.
    Print each result as soon as it is computed, so stopping part-way still
    leaves the finished conditions on stdout. If you truly cannot run everything,

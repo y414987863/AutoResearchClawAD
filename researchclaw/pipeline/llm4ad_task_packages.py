@@ -33,6 +33,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1185,6 +1186,172 @@ def smoke_check_package(
     return ""
 
 
+def _run_streaming(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, Any],
+    timeout_sec: int,
+    stream_path: Path | None = None,
+    on_line: Any = None,
+) -> tuple[int, str, bool]:
+    """Run ``argv``, returning ``(returncode, full_output, timed_out)``.
+
+    Unlike ``subprocess.run(capture_output=True)`` — which buffers everything and
+    hands it back only after the process exits — this reads the child's output
+    line by line as it is produced, so the run can be watched while it is still
+    going. An LLM4AD evolution run takes tens of minutes, and "did it hang, or is
+    it thinking?" is otherwise unanswerable until the end.
+
+    Two details make the difference between this working and deadlocking:
+
+    * stdout and stderr are merged into ONE pipe (``stderr=STDOUT``) and read on
+      the calling thread. Reading two pipes from one thread deadlocks as soon as
+      one of them fills its 64 KB kernel buffer while the other is being drained.
+    * each line is written and flushed as it arrives. Without the flush the
+      Python-level buffer would hold the tail back, and ``tail -f`` would show
+      nothing — which is the whole point of streaming.
+
+    ``timeout_sec`` is enforced by a watchdog rather than by ``Popen.wait``:
+    reading the pipe blocks until the child closes it, so a child that hangs
+    without exiting would keep the reader parked forever and the timeout would
+    never be reached. The watchdog kills the tree at the deadline, which closes
+    the pipe and releases the reader.
+    """
+    import subprocess as _sp_stream
+    import threading
+    import time as _time_stream
+
+    proc = _sp_stream.Popen(
+        argv,
+        cwd=str(cwd),
+        stdout=_sp_stream.PIPE,
+        stderr=_sp_stream.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        bufsize=1,  # line-buffered, so a line arrives when it is written
+        # Own process group / session, so the whole tree can be signalled on
+        # timeout. Without it the child shares our group and killing the group
+        # would kill this process too.
+        start_new_session=(os.name == "posix"),
+    )
+
+    timed_out = False
+    _deadline = _time_stream.monotonic() + max(1, int(timeout_sec))
+
+    def _watchdog() -> None:
+        nonlocal timed_out
+        while True:
+            _remaining = _deadline - _time_stream.monotonic()
+            if _remaining <= 0:
+                break
+            if proc.poll() is not None:
+                return  # finished on its own; nothing to enforce
+            _time_stream.sleep(min(1.0, _remaining))
+        if proc.poll() is None:
+            timed_out = True
+            _kill_tree(proc)
+
+    _wd = threading.Thread(target=_watchdog, daemon=True)
+    _wd.start()
+
+    chunks: list[str] = []
+    fh = None
+    if stream_path is not None:
+        try:
+            stream_path.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(stream_path, "w", encoding="utf-8", errors="replace")
+        except OSError:
+            fh = None  # streaming is a convenience; never fail the run for it
+
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            chunks.append(line)
+            if fh is not None:
+                try:
+                    fh.write(line)
+                    fh.flush()
+                except (OSError, ValueError):
+                    fh = None
+            if on_line is not None:
+                try:
+                    on_line(line)
+                except Exception:  # noqa: BLE001 - a logger hiccup is not fatal
+                    pass
+    finally:
+        if fh is not None:
+            fh.close()
+
+    try:
+        proc.wait(timeout=30)
+    except _sp_stream.TimeoutExpired:
+        # The watchdog already tried to kill it; make sure it is gone.
+        _kill_tree(proc)
+        try:
+            proc.wait(timeout=10)
+        except _sp_stream.TimeoutExpired:
+            pass
+
+    return (proc.returncode if proc.returncode is not None else -1), "".join(chunks), timed_out
+
+
+#: A single llm4ad log line can be enormous — it echoes whole prompts, and one
+#: real run had a 6.5 KB line. Forwarded verbatim those swamp the pipeline log
+#: they are meant to illuminate, so long lines are truncated with a marker
+#: rather than dropped: the beginning is what identifies which step is running.
+_LLM4AD_LOG_LINE_MAX = 500
+
+
+def _forward_llm4ad_line(line: str) -> None:
+    """Echo one line of llm4ad's output into the pipeline log, as it arrives.
+
+    Evolution runs for tens of minutes. Without this the stage logs a single
+    "running LLM4AD evolution ..." line and then nothing until the subprocess
+    returns, which is indistinguishable from a hang — an operator watching a
+    live run reported exactly that, while llm4ad was in fact working and writing
+    artifacts. Same convention as the opencode bridge: one prefixed line per
+    child line, so the source is obvious in a combined log.
+    """
+    text = line.rstrip("\n")
+    if not text.strip():
+        return
+    if len(text) > _LLM4AD_LOG_LINE_MAX:
+        text = (
+            text[:_LLM4AD_LOG_LINE_MAX]
+            + f"... [{len(text) - _LLM4AD_LOG_LINE_MAX} more chars]"
+        )
+    logger.info("[llm4ad] %s", text)
+
+
+def _kill_tree(proc: Any) -> None:
+    """Terminate a subprocess and whatever it spawned.
+
+    llm4ad runs git and python children of its own; killing only the parent
+    would leave them holding the workspace, and a later cleanup then fails with
+    "directory not empty". On POSIX the group started by Popen is signalled;
+    elsewhere the parent alone is killed and a TaskKill reaches the tree.
+    """
+    import os as _os_kill
+    import subprocess as _sp_kill
+
+    try:
+        if _os_kill.name == "posix":
+            _os_kill.killpg(_os_kill.getpgid(proc.pid), 15)
+        else:
+            _sp_kill.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, check=False,
+            )
+    except Exception:  # noqa: BLE001 - best effort
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def run_evolution_on_packages(
     packages_dir: Path,
     llm4ad_cmd: str = "llm4ad",
@@ -1291,26 +1458,40 @@ def run_evolution_on_packages(
             )
             continue
         try:
-            proc = _sp.run(
+            # Stream rather than buffer: an evolution run takes tens of minutes,
+            # and the operator needs to see progress while it happens. The tee
+            # goes next to the package so it is findable from the artifacts
+            # (`tail -f <pkg>/runs/llm4ad_stream.log`), independently of where
+            # llm4ad chose to put its worktrees.
+            _stream_path = package_dir / "runs" / "llm4ad_stream.log"
+            _rc, log, _timed_out = _run_streaming(
                 [llm4ad_cmd, "run", "config.yaml"],
-                cwd=str(package_dir),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout_sec,
-                check=False,
+                cwd=package_dir,
                 env=base_env,
+                timeout_sec=timeout_sec,
+                stream_path=_stream_path,
+                # Forward to the pipeline log as it arrives. Without this the
+                # run is silent for its whole duration — the stage prints
+                # "running LLM4AD evolution" and then nothing until it returns,
+                # which reads exactly like a hang while llm4ad is in fact
+                # working (its artifacts do appear). Same convention as the
+                # opencode bridge: one prefixed line per child output line,
+                # blank lines dropped.
+                on_line=_forward_llm4ad_line,
             )
-            log = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+            if _timed_out:
+                log += (
+                    f"\n[WARNING] llm4ad exceeded its {timeout_sec}s budget and "
+                    f"was terminated; partial output is in {_stream_path}"
+                )
             tail = log[-2000:]
-            if proc.returncode != 0:
+            if _rc != 0:
                 results.append(
                     EvolutionResult(
                         algo=algo,
                         success=False,
                         error_message=(
-                            f"llm4ad run exited {proc.returncode}: "
+                            f"llm4ad run exited {_rc}: "
                             f"{tail[-300:]}"
                         ),
                         log_tail=tail,
