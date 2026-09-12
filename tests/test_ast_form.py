@@ -30,9 +30,65 @@ def test_shadowing_not_delegation():
     assert E('a.py', mk('    return {"a": helper(1)}\n'))
 
 
+def test_helper_defined_inside_the_markers_is_not_delegation():
+    """Only a helper OUTSIDE the markers hides the algorithm.
+
+    A module-level class/function that sits inside the marked region is part of
+    the evolvable unit: LLM4AD rewrites that whole region, so calling it is not
+    delegation. The reference task packages are laid out exactly this way — a
+    marker block containing a helper class *and* the function that uses it. The
+    old rule keyed on "is a module-level definition", which flagged a correct
+    `class _OptimizationTimeoutError(Exception)` inside the block and sent the
+    repair loop after working code.
+    """
+    inside = (
+        "# EVOLVE_START\n"
+        "class _Timeout(Exception):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "def optimize(instance, seed):\n"
+        "    raise _Timeout()\n"
+        "# EVOLVE_END\n"
+    )
+    assert not E('a.py', inside)
+
+    # Same file, but the helper now sits ABOVE the marker: frozen, unreachable,
+    # and genuinely a defect.
+    outside = (
+        "class _Timeout(Exception):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "# EVOLVE_START\n"
+        "def optimize(instance, seed):\n"
+        "    raise _Timeout()\n"
+        "# EVOLVE_END\n"
+    )
+    assert E('a.py', outside)
+
+
+def test_helper_inside_but_partially_outside_is_still_flagged():
+    """A helper straddling the boundary is only partly evolvable."""
+    straddling = (
+        "# EVOLVE_START\n"
+        "def optimize(instance, seed):\n"
+        "    return {'a': helper(1)}\n"
+        "# EVOLVE_END\n"
+        "\n"
+        "\n"
+        "def helper(x):\n"
+        "    return x\n"
+    )
+    assert E('a.py', straddling)
+
+
 def test_init_excluded_and_nonjson():
+    # The evaluator carries METRIC_DEF because the structure check requires a
+    # static direction declaration; this test is about `__init__.py` exclusion
+    # and non-JSON instances, so the fixture must otherwise be contract-clean.
     base = {"main.py": 'import importlib\nprimary_metric="x"\nif __name__ == "__main__":\n    pass\n# --algorithm\n',
-            "evaluator.py": 'PRIMARY_METRIC="m"\ndef evaluate_instance(instance, solve):\n    return {"m":1.0}\n'}
+            "evaluator.py": 'PRIMARY_METRIC="m"\nMETRIC_DEF={"primary_metric":PRIMARY_METRIC,"direction":"minimize"}\ndef evaluate_instance(instance, solve):\n    return {"m":1.0}\n'}
     files = dict(base); files["algorithms/a/__init__.py"] = ""
     files["algorithms/a/a.py"] = 'def optimize(i,s):\n    # EVOLVE_START\n    return {"z":i["d"]}\n    # EVOLVE_END\n'
     files["data/x.json"] = json.dumps({"d":2})

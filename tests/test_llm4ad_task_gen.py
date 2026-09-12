@@ -96,3 +96,48 @@ def test_generated_evaluator_uses_timeout_constant():
         l for l in ev_text.splitlines() if not l.strip().startswith("#")
     )
     assert 'cfg.timeout' not in code_only
+
+
+def test_algorithm_module_name_matches_its_directory():
+    """`solve.__module__` must report the algorithm's name, not a private alias.
+
+    A generated evaluator may identify the algorithm it is scoring from the
+    callable it was handed:
+
+        f"condition={solve.__module__.split('.')[-1]}"
+
+    Loading the file under a private alias (``_evolved_<algo>`` in run_single,
+    ``_cmp_<algo>`` in the promotion runner) made that expression yield the
+    alias, so the evaluator looked it up in its own table, raised
+    ``ValueError('Unknown algorithm: _cmp_listmle_lite')``, and every candidate
+    scored nothing — the fitness gate then skipped evolution entirely.
+    """
+    ev = '''
+PRIMARY_METRIC="m"
+def evaluate_instance(instance, solve):
+    # A real experiment does exactly this to label its output.
+    name = solve.__module__.split(".")[-1]
+    return {"m": float(len(instance["coords"])) if name == "nm" else -1.0}
+'''
+    exp = _build_exp(_ALGO, ev, {"i.json": '{"coords":[[0,0],[1,1]]}'})
+    r = _evaluate_pkg(exp, 'nm', 'i.json')
+    assert r.success, r
+    # -2.0 is the "name matched" branch; the old alias produced -1.0.
+    assert r.score == -2.0, f"__module__ did not report 'nm' (score={r.score})"
+
+
+def test_comparison_runner_loads_under_the_real_name():
+    """The promotion scorer must agree with run_single about the module name."""
+    import importlib.util as _ilu
+
+    from researchclaw.pipeline.llm4ad_utils.comparison_runner import _load_optimize
+
+    tmp = Path(tempfile.mkdtemp())
+    algo = tmp / 'my_algo.py'
+    algo.write_text('def optimize(i, s):\n    return {"v": 1.0}\n', encoding='utf-8')
+    try:
+        fn = _load_optimize(algo, 'my_algo')
+        assert fn.__module__ == 'my_algo', fn.__module__
+    finally:
+        import sys as _sys
+        _sys.modules.pop('my_algo', None)

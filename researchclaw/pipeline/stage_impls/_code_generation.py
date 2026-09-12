@@ -503,10 +503,22 @@ def _evolve_block_problems(path: str, code: str) -> list[str]:
             "whole function is the evolvable unit."
         )
 
+    # Only a helper defined OUTSIDE the markers can hide the algorithm: its body
+    # is then frozen and evolution cannot reach it. A module-level class or
+    # function that sits inside the marked region is part of the evolvable unit
+    # and is rewritten along with `optimize`, so calling it is not delegation —
+    # the reference task packages are laid out exactly that way (a
+    # `# EVOLVE_START` block containing a helper class *and* the function that
+    # uses it). Keying on "is a module-level definition" alone flagged those as
+    # broken and sent the repair loop after correct code.
     helpers = {
         n.name for n in tree.body
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
         and n.name != "optimize"
+        and not (
+            start_line <= n.lineno
+            and (n.end_lineno or n.lineno) <= end_line
+        )
     }
     if helpers:
         # A name bound inside `optimize` is a LOCAL that shadows the module-level
@@ -2603,11 +2615,23 @@ def _execute_code_generation(
                 max_tokens=_code_max_tokens,
             )
             repaired = _extract_multi_file_blocks(repair_resp.content)
+            _dr_prev = dict(files)  # pre-repair copy (marker provenance)
             files, _known = _merge_repaired_files(
                 files, repaired, label="deep repair"
             )
-            if _known:
-                for fname, code in _known.items():
+            # Same marker guard as the OpenCode and smoke-fix paths. A deep
+            # repair rewrites whole files to fix structural defects, which is
+            # exactly when a model drops the `# EVOLVE_START` / `# EVOLVE_END`
+            # pair; without this the algorithm silently becomes non-evolvable
+            # and the evolution stage produces nothing.
+            _dr_reverted = _revert_marker_dropped_files(
+                _dr_prev, _known, label="deep repair",
+            )
+            for _fn in _dr_reverted:
+                files[_fn] = _dr_prev[_fn]  # restore marker-bearing original
+            if _known or _dr_reverted:
+                for fname in dict.fromkeys(list(_known) + _dr_reverted):
+                    code = files[fname]
                     _wp = exp_dir / fname
                     _wp.parent.mkdir(parents=True, exist_ok=True)
                     _wp.write_text(code, encoding="utf-8")
@@ -2756,14 +2780,23 @@ def _execute_code_generation(
                         )
                         fixed_files = _extract_multi_file_blocks(fix_resp.content)
                         # Partial reply is normal — see deep-repair note above.
+                        _rf_prev = dict(files)  # pre-repair copy (marker provenance)
                         files, _fx = _merge_repaired_files(
                             files, fixed_files, label="review-fix"
                         )
-                        if _fx:
-                            for fname, code in _fx.items():
+                        # Same marker guard as the OpenCode/smoke-fix/deep-repair
+                        # paths: a review-driven rewrite must not strip the
+                        # EVOLVE pair, or the algorithm stops being evolvable.
+                        _rf_reverted = _revert_marker_dropped_files(
+                            _rf_prev, _fx, label="review-fix",
+                        )
+                        for _fn in _rf_reverted:
+                            files[_fn] = _rf_prev[_fn]
+                        if _fx or _rf_reverted:
+                            for fname in dict.fromkeys(list(_fx) + _rf_reverted):
                                 _wp = exp_dir / fname
                                 _wp.parent.mkdir(parents=True, exist_ok=True)
-                                _wp.write_text(code, encoding="utf-8")
+                                _wp.write_text(files[fname], encoding="utf-8")
                             logger.info(
                                 "Stage 10: Code fixed after review "
                                 "(was %d/10, %d critical issues)",

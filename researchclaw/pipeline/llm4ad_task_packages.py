@@ -335,11 +335,24 @@ def _write_run_single(algo: str, package: Path, primary_metric: str) -> None:
         "\n"
         "def _load_optimize(path):\n"
         "    import importlib.util\n"
-        '    spec = importlib.util.spec_from_file_location(f"_evolved_{ALGO}", str(path))\n'
+        "    # Load under the ALGORITHM's real name, and register it, so the\n"
+        "    # callable reports the right __module__. A generated evaluator may\n"
+        "    # identify the algorithm it is scoring via solve.__module__, and a\n"
+        "    # private alias made that lookup fail with\n"
+        "    # ValueError('Unknown algorithm: ...') — every candidate then scored\n"
+        "    # nothing and evolution was skipped. The file is still loaded by path,\n"
+        "    # so the worktree never joins sys.path and cannot shadow a fixed\n"
+        "    # module; sys.modules here is private to this run's subprocess.\n"
+        "    spec = importlib.util.spec_from_file_location(ALGO, str(path))\n"
         "    if spec is None or spec.loader is None:\n"
         '        raise RuntimeError(f"cannot load algorithm from {path}")\n'
         "    mod = importlib.util.module_from_spec(spec)\n"
-        "    spec.loader.exec_module(mod)\n"
+        "    sys.modules[ALGO] = mod\n"
+        "    try:\n"
+        "        spec.loader.exec_module(mod)\n"
+        "    except BaseException:\n"
+        "        sys.modules.pop(ALGO, None)\n"
+        "        raise\n"
         '    fn = getattr(mod, "optimize", None)\n'
         "    if fn is None:\n"
         '        raise RuntimeError(f"{path.name} has no optimize(instance, seed) function")\n'

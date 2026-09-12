@@ -8,6 +8,7 @@ enabling automated repair via LLM re-generation.
 from __future__ import annotations
 
 import ast
+import builtins as _builtins
 import sys
 from dataclasses import dataclass, field
 from typing import Any
@@ -1051,7 +1052,14 @@ def check_undefined_calls(code: str, fname: str = "main.py") -> list[str]:
     except SyntaxError:
         return warnings
 
-    # Common builtins that are always available
+    # Common builtins that are always available.
+    #
+    # The exception classes come from the interpreter rather than being typed
+    # out: a hand-written list is always incomplete, and every omission is a
+    # false positive that sends the repair loop after correct code. `raise
+    # FloatingPointError(...)` was reported as "Call to undefined function" for
+    # exactly that reason — 38 builtin exceptions were missing, among them
+    # NameError, TimeoutError, PermissionError and ConnectionError.
     builtins = {
         "print", "len", "range", "enumerate", "zip", "map", "filter", "sorted",
         "list", "dict", "set", "tuple", "str", "int", "float", "bool", "bytes",
@@ -1060,17 +1068,16 @@ def check_undefined_calls(code: str, fname: str = "main.py") -> list[str]:
         "property", "staticmethod", "classmethod", "abs", "all", "any", "bin",
         "chr", "ord", "hex", "oct", "pow", "round", "sum", "min", "max", "open",
         "input", "repr", "hash", "id", "dir", "vars", "globals", "locals",
-        "format", "ascii", "object", "Exception", "ValueError", "TypeError",
-        "KeyError", "IndexError", "AttributeError", "RuntimeError", "StopIteration",
-        "NotImplementedError", "AssertionError", "ImportError", "FileNotFoundError",
-        "OSError", "IOError", "ZeroDivisionError", "OverflowError", "MemoryError",
-        "RecursionError", "SystemExit", "KeyboardInterrupt", "GeneratorExit",
-        "BaseException", "Warning", "DeprecationWarning", "UserWarning",
-        "FutureWarning", "PendingDeprecationWarning", "SyntaxWarning",
-        "RuntimeWarning", "ResourceWarning", "BytesWarning", "UnicodeWarning",
+        "format", "ascii", "object",
         "breakpoint", "memoryview", "bytearray", "frozenset", "complex",
         "divmod", "eval", "exec", "compile", "__import__", "help", "exit", "quit",
     }
+    # Every builtin exception/warning class this interpreter defines.
+    builtins.update(
+        _n for _n in dir(_builtins)
+        if isinstance(getattr(_builtins, _n, None), type)
+        and issubclass(getattr(_builtins, _n), BaseException)
+    )
 
     # Collect all defined names in the module
     defined_names: set[str] = set()

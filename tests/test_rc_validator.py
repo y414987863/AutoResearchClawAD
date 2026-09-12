@@ -603,3 +603,87 @@ def test_revert_marker_dropped_files_keeps_neutral_fix():
     assert "EVOLVE_START" in files["algorithms/a/a.py"]
     # b never had markers -> the neutral fix is preserved
     assert "i*2" in files["algorithms/b/b.py"]
+
+
+def test_every_repair_channel_reverts_dropped_markers():
+    """Every `_merge_repaired_files` call site must be paired with the guard.
+
+    Stage 10 rewrites project files through four LLM repair channels (deep
+    repair, review-fix, OpenCode repair, smoke fix). Each one hands the model the
+    current code and merges back whatever it returns — so each one can also drop
+    the `# EVOLVE_START` / `# EVOLVE_END` pair, which makes the algorithm
+    non-evolvable and silently wastes the evolution stage.
+
+    Two of the four were missing this guard. One real run had the model write all
+    four algorithms correctly, markers included, and verify them itself — then a
+    repair pass rewrote the files without the markers, and Stage 13's analysis
+    found zero evolvable blocks.
+
+    The channels are inline inside `_execute_code_generation`, so their behaviour
+    is not reachable from a unit test; this checks the invariant that must hold
+    for each, which is what regressed.
+    """
+    import inspect
+
+    from researchclaw.pipeline.stage_impls import _code_generation as cg
+
+    src = inspect.getsource(cg._execute_code_generation)
+    lines = src.splitlines()
+
+    merges = [i for i, ln in enumerate(lines) if "_merge_repaired_files(" in ln]
+    assert merges, "expected the repair channels to call _merge_repaired_files"
+
+    for i in merges:
+        # The guard is invoked a few lines after the merge, within the same
+        # block. A channel that merges but never reverts is the bug.
+        window = "\n".join(lines[i:i + 25])
+        assert "_revert_marker_dropped_files(" in window, (
+            "repair channel at line %d merges repaired files without reverting "
+            "dropped EVOLVE markers:\n%s" % (i, lines[i].strip())
+        )
+
+
+def test_builtin_exceptions_are_not_undefined_functions():
+    """`raise FloatingPointError(...)` must not read as an undefined function.
+
+    The undefined-call check kept its own hardcoded list of "common builtins",
+    and the exception classes in it were incomplete — 38 builtin exceptions were
+    missing, including FloatingPointError, NameError, TimeoutError and
+    PermissionError. Every omission turned correct `raise`/`except` code into a
+    "Call to undefined function" warning, which is a repair-loop trigger: one
+    real Stage-10 run was flagged for `raise FloatingPointError(...)` and spent a
+    deep-repair round on code that was already right.
+
+    The list now comes from the interpreter, so it cannot drift again.
+    """
+    from researchclaw.experiment.validator import deep_validate_files
+
+    code = (
+        "import numpy as np\n"
+        "def evaluate_instance(instance, solve):\n"
+        "    try:\n"
+        "        w = np.asarray(solve(instance, 0)['w'], dtype=np.float64)\n"
+        "        if not np.all(np.isfinite(w)):\n"
+        "            raise FloatingPointError('non-finite')\n"
+        "    except FloatingPointError:\n"
+        "        pass\n"
+        "    except (TimeoutError, PermissionError, NameError,\n"
+        "            ArithmeticError, ConnectionError, LookupError):\n"
+        "        pass\n"
+        "    return {'m': 1.0}\n"
+    )
+    warnings = deep_validate_files({"evaluator.py": code})
+    flagged = [w for w in warnings if "undefined function" in w.lower()]
+    assert not flagged, flagged
+
+
+def test_a_genuinely_undefined_call_is_still_reported():
+    """Widening the builtin set must not disable the check itself."""
+    from researchclaw.experiment.validator import deep_validate_files
+
+    code = (
+        "def evaluate_instance(instance, solve):\n"
+        "    return {'m': genuinely_undefined_fn(1)}\n"
+    )
+    warnings = deep_validate_files({"evaluator.py": code})
+    assert any("undefined function" in w.lower() for w in warnings), warnings
