@@ -2007,14 +2007,30 @@ def _execute_iterative_refine(
         user_prompt = ip.user + _saturation_hint
         if prior_timed_out and baseline_metric is None:
             timeout_refine_attempts += 1
+            # Shrink the COMPUTE, not the comparison. The previous wording told
+            # the model to "remove conditions that are not essential" and to
+            # "add time.time() checks to stop gracefully" — i.e. exactly the two
+            # edits that silently destroy a controlled comparison: a dropped
+            # condition (one run lost its only tuned baseline this way, and the
+            # plan had named it) and a loop that abandons every remaining
+            # condition once the clock runs out. `iterative_improve` already
+            # forbids renaming/removing conditions; this hint used to contradict
+            # it, and the hint is what the model saw last.
             timeout_hint = (
                 f"\n\nCRITICAL: The experiment TIMED OUT after {prior_time_budget}s "
-                f"with NO results. You MUST drastically reduce the experiment scale:\n"
-                f"- Reduce total runs to ≤50\n"
-                f"- Reduce steps per run to ≤2000\n"
-                f"- Remove conditions that are not essential\n"
-                f"- Add time.time() checks to stop gracefully before timeout\n"
-                f"- Print intermediate metrics frequently so partial data is captured\n"
+                f"with NO results. Cut the COST of each run — never the condition\n"
+                f"list. Every condition named in the plan MUST still appear:\n"
+                f"- Keep ALL conditions from the experiment plan. Do NOT remove any:\n"
+                f"  a missing condition is a missing baseline, and the comparison\n"
+                f"  cannot be recovered downstream.\n"
+                f"- Reduce work per condition instead: fewer steps per run (≤2000),\n"
+                f"  smaller batches/instances, fewer epochs.\n"
+                f"- Give each (condition, instance, seed) run its OWN time slice, e.g.\n"
+                f"  per_run_budget = budget / (n_conditions * n_instances * n_seeds),\n"
+                f"  and check the deadline INSIDE a run. Never break out of the\n"
+                f"  condition loop — that drops every condition still to come.\n"
+                f"- Print each result the moment it is computed, so a stop still\n"
+                f"  leaves completed conditions on stdout.\n"
                 f"- Time budget is {prior_time_budget}s — design for ≤{int(prior_time_budget * 0.7)}s\n"
             )
             user_prompt = user_prompt + timeout_hint
