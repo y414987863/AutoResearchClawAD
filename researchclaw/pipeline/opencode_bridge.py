@@ -364,13 +364,27 @@ method or dataset.
     smaller values are better. Stage validation will reject the code if METRIC_DEF
     is missing — this is NOT optional.
 
+    `main.py` must ALSO satisfy this contract, and it is checked just as strictly.
+    A later stage loads ONE algorithm at a time and runs it through
+    `evaluator.evaluate_instance` — it never calls `main()` — so `main.py` must be
+    able to run a single algorithm on its own. It must contain:
+    - a `--algorithm <name>` CLI argument selecting one condition by name;
+    - dynamic loading of that algorithm via `importlib` (not a hardcoded
+      `from algorithms.x import y`), so a new variant can be swapped in by path;
+    - a printed metric line `<metric>: <value>`;
+    - an `if __name__ == "__main__":` guard.
+    Add `--instance <path>` too when instances exist, so one instance can be
+    selected the same way. This is the ONE place CLI arguments are required —
+    see Constraints.
+
 ## Constraints
 
 - The code runs in an isolated container. `GUIDANCE.md` lists exactly which
   packages are available and is AUTHORITATIVE: where it and this file disagree,
   `GUIDANCE.md` wins.
-- Do NOT use argparse or CLI arguments — hardcode all configuration, UNLESS
-  `GUIDANCE.md` explicitly requires a CLI flag (e.g. an `--algorithm` selector).
+- Do NOT add CLI arguments or configuration flags beyond the `--algorithm` /
+  `--instance` selectors required by requirement 10 — hardcode everything else.
+  Those two are required, not optional; everything besides them is not wanted.
 - All results must go to stdout via print statements.
 - Keep the experiment feasible within {time_budget_sec} seconds total.
 

@@ -220,6 +220,29 @@ def _is_llm4ad_enabled(config: Any) -> bool:
         return False
 
 
+def _topic_is_ml_domain(config: Any) -> bool:
+    """True when the configured topic resolves to an ML/AI domain.
+
+    Used to decide whether dataset-specific guidance applies — an ML experiment
+    may need the image datasets the image ships, a numerical or physical one does
+    not. Detection is delegated to the shared domain detector so this stays in
+    step with every other stage instead of growing its own keyword list.
+
+    Defaults to False on any failure: withholding dataset advice is recoverable
+    (the model can still write a working experiment), while injecting the wrong
+    advice actively misdirects it.
+    """
+    try:
+        from researchclaw.domains.detector import detect_domain, is_ml_domain
+
+        topic = getattr(getattr(config, "research", None), "topic", "") or ""
+        if not topic:
+            return False
+        return bool(is_ml_domain(detect_domain(topic=topic)))
+    except Exception:  # noqa: BLE001 - advisory classification
+        return False
+
+
 def _llm4ad_constraint_text(config: Any) -> str:
     """LLM4AD structure-constraint snippet, single source of truth.
 
@@ -1505,7 +1528,19 @@ def _execute_code_generation(
                     f"- Avoid large batch sizes\n"
                 )
         else:
-            pkg_hint = _pm.block("pkg_hint_sandbox")
+            # No GPU: the package list comes from config, not from a prompt
+            # constant. `experiment.sandbox.allowed_imports` is what the sandbox
+            # actually enforces, so rendering the hint from it is the only way
+            # the model and the runtime can agree. The two used to be separate
+            # hardcoded lists that contradicted each other.
+            from researchclaw.prompts.shared import render_package_hint
+
+            _allowed = getattr(
+                getattr(config.experiment, "sandbox", None), "allowed_imports", (),
+            )
+            pkg_hint = _pm.block(
+                "pkg_hint_sandbox", packages=render_package_hint(_allowed),
+            )
     else:
         pkg_hint = ""
 
@@ -1533,9 +1568,15 @@ def _execute_code_generation(
             else "none"  # sandbox mode has no network
         )
         if _net_policy == "none":
-            # Network disabled: inject strict offline-only guidance
+            # Network disabled: inject strict offline-only guidance.
             try:
                 extra_guidance += _pm.block("network_disabled_guidance")
+                # The pre-cached image datasets are useful only to a domain that
+                # consumes them. Appending them unconditionally told a numerical
+                # optimization study to prefer CIFAR-10, which is off-topic noise
+                # that competes with the actual method for the model's attention.
+                if _topic_is_ml_domain(config):
+                    extra_guidance += _pm.block("ml_offline_datasets")
             except Exception:  # noqa: BLE001
                 pass
         elif _net_policy == "full":

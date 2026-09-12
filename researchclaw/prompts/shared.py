@@ -200,12 +200,19 @@ _DEFAULT_BLOCKS: dict[str, str] = {
         "not environment status.\n"
         "=== END CONSTRAINT ===\n"
     ),
+    # The package list itself is NOT hardcoded here. It is rendered from
+    # `experiment.sandbox.allowed_imports` (see `render_package_hint`) so that
+    # config is the single source of truth. Hardcoding it produced a prompt that
+    # contradicted itself: this block said "ONLY numpy and stdlib, do NOT use
+    # scipy", while `network_disabled_guidance` — appended to the same GUIDANCE.md
+    # — listed scipy as pre-installed. The generated code then contained both
+    # variants of every algorithm.
     "pkg_hint_sandbox": (
-        "\nAVAILABLE PACKAGES (sandbox mode): Python stdlib, numpy, math, random, "
-        "statistics, json.\n"
-        "Do NOT use: torch, tensorflow, jax, sklearn, pandas, scipy, matplotlib, "
-        "or any deep learning framework.\n"
-        "Write the experiment using ONLY numpy and stdlib.\n"
+        "\nAVAILABLE PACKAGES (sandbox mode): {packages}.\n"
+        "Do NOT import anything outside this list.\n"
+        "Do NOT use GPU or deep-learning frameworks (torch, tensorflow, jax) — "
+        "there is no GPU available, and they are not installed.\n"
+        "Write the experiment using only the packages above.\n"
     ),
     "dataset_guidance": (
         "\n## Standard Datasets & Real Baselines (MANDATORY when applicable)\n"
@@ -324,30 +331,41 @@ _DEFAULT_BLOCKS: dict[str, str] = {
         "You may also include a `requirements.txt` file listing any additional "
         "pip packages your experiment needs beyond the pre-installed set.\n"
     ),
+    # Network-off guidance, deliberately domain-neutral. This block used to end
+    # with a hardcoded list of torchvision datasets AND a hardcoded
+    # "pre-installed packages" list — which both contradicted `pkg_hint_sandbox`
+    # and injected deep-learning advice into domains that have no datasets at all
+    # (a numerical-optimization experiment was told to prefer CIFAR-10). The
+    # dataset half now lives in `ml_offline_datasets`, injected only for ML
+    # domains; the package list is rendered from config (see
+    # `render_package_hint`). No network is a fact about the environment, so what
+    # is left here applies to every domain.
     "network_disabled_guidance": (
-        "\n## ⚠️ NO NETWORK ACCESS — CRITICAL CONSTRAINT ⚠️\n"
-        "This experiment runs with network_policy='none'. There is NO network access\n"
-        "at ANY phase (no pip install, no dataset downloads, no HTTP requests).\n\n"
-        "### ONLY these pre-cached datasets are available:\n"
+        "\n## NO NETWORK ACCESS — CRITICAL CONSTRAINT\n"
+        "This experiment runs with network_policy='none'. There is NO network "
+        "access at ANY phase (no pip install, no dataset downloads, no HTTP "
+        "requests).\n\n"
+        "### FORBIDDEN (will cause runtime failure):\n"
+        "- Do NOT create setup.py (it cannot run without network)\n"
+        "- Do NOT create requirements.txt (pip install is unavailable)\n"
+        "- Do NOT use `urllib`, `requests`, `httpx`, or any HTTP library\n"
+        "- Do NOT download anything, or set `download=True` anywhere\n"
+        "- Do NOT import packages that are not in the AVAILABLE PACKAGES list\n"
+    ),
+    # ML-only: the offline image ships image/vision datasets, which is useful
+    # only when the experiment consumes them. Injecting this into, say, an
+    # optimization study adds noise and nudges the model toward an unrelated
+    # dataset.
+    "ml_offline_datasets": (
+        "\n### Pre-cached datasets (ML domains only, use download=False):\n"
         "- `torchvision.datasets.CIFAR10(root='/opt/datasets', train=True/False, download=False)`\n"
         "- `torchvision.datasets.CIFAR100(root='/opt/datasets', train=True/False, download=False)`\n"
         "- `torchvision.datasets.MNIST(root='/opt/datasets', train=True/False, download=False)`\n"
         "- `torchvision.datasets.FashionMNIST(root='/opt/datasets', train=True/False, download=False)`\n"
         "- `torchvision.datasets.STL10(root='/opt/datasets', split='train'/'test', download=False)`\n"
-        "- `torchvision.datasets.SVHN(root='/opt/datasets', split='train'/'test', download=False)`\n\n"
-        "### FORBIDDEN (will cause runtime failure):\n"
-        "- Do NOT create setup.py (it cannot run without network)\n"
-        "- Do NOT create requirements.txt (pip install is unavailable)\n"
-        "- Do NOT use `download=True` on any dataset\n"
-        "- Do NOT use `urllib`, `requests`, `httpx`, or any HTTP library\n"
-        "- Do NOT use `datasets.load_dataset()` from HuggingFace (requires download)\n"
-        "- Do NOT import packages not pre-installed in the Docker image\n\n"
-        "### Available pre-installed packages:\n"
-        "torch, torchvision, torchaudio, numpy, scipy, sklearn, matplotlib, seaborn,\n"
-        "pandas, tqdm, gymnasium, networkx, PyYAML, Pillow, timm, einops, torchmetrics,\n"
-        "h5py, transformers, datasets, accelerate, peft, bitsandbytes.\n\n"
-        "If your research topic requires a dataset NOT in the pre-cached list,\n"
-        "you MUST adapt to use one of the 6 pre-cached datasets instead.\n"
+        "- `torchvision.datasets.SVHN(root='/opt/datasets', split='train'/'test', download=False)`\n"
+        "If your topic needs a dataset outside this list, adapt to one of these "
+        "instead.\n"
     ),
     "network_full_guidance": (
         "\n## Network Access: Full\n"
@@ -1083,6 +1101,54 @@ _DEFAULT_BLOCKS: dict[str, str] = {
         "from the Results section. Violation of this rule will result in desk rejection.\n"
     ),
 }
+
+# -- Package hint ---------------------------------------------------------
+
+#: Importable names that are part of Python itself. Listed separately from the
+#: config-declared packages so the rendered hint can say "Python stdlib, …"
+#: without the caller having to pre-split its own allow-list.
+_STDLIB_IMPORTS: frozenset[str] = frozenset({
+    "collections", "csv", "dataclasses", "functools", "itertools", "json",
+    "math", "os", "pathlib", "random", "re", "statistics", "sys", "time",
+    "typing", "warnings", "copy", "abc", "enum", "fractions", "decimal",
+    "heapq", "bisect", "string", "textwrap", "datetime", "hashlib",
+    "subprocess", "tempfile", "shutil", "pickle", "gzip", "zipfile",
+})
+
+
+def render_package_hint(allowed_imports: Any) -> str:
+    """Build the AVAILABLE PACKAGES line from the configured allow-list.
+
+    The allow-list in config is the single source of truth for what the sandbox
+    will actually have. Rendering the hint from it is what keeps the prompt
+    consistent with the environment: when the list was hardcoded in two
+    different places, the two copies disagreed (one forbade `scipy`, the other
+    advertised it as pre-installed) and the generated experiment shipped both
+    variants of every algorithm.
+
+    Order follows the config so the rendered text is stable run to run. Stdlib
+    names are folded into the leading "Python stdlib" phrase; everything else is
+    listed explicitly. An empty/absent list falls back to the stdlib phrase
+    alone, which is what a restrictive sandbox would really offer.
+    """
+    try:
+        declared = [str(p).strip() for p in (allowed_imports or []) if str(p).strip()]
+    except TypeError:
+        declared = []
+    # Preserve config order, drop duplicates.
+    seen: set[str] = set()
+    ordered = [p for p in declared if not (p in seen or seen.add(p))]
+
+    stdlib = [p for p in ordered if p in _STDLIB_IMPORTS]
+    third_party = [p for p in ordered if p not in _STDLIB_IMPORTS]
+
+    # `math`/`json`/… are importable whatever the config says — the allow-list
+    # governs packages, not the interpreter — so the phrase is always present.
+    parts: list[str] = ["Python stdlib"]
+    if third_party:
+        parts.append(", ".join(third_party))
+    return ", ".join(parts)
+
 
 # -- Sub-prompts (secondary LLM calls within a stage) --------------------
 

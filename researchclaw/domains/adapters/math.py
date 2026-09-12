@@ -14,19 +14,46 @@ class MathPromptAdapter(PromptAdapter):
         domain = self.domain
         paradigm = domain.experiment_paradigm
 
+        # The optimization sub-domain has no datasets — an optimizer is
+        # evaluated on synthetic objective functions, not on loaded data — so
+        # the generic numerical advice ("ODE: Lotka-Volterra", "Quadrature:
+        # singular integrands") describes the wrong experiment. It was reaching
+        # an optimization run and competing with the actual method for the
+        # model's attention, so the split here mirrors the one already made in
+        # `get_experiment_design_blocks` for the same pair of domains.
+        if domain.domain_id == "mathematics_optimization":
+            default_dataset_guidance = (
+                "No external dataset is needed — an optimizer is evaluated on "
+                "objective functions defined in code.\n"
+                "- Use standard benchmark functions with known global optima "
+                "(e.g. Sphere, Rosenbrock, Rastrigin, Ackley) so results can be "
+                "checked against ground truth.\n"
+                "- Define them in the project, parameterised by dimension and "
+                "bounds; do NOT download anything.\n"
+                "- Keep the function set small (2-4) so every condition is "
+                "evaluated on the same problems."
+            )
+        elif domain.domain_id == "mathematics_numerical":
+            default_dataset_guidance = (
+                "Use standard test problems with known solutions:\n"
+                "- ODE: Lotka-Volterra, Van der Pol, stiff systems\n"
+                "- Quadrature: smooth, oscillatory, singular integrands\n"
+                "- Linear algebra: Hilbert matrix, tridiagonal\n"
+                "- Do NOT download external datasets"
+            )
+        else:
+            default_dataset_guidance = (
+                "Use standard test problems with known solutions, defined in "
+                "code. Do NOT download external datasets."
+            )
+
         return PromptBlocks(
             compute_budget=domain.compute_budget_guidance or (
                 "Numerical methods are typically fast.\n"
                 "Use 5-8 refinement levels for convergence plots.\n"
                 "Step sizes: geometric sequence (h, h/2, h/4, ...)"
             ),
-            dataset_guidance=domain.dataset_guidance or (
-                "Use standard test problems with known solutions:\n"
-                "- ODE: Lotka-Volterra, Van der Pol, stiff systems\n"
-                "- Quadrature: smooth, oscillatory, singular integrands\n"
-                "- Linear algebra: Hilbert matrix, tridiagonal\n"
-                "- Do NOT download external datasets"
-            ),
+            dataset_guidance=domain.dataset_guidance or default_dataset_guidance,
             code_generation_hints=domain.code_generation_hints or self._hints(paradigm),
             output_format_guidance=self._output_format(paradigm),
         )
