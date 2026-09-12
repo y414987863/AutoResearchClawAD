@@ -343,8 +343,38 @@ method or dataset.
 5. Use multi-seed evaluation (seeds 0, 1, 2) and report mean ± std.
 6. Each ablation/condition MUST be genuinely different — not a copy-paste with
    a renamed variable.
-7. Implement a time guard: stop gracefully at 80% of the time budget
-   ({time_budget_sec} seconds).
+7. Budget every run by a COUNT, never by the clock ({time_budget_sec} seconds
+   total). The primary metric MUST be a deterministic function of (algorithm,
+   instance, seed): scoring the same combination twice must produce the same
+   number.
+
+   **NEVER read the clock inside an algorithm.** `time.time()`,
+   `time.perf_counter()` and `time.monotonic()` must NOT appear in
+   `algorithms/<algo>/<algo>.py` — not to bound a loop, not to decide when to
+   stop, and not even to measure duration. A loop that stops on elapsed time
+   does a different amount of work on a busy machine, so the same algorithm
+   scores differently on every run; such a metric cannot be optimised and the
+   run is rejected before it starts. If you want a runtime figure, measure it in
+   `main.py` around the call.
+
+       # RIGHT — same inputs, same result, every time
+       max_evals = int(instance["max_evals"])     # a number, not a duration
+       while evals < max_evals:
+           evals += 1
+
+       # WRONG — the amount of work, and so the score, depends on the clock
+       deadline = time.time() + budget
+       if time.time() > deadline:
+           break
+
+   A time guard in `main.py` is still required, but it must protect the whole
+   run without entering the algorithms: it may skip a whole (condition,
+   instance, seed) unit and record that it did, and it must NEVER break out of
+   the loop over conditions — that silently discards every condition still to
+   come, and an experiment missing a baseline cannot be repaired downstream.
+   Print each result as soon as it is computed, so stopping part-way still
+   leaves the finished conditions on stdout. If you truly cannot run everything,
+   first print `SKIPPED_CONDITIONS: <names>` naming what did not run.
 8. Write `requirements.txt` listing any extra pip packages needed — UNLESS
    `GUIDANCE.md` forbids it (offline runs cannot pip install; then use only the
    preinstalled packages it lists).
@@ -364,13 +394,27 @@ method or dataset.
     smaller values are better. Stage validation will reject the code if METRIC_DEF
     is missing — this is NOT optional.
 
+    `main.py` must ALSO satisfy this contract, and it is checked just as strictly.
+    A later stage loads ONE algorithm at a time and runs it through
+    `evaluator.evaluate_instance` — it never calls `main()` — so `main.py` must be
+    able to run a single algorithm on its own. It must contain:
+    - a `--algorithm <name>` CLI argument selecting one condition by name;
+    - dynamic loading of that algorithm via `importlib` (not a hardcoded
+      `from algorithms.x import y`), so a new variant can be swapped in by path;
+    - a printed metric line `<metric>: <value>`;
+    - an `if __name__ == "__main__":` guard.
+    Add `--instance <path>` too when instances exist, so one instance can be
+    selected the same way. This is the ONE place CLI arguments are required —
+    see Constraints.
+
 ## Constraints
 
 - The code runs in an isolated container. `GUIDANCE.md` lists exactly which
   packages are available and is AUTHORITATIVE: where it and this file disagree,
   `GUIDANCE.md` wins.
-- Do NOT use argparse or CLI arguments — hardcode all configuration, UNLESS
-  `GUIDANCE.md` explicitly requires a CLI flag (e.g. an `--algorithm` selector).
+- Do NOT add CLI arguments or configuration flags beyond the `--algorithm` /
+  `--instance` selectors required by requirement 10 — hardcode everything else.
+  Those two are required, not optional; everything besides them is not wanted.
 - All results must go to stdout via print statements.
 - Keep the experiment feasible within {time_budget_sec} seconds total.
 
@@ -407,7 +451,114 @@ downstream will fix it for you.
 3. Read the output. It must exit 0 and print a finite `{metric}`. A traceback,
    a `nan`/`inf`, or a missing metric means the task is NOT done.
 
-4. Fix whatever you find and run it again. Repeat until it passes.
+   A passing default run is necessary but NOT sufficient — see step 4.
+
+4. **Structural self-check — run it yourself, before reporting done.**
+
+   These defects let `main.py` pass while the experiment is unusable for what
+   happens next: a separate harness loads ONE algorithm at a time through
+   `evaluator.evaluate_instance` and evolves it. Code that runs as a whole but
+   carries none of the markers below evolves into nothing, silently — the run
+   completes, reports no score, and all the compute is wasted.
+
+   Check each item against your own files. Where a command is given, RUN it:
+
+   a. **Every algorithm module is evolvable.** For each `algorithms/<algo>/<algo>.py`:
+
+      ```bash
+      "{python}" -c "import ast,sys; p=sys.argv[1]; s=open(p).read(); \
+      assert '# EVOLVE_START' in s and '# EVOLVE_END' in s, 'missing EVOLVE markers'; \
+      t=ast.parse(s); f=[n for n in ast.walk(t) if isinstance(n,ast.FunctionDef) and n.name=='optimize']; \
+      assert f, 'no optimize() function'; \
+      lo=s[:s.index('# EVOLVE_START')].count(chr(10))+1; hi=s[:s.index('# EVOLVE_END')].count(chr(10))+1; \
+      outside=[n for n in f[0].body if n.lineno<lo or (n.end_lineno or n.lineno)>hi]; \
+      assert not outside, f'{len(outside)} statement(s) of optimize lie outside the markers'; \
+      print('OK', p)" algorithms/<algo>/<algo>.py
+      ```
+
+      The markers must enclose the ENTIRE `optimize` function — its `def` line
+      through its final `return`. A marker pair around only part of the body, or
+      around nothing but a helper call, is a failure: then only that fragment is
+      evolvable and the algorithm cannot be improved.
+
+   b. **`optimize` is self-contained.** If its body calls a function or class
+      defined ELSEWHERE in the same file, that logic is outside the evolvable
+      region. Inline it between the markers. If it is genuinely shared by several
+      algorithms, move it to a module at the experiment root and import it.
+
+   c. **Each algorithm can be loaded and run on ONE instance, alone.** Pick one
+      instance file and one algorithm, and confirm the algorithm alone produces
+      the metric — no sibling algorithm, no `main()`, no global state:
+
+      ```bash
+      "{python}" -c "import json,sys; sys.path.insert(0,'.'); \
+      import evaluator; \
+      from importlib import import_module; \
+      m=import_module('algorithms.<algo>.<algo>'); \
+      inst=evaluator.load_instance('data/<one-instance-file>') if hasattr(evaluator,'load_instance') else json.load(open('data/<one-instance-file>')); \
+      r=evaluator.evaluate_instance(inst, m.optimize); \
+      print(r); assert float(r[evaluator.PRIMARY_METRIC]) == float(r[evaluator.PRIMARY_METRIC])"
+      ```
+
+      Do this for EVERY algorithm file, substituting its name. A `KeyError`, an
+      `AttributeError`, or `nan` here means that algorithm is unscoreable on its
+      own, which is exactly how it will be loaded later.
+
+   d. **`evaluate_instance(instance, solve)` must not need anything `main()` sets
+      up.** The runner calls it directly and never runs `main()`. If it reads a
+      module-level name that `main()` assigns, or depends on `main()` having
+      mutated a global, every candidate scores `-inf` with no visible error. Move
+      whatever is needed inside `evaluate_instance`, or compute it from
+      `instance` alone.
+
+   e. **Every key an algorithm reads off `instance` is present.** When the runner
+      calls `evaluate_instance(instance, solve)`, a missing key raises `KeyError`
+      and that algorithm scores nothing. There are three ways to satisfy this —
+      any one is fine:
+
+      1. the key is in every `data/*.json`;
+      2. `evaluate_instance` adds it to the instance before calling `solve`
+         (deriving training data from parameters, for example);
+      3. the algorithm reads it defensively: `instance.get(key, default)` or
+         `key in instance`.
+
+      Only an UNGUARDED `instance["key"]` with no source is a defect. Check both
+      sides — what the algorithms read, and what the data or evaluator provides:
+
+      ```bash
+      "{python}" -c "import json,glob,ast; \
+      used=set(); \
+      [used.update({n.slice.value for n in ast.walk(ast.parse(open(p).read())) if isinstance(n,ast.Subscript) and isinstance(n.slice,ast.Constant) and isinstance(n.slice.value,str) and isinstance(n.value,ast.Name) and n.value.id in ('instance','inst','data','d')}) for p in glob.glob('algorithms/*/*.py')]; \
+      files=glob.glob('data/*.json'); \
+      indata=set().union(*[set(json.load(open(f))) for f in files]) if files else set(); \
+      ev=open('evaluator.py').read(); \
+      injected={k for k in used if k in ev}; \
+      unresolved=sorted(used-indata-injected); \
+      print('used:',sorted(used)); print('from data/:',sorted(used&indata)); print('from evaluator:',sorted(used&injected)); print('UNRESOLVED:',unresolved); \
+      assert not unresolved, 'read unguarded, absent from data/, and never mentioned in evaluator.py: '+str(unresolved)"
+      ```
+
+      Resolve anything left: add the key to `data/*.json`, inject it in
+      `evaluate_instance`, or read it with `.get`. A key listed under "from
+      evaluator" is fine — confirm by reading that code, not by the name match
+      alone.
+
+   f. **`main.py` supports the single-algorithm contract.** It must accept
+      `--algorithm <name>` (and `--instance <path>` if instances exist), import the
+      chosen module dynamically via `importlib` (not a hardcoded `from
+      algorithms.x import y`), print `{metric}: <value>`, and end with
+      `if __name__ == "__main__":`. A default `argparse` (see Constraints) is the
+      right tool here — this one flag is required, not a violation.
+
+   g. **Every planned condition appears and is labelled.** Each condition in
+      `EXPERIMENT_PLAN.yaml` must actually run and print its metric with the
+      condition name attached, so a condition cannot silently go missing.
+
+   Confirm each item by running the commands above, not by reading the code. If
+   you cannot make one pass, say so explicitly in your final message and name
+   which item failed — do not report success.
+
+5. Fix whatever you find and run it again. Repeat until it passes.
 
    One exception: if it fails only because a package `GUIDANCE.md` lists as
    available cannot be imported here, that is an environment gap, not a defect.
@@ -415,7 +566,7 @@ downstream will fix it for you.
    exist. Note it in a comment and move on — do NOT restructure the code, drop
    the dependency, or reimplement it by hand to make the import go away.
 
-5. Keep the default configuration small enough that this verification finishes
+6. Keep the default configuration small enough that this verification finishes
    in seconds. Shrink the workload, not the correctness.
 
 Never report success for code you did not run to completion. If it still fails

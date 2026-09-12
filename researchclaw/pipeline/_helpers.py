@@ -1598,6 +1598,155 @@ def _collect_experiment_results(
     return collected
 
 
+def _read_llm4ad_provenance(run_dir: Path) -> dict[str, Any]:
+    """Stage 14's ``algorithm_provenance.json``, or ``{}`` when there is none.
+
+    Absent for a run whose boost was off — which is also how every caller
+    distinguishes "no LLM4AD in this run" from "LLM4AD ran and changed nothing"
+    (the file exists, ``n_algorithms_replaced`` is 0).
+    """
+    path = run_dir / "stage-14" / "algorithm_provenance.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = _safe_json_loads(path.read_text(encoding="utf-8"), {})
+    except OSError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _llm4ad_adopted_final(run_dir: Path) -> bool:
+    """True when the run's reported metrics come from a delivered package.
+
+    Stage 14 adopts the chosen package's own numbers as the run's results when
+    it can read them; the producer records that in the provenance. Callers use
+    this to avoid re-deriving results from the earlier sandboxes, which would
+    contradict the reported ones.
+    """
+    prov = _read_llm4ad_provenance(run_dir)
+    return bool(prov.get("final_metrics"))
+
+
+def _read_llm4ad_evidence(run_dir: Path) -> str:
+    """Describe which algorithms LLM4AD improved, for the paper's prompts.
+
+    Reads ``algorithm_provenance.json`` (written by Stage 14). Returns "" when
+    the boost was off, when nothing was replaced, or when the file is missing —
+    so a run without LLM4AD gets a prompt byte-for-byte identical to before.
+
+    Only *replacements* are reported. An algorithm the search could not improve
+    is not evidence of anything and must not read as a contribution: the
+    provenance records it with ``source == "refine"`` and it is skipped here.
+    """
+    data = _read_llm4ad_provenance(run_dir)
+    if not data:
+        return ""
+    algos = data.get("algorithms")
+    if not isinstance(algos, dict):
+        return ""
+    adopted = {
+        name: rec for name, rec in algos.items()
+        if isinstance(rec, dict) and rec.get("source") == "llm4ad" and rec.get("replaced")
+    }
+    if not adopted:
+        return ""
+
+    direction = str(data.get("metric_direction", "") or "")
+    lines = [
+        "",
+        "### Algorithm Discovery (LLM4AD)",
+        "",
+        "An automated algorithm-discovery tool searched for better implementations",
+        "of the proposed method(s). Each entry compares the implementation the",
+        "refinement pass left in place against the one the search produced, scored",
+        "by this experiment's own evaluator on the same instances:",
+        "",
+    ]
+    for name, rec in sorted(adopted.items()):
+        refined = rec.get("refined")
+        llm4ad = rec.get("llm4ad")
+        delta = rec.get("delta_pct")
+        if not isinstance(refined, (int, float)) or not isinstance(llm4ad, (int, float)):
+            continue
+        change = f"{delta:+.2f}%" if isinstance(delta, (int, float)) else "n/a"
+        lines.append(f"- **{name}**: {refined:.6g} → {llm4ad:.6g} ({change})")
+        n_cmp = rec.get("n_instances_compared")
+        if isinstance(n_cmp, int):
+            lines.append(f"  - scored on {n_cmp} instance(s)")
+    if len(lines) <= 6:
+        return ""
+    lines += [
+        "",
+        "The adopted implementation is reported for every metric below "
+        f"(the search is {'maximizing' if direction == 'maximize' else 'minimizing'} "
+        "the primary metric). Methods not listed were left as the refinement pass "
+        "produced them. Quote these numbers exactly; do not extrapolate.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _read_llm4ad_algorithm_details(run_dir: Path) -> str:
+    """What the discovered algorithms *are* — name, motivation, edit size.
+
+    LLM4AD writes a ``metadata.json`` beside each winning individual. It holds
+    the only description of the discovered method that exists anywhere in the
+    run, so it is what lets the paper say more than "a number went up".
+    Returns "" when there is nothing to report.
+    """
+    algos_root = run_dir / "stage-13" / "task_packages"
+    if not algos_root.is_dir():
+        return ""
+    data = _read_llm4ad_provenance(run_dir)
+    if not data:
+        return ""
+    # Same filter as _read_llm4ad_evidence: an algorithm the search produced but
+    # that did not beat the refined implementation is not part of the reported
+    # system, so describing it would attribute an unused method to this paper.
+    adopted = {
+        name for name, rec in (data.get("algorithms") or {}).items()
+        if isinstance(rec, dict)
+        and rec.get("source") == "llm4ad"
+        and rec.get("replaced")
+    }
+    if not adopted:
+        return ""
+
+    lines: list[str] = []
+    for algo in sorted(adopted):
+        # The run directory name carries a random token, so locate the winning
+        # individual by glob rather than by reconstructing the path.
+        for meta_path in sorted(
+            algos_root.glob(f"{algo}/runs/*/*/best/metadata.json")
+        ):
+            meta = _safe_json_loads(meta_path.read_text(encoding="utf-8"), {})
+            if not isinstance(meta, dict):
+                continue
+            if meta.get("name"):
+                lines.append(f"- **{algo}** → *{meta['name']}*")
+            if meta.get("description"):
+                lines.append(f"  - what changed: {str(meta['description'])[:500]}")
+            gen = meta.get("generation")
+            added = meta.get("lines_added")
+            removed = meta.get("lines_removed")
+            if isinstance(gen, int):
+                lines.append(
+                    f"  - found at generation {gen}"
+                    + (f", +{added}/-{removed} lines" if isinstance(added, int) else "")
+                )
+            break
+    if not lines:
+        return ""
+    return (
+        "\n### Discovered Algorithm Descriptions\n\n"
+        + "\n".join(lines)
+        + "\n\nDescribe WHAT was discovered (the mechanism that changed), not just "
+          "that a number improved.\n"
+    )
+
+
 def _build_context_preamble(
     config: RCConfig,
     run_dir: Path,

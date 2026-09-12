@@ -231,6 +231,51 @@ def test_prompt_carries_the_plan_and_the_names():
     assert "proposed" in sent and "baseline" in sent and "ablation" in sent
 
 
+def test_prompt_points_at_the_prose_not_the_condition_list():
+    """The plan's role signal is in its prose, and the prompt must say so.
+
+    `conditions:` enumerates every method flatly, so reading it alone makes all
+    directories look alike — one real plan then classified all four as
+    `baseline`, `evolve_scope: {categories: [proposed]}` matched nothing, and
+    the whole evolution stage was skipped behind a single warning. The role is
+    named in `research_question` / `hypotheses` (which method is predicted to
+    beat which) and in explicit `baselines` / `ablations` keys, so the prompt
+    has to direct the model there.
+    """
+    exp = _tree(["a_method", "b_baseline"])
+    llm = _FakeLLM(_reply({"a_method": "proposed", "b_baseline": "baseline"}))
+    classify_algorithms(
+        exp,
+        "research_question: how does a_method compare to b_baseline?\n"
+        "hypotheses:\n- a_method achieves better primary_metric than b_baseline\n"
+        "conditions:\n- name: a_method\n- name: b_baseline\n",
+        llm,
+    )
+    sent = llm.prompts[0].lower()
+    # Must name the prose fields that carry the role.
+    assert "hypotheses" in sent
+    assert "research_question" in sent
+    assert "baselines" in sent and "ablations" in sent
+    # Must warn that a flat condition list is not evidence of a role, and that
+    # labelling everything `baseline` is almost always a misreading.
+    assert "not evidence" in sent or "not just its condition list" in sent
+    assert "misreading" in sent
+
+
+def test_prompt_has_no_topic_specific_hardcoding():
+    """Guidance must stay generic: no method names or run identifiers baked in."""
+    exp = _tree(["whatever_method", "another_method"])
+    llm = _FakeLLM(_reply({"whatever_method": "proposed", "another_method": "baseline"}))
+    classify_algorithms(exp, "plan", llm)
+    sent = llm.prompts[0].lower()
+    for token in (
+        "cma_es", "cma-es", "nelder", "powell", "ridge", "ndcg", "listmle",
+        "ranknet", "pointwise", "ackley", "rastrigin", "rosenbrock",
+        "ml03", "ml23", "tsp", "esn",
+    ):
+        assert token not in sent, f"prompt hardcodes {token!r}"
+
+
 def test_unchanged_tree_can_be_reused():
     exp = _tree(["cma_es"])
     first = classify_algorithms(exp, "plan", _FakeLLM(_reply({"cma_es": "baseline"})))

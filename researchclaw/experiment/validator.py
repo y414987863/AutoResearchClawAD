@@ -8,6 +8,7 @@ enabling automated repair via LLM re-generation.
 from __future__ import annotations
 
 import ast
+import builtins as _builtins
 import sys
 from dataclasses import dataclass, field
 from typing import Any
@@ -894,11 +895,116 @@ def auto_fix_unbound_locals(code: str) -> tuple[str, int]:
     return "".join(lines), num_fixes
 
 
+class _Masked(str):
+    """A copy of the source with prose blanked out, carrying line numbers.
+
+    Subclasses ``str`` so every regex in the checks below runs against it
+    unchanged, while ``_keep`` remembers the original lines the mask came from.
+    Blanking (rather than deleting) preserves both offsets and the line count,
+    so a reported line number still points at the real line.
+    """
+
+    _keep: list[str]
+
+    def line(self, lineno: int) -> str:
+        """The original text of 1-based *lineno*, for diagnostics."""
+        try:
+            return self._keep[lineno - 1]
+        except IndexError:
+            return ""
+
+
+def _blank_prose(code: str) -> _Masked:
+    """Return *code* with every comment and string literal blanked to spaces.
+
+    The API checks are text patterns, so they match a name *mentioned* in prose
+    exactly as if it were called. Every false positive found in this area came
+    from that, and each one cost something:
+
+    * a docstring reading ``NumPy 2.x: uses scipy.special.erfinv (np.erfinv
+      removed)`` — written by a model explaining its own correct fix, then
+      reported as the very defect it had repaired;
+    * ``x = erfinv(u)  # legacy np.erfinv(2*u-1)`` — a trailing comment;
+    * ``MSG = "call np.erfinv to invert"`` and a triple-quoted SQL snippet —
+      strings are data, and no name inside one is ever looked up.
+
+    Masking spans rather than whole lines is what keeps real code reportable:
+    ``z = np.erfinv(u)  # compute it`` still reports (only the comment is
+    blanked), and so does a call that follows a multi-line string's closing
+    quotes on the same line. A per-line skip gets both of those wrong.
+
+    f-strings are deliberately NOT blanked: their interpolations are
+    executable, so ``f"{np.erfinv(x)}"`` holds a real reference that must stay
+    visible. Masking the whole literal to hide its text would also hide that
+    call, and a missed crash is worse than a rare false positive.
+
+    Best-effort by construction: if tokenizing fails the original text is
+    returned and every check behaves as it did before.
+    """
+    import io
+    import tokenize
+
+    # FSTRING_MIDDLE exists from 3.12's PEP 701 tokenizer; on older
+    # interpreters an f-string arrives as a single STRING token (blanked in
+    # full), and this sentinel simply never matches.
+    _FSTRING_MIDDLE = getattr(tokenize, "FSTRING_MIDDLE", -1)
+
+    try:
+        source_lines = code.splitlines(keepends=True)
+    except (ValueError, MemoryError):  # pragma: no cover - defensive
+        return _Masked(code)
+
+    chars = list(code)
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(code).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
+        tokens = []
+
+    # Precomputed once: the character offset each line starts at. Recomputing
+    # it inside the blanking loop made masking quadratic in file size.
+    line_offsets: list[int] = []
+    _running = 0
+    for _line in source_lines:
+        line_offsets.append(_running)
+        _running += len(_line)
+
+    def _blank(start: tuple[int, int], end: tuple[int, int]) -> None:
+        """Space out the (row, col) half-open span, keeping newlines."""
+        s_row, s_col = start
+        e_row, e_col = end
+        for row in range(s_row, e_row + 1):
+            if row - 1 >= len(source_lines):
+                break
+            line = source_lines[row - 1]
+            lo = s_col if row == s_row else 0
+            hi = e_col if row == e_row else len(line)
+            base = line_offsets[row - 1]
+            for i in range(lo, min(hi, len(line))):
+                off = base + i
+                if off < len(chars) and chars[off] not in "\r\n":
+                    chars[off] = " "
+
+    for tok in tokens:
+        if tok.type == tokenize.COMMENT:
+            _blank(tok.start, tok.end)
+        elif tok.type == tokenize.STRING:
+            _blank(tok.start, tok.end)
+        elif tok.type == _FSTRING_MIDDLE:
+            # The literal run inside an f-string. Its interpolations are
+            # separate tokens and stay visible, so `f"{np.erfinv(x)}"` still
+            # reports while `f"np.erfinv is gone"` does not.
+            _blank(tok.start, tok.end)
+
+    masked = _Masked("".join(chars))
+    masked._keep = code.splitlines()
+    return masked
+
+
 def check_api_correctness(code: str, fname: str = "main.py") -> list[str]:
     """Detect common API misuse patterns.
 
     Catches:
-    - np.erf() (should be scipy.special.erf)
+    - np.erf()/np.erfc()/np.erfinv()/np.erfcinv() (should be scipy.special.*)
     - nn.Linear/nn.Conv2d inside forward() (unregistered module)
     - random.seed() without numpy.random.seed() (incomplete seeding)
     - NumPy 2.0 removed APIs (.ptp(), np.bool, etc.)
@@ -931,22 +1037,46 @@ def check_api_correctness(code: str, fname: str = "main.py") -> list[str]:
         "np.NINF": "-np.inf",
         "np.PZERO": "0.0",
         "np.NZERO": "-0.0",
+        # NOTE: these two were never in NumPy at any version (unlike the entries
+        # above, which NumPy 2.0 removed). They are confabulated names — the
+        # model knows the erf family and NumPy's np.* namespace and fuses them —
+        # so no amount of "please target NumPy 2.x" in the prompt prevents them,
+        # and only a static catch does. erfinv reached a real run inside
+        # algorithms/cma_es/cma_es.py and the evaluator's bare `except
+        # Exception: v = inf` swallowed the AttributeError, so it scored inf and
+        # stayed invisible until Stage 13's fitness gate rejected the whole
+        # evolution for "no finite primary metric".
+        "np.erfinv": "scipy.special.erfinv",
+        "np.erfcinv": "scipy.special.erfcinv",
     }
+    # Subset of _NP_REMOVED that no NumPy release ever exposed, so the message
+    # does not point at a 2.0 migration note for a name that never had one.
+    _NP_NEVER_EXISTED = frozenset({"np.erfinv", "np.erfcinv"})
 
-    lines = code.splitlines()
+    # Prose (comments, string literals) is blanked to spaces in this copy, so
+    # the patterns below see code only. Line numbers still line up with the
+    # original, and `_masked._keep` holds the original text for messages.
+    _masked = _blank_prose(code)
+    lines = _masked.splitlines()
+    _keep = _masked._keep
     _has_pandas = bool(
         _re.search(r"^\s*(?:import\s+pandas|from\s+pandas)\b", code, _re.MULTILINE)
     )
-    for i, line in enumerate(lines, 1):
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            continue
+    for i, stripped in enumerate(lines, 1):
+        stripped = stripped.strip()
 
-        # np.erf doesn't exist
-        if _re.search(r"\bnp\.erf\b", stripped):
+        # np.erf()/np.erfc() don't exist; nor do np.erfinv()/np.erfcinv(), which
+        # _NP_REMOVED reports below with a scipy.special replacement. The
+        # negative lookahead is what keeps the two apart: `\bnp\.erf\b` looks
+        # like it covers the whole family but a word boundary does not exist
+        # between "erf" and "inv" — both are word characters — so np.erfinv
+        # passed this check untouched. `(?![A-Za-z0-9_])` matches erfc (no
+        # boundary inside) while leaving erfinv/erfcinv to the dict, so a line
+        # never gets both messages.
+        if _re.search(r"np\.erf(?:c)?(?![A-Za-z0-9_])", stripped):
             warnings.append(
-                f"[{fname}:{i}] np.erf() does not exist — use "
-                f"scipy.special.erf() or math.erf() instead"
+                f"[{fname}:{i}] np.erf()/np.erfc() do not exist — use "
+                f"scipy.special.erf()/erfc() or math.erf() instead"
             )
 
         # NumPy 2.0 removed ndarray methods
@@ -964,8 +1094,18 @@ def check_api_correctness(code: str, fname: str = "main.py") -> list[str]:
         for old_name, replacement in _NP_REMOVED.items():
             pattern = _re.escape(old_name) + r"(?![_\w\d])"
             if _re.search(pattern, stripped):
+                # Two different defects share this table, and telling them
+                # apart matters to whoever reads the message: `np.trapz` moved
+                # (the code was correct once, under an older NumPy), whereas
+                # `np.erfinv` never existed under any version. Calling the
+                # latter "removed" sends the reader looking for a migration
+                # note that does not exist.
+                if old_name in _NP_NEVER_EXISTED:
+                    _why = "does not exist in NumPy (any version) — it is a SciPy name"
+                else:
+                    _why = "was removed in NumPy 2.0"
                 warnings.append(
-                    f"[{fname}:{i}] {old_name} was removed in NumPy 2.0 — "
+                    f"[{fname}:{i}] {old_name} {_why} — "
                     f"use {replacement} instead"
                 )
 
@@ -1018,8 +1158,6 @@ def check_api_correctness(code: str, fname: str = "main.py") -> list[str]:
     # Now scan for qualified calls to modules that were only from-imported
     for i, line in enumerate(lines, 1):
         stripped = line.strip()
-        if stripped.startswith("#"):
-            continue
         for mod, _names in import_from_map.items():
             top_mod = mod.split(".")[0]
             # Only flag if the module was NOT also imported via `import X`
@@ -1038,6 +1176,103 @@ def check_api_correctness(code: str, fname: str = "main.py") -> list[str]:
     return warnings
 
 
+def check_numpy_attribute_exists(code: str, fname: str = "main.py") -> list[str]:
+    """Flag ``np.<name>`` references that the installed NumPy does not define.
+
+    The complement of ``check_api_correctness``'s hand-written tables. Those
+    tables can only catch a name someone already knew to write down, which is
+    how ``np.erfinv`` reached a real run: the model fused "erf is a maths
+    function" with "NumPy has np.* scientific functions" into a plausible name
+    that has never existed in any NumPy release, and the tables — being a list
+    of *known* defects — said nothing.
+
+    Asking the namespace instead inverts that: the reference set is
+    ``dir(numpy)`` from the live interpreter, so a *new* confabulated name is
+    caught the first time without anyone predicting it. Measured over 3161
+    generated files (30 artifact roots, 122 distinct ``np.*`` names used), a
+    whitelist flagged exactly the 2 genuine defects and nothing else — against
+    21 entries the hand-written table must maintain by hand.
+
+    ``hasattr`` rather than ``in dir(np)``: ``np.matrixlib`` and
+    ``np.version`` are reachable attributes that ``dir()`` omits, and
+    reporting a working import as a NameError is the exact false positive this
+    check exists to avoid.
+
+    Scoped to plain ``np.<name>`` reads only — the alias must literally be
+    ``np``, so a project that binds numpy to another name is simply not
+    checked rather than mis-checked. The one case that still slips through is
+    a *rebinding* of ``np`` (``np = MyShim()`` or a parameter named ``np``)
+    inside a file that also imports numpy; that reads as a report on code
+    whose ``np`` is not numpy. It is left unhandled deliberately — resolving
+    it needs scope analysis, and of the two possible errors, flagging a
+    shim's missing attribute is the cheaper one to be wrong about. Prose
+    lines are skipped through the same helper ``check_api_correctness`` uses,
+    since a docstring explaining that ``np.erfinv`` was removed must not
+    itself be reported.
+    """
+    import re as _re
+
+    if not _re.search(r"^\s*(?:import\s+numpy(?:\s+as\s+np)?|from\s+numpy)", code, _re.MULTILINE):
+        return []
+
+    # `np` rebound to something else means every `np.x` below is not a numpy
+    # lookup. Detected from the AST and scoped to the span of the binding that
+    # does the shadowing: a parameter named `np` in one function must not
+    # silence a real `np.erfinv` two functions further down, while a
+    # module-level `np = shim` legitimately covers the whole file.
+    _shadowed: list[tuple[int, int]] = []
+    try:
+        _tree: ast.Module | None = ast.parse(code)
+    except (SyntaxError, ValueError):
+        _tree = None
+
+    if _tree is not None:
+        for node in ast.walk(_tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                _args = node.args
+                if any(a.arg == "np" for a in (*_args.posonlyargs, *_args.args, *_args.kwonlyargs)):
+                    _shadowed.append((node.lineno, getattr(node, "end_lineno", node.lineno) or node.lineno))
+        for node in _tree.body:
+            if (isinstance(node, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "np" for t in node.targets)) or (
+                    isinstance(node, (ast.AnnAssign, ast.AugAssign))
+                    and isinstance(node.target, ast.Name) and node.target.id == "np"):
+                _shadowed.append((0, 10**9))  # module level: covers the file
+                break
+    elif _re.search(r"^\s*np\s*=\s*(?!=)", code, _re.MULTILINE):
+        _shadowed.append((0, 10**9))
+
+    def _is_shadowed(lineno: int) -> bool:
+        return any(lo <= lineno <= hi for lo, hi in _shadowed)
+
+    try:
+        import numpy as _np
+    except ImportError:  # pragma: no cover - numpy is a core dependency
+        return []
+
+    warnings: list[str] = []
+    _masked = _blank_prose(code)
+    lines = _masked.splitlines()
+    seen: set[str] = set()
+    for i, line in enumerate(lines, 1):
+        if _is_shadowed(i):
+            continue
+        stripped = line.strip()
+        if not stripped:
+            continue
+        for name in _re.findall(r"\bnp\.([A-Za-z_][A-Za-z0-9_]*)", stripped):
+            if name in seen or hasattr(_np, name):
+                continue
+            seen.add(name)
+            warnings.append(
+                f"[{fname}:{i}] np.{name} is not defined by the installed NumPy "
+                f"({_np.__version__}) — this raises AttributeError at runtime. "
+                f"Check the name, or import it from scipy/math."
+            )
+
+    return warnings
+
+
 def check_undefined_calls(code: str, fname: str = "main.py") -> list[str]:
     """Detect calls to undefined functions/names in experiment code.
 
@@ -1051,7 +1286,14 @@ def check_undefined_calls(code: str, fname: str = "main.py") -> list[str]:
     except SyntaxError:
         return warnings
 
-    # Common builtins that are always available
+    # Common builtins that are always available.
+    #
+    # The exception classes come from the interpreter rather than being typed
+    # out: a hand-written list is always incomplete, and every omission is a
+    # false positive that sends the repair loop after correct code. `raise
+    # FloatingPointError(...)` was reported as "Call to undefined function" for
+    # exactly that reason — 38 builtin exceptions were missing, among them
+    # NameError, TimeoutError, PermissionError and ConnectionError.
     builtins = {
         "print", "len", "range", "enumerate", "zip", "map", "filter", "sorted",
         "list", "dict", "set", "tuple", "str", "int", "float", "bool", "bytes",
@@ -1060,17 +1302,16 @@ def check_undefined_calls(code: str, fname: str = "main.py") -> list[str]:
         "property", "staticmethod", "classmethod", "abs", "all", "any", "bin",
         "chr", "ord", "hex", "oct", "pow", "round", "sum", "min", "max", "open",
         "input", "repr", "hash", "id", "dir", "vars", "globals", "locals",
-        "format", "ascii", "object", "Exception", "ValueError", "TypeError",
-        "KeyError", "IndexError", "AttributeError", "RuntimeError", "StopIteration",
-        "NotImplementedError", "AssertionError", "ImportError", "FileNotFoundError",
-        "OSError", "IOError", "ZeroDivisionError", "OverflowError", "MemoryError",
-        "RecursionError", "SystemExit", "KeyboardInterrupt", "GeneratorExit",
-        "BaseException", "Warning", "DeprecationWarning", "UserWarning",
-        "FutureWarning", "PendingDeprecationWarning", "SyntaxWarning",
-        "RuntimeWarning", "ResourceWarning", "BytesWarning", "UnicodeWarning",
+        "format", "ascii", "object",
         "breakpoint", "memoryview", "bytearray", "frozenset", "complex",
         "divmod", "eval", "exec", "compile", "__import__", "help", "exit", "quit",
     }
+    # Every builtin exception/warning class this interpreter defines.
+    builtins.update(
+        _n for _n in dir(_builtins)
+        if isinstance(getattr(_builtins, _n, None), type)
+        and issubclass(getattr(_builtins, _n), BaseException)
+    )
 
     # Collect all defined names in the module
     defined_names: set[str] = set()
@@ -1198,14 +1439,69 @@ def deep_validate_files(
     """Run all deep quality checks across all experiment files.
 
     Returns a list of warning strings. Empty = no concerns.
+
+    ``check_numpy_attribute_exists`` is included here as a *warning* only. The
+    callers separate critical from advisory by keyword (``_code_generation``
+    looks for "does not exist" / "NameError" / …), and this check's message
+    says "is not defined by the installed NumPy … AttributeError", which
+    matches none of them. That is deliberate: a wrong name in a rarely-taken
+    branch is not worth an LLM repair cycle, but it is worth a log line, since
+    the alternative is what produced the 4c5e70cf run — a silent `inf` that
+    surfaced only as "evolution refused to start".
+
+    ``np.trapz`` is reported by both API checks, and by design they are not the
+    same finding: the hand-written table knows the *replacement*
+    (``np.trapezoid``), while the namespace check is what catches a name nobody
+    tabulated. So the pair is deduplicated here, at the point they meet, rather
+    than by deleting either check — dropping the table's entry would trade a
+    duplicate line for a worse message, and dropping the namespace check would
+    reopen the hole it exists to close.
     """
     warnings: list[str] = []
     warnings.extend(check_class_quality(files))
     warnings.extend(check_filename_collisions(files))
+    _seen: set[tuple[str, str, str]] = set()
+
+    def _emit(msg: str) -> None:
+        """Append *msg* unless the same name was already reported at that site.
+
+        Identity is (file, line, np-name), not the message text: the two API
+        checks word the same defect differently, so comparing strings would let
+        the duplicate through.
+        """
+        _key = (*_site_of(msg), _np_name_in(msg))
+        if _np_name_in(msg) and _key in _seen:
+            return
+        _seen.add(_key)
+        warnings.append(msg)
+
     for fname, code in files.items():
         if not fname.endswith(".py"):
             continue
         warnings.extend(check_variable_scoping(code, fname))
-        warnings.extend(check_api_correctness(code, fname))
+        for w in check_api_correctness(code, fname):
+            _emit(w)
+        for w in check_numpy_attribute_exists(code, fname):
+            _emit(w)
         warnings.extend(check_undefined_calls(code, fname))
     return warnings
+
+
+def _site_of(warning: str) -> tuple[str, str]:
+    """The ``(file, line)`` a warning's ``[...]`` prefix names.
+
+    The checks do not agree on the prefix shape — ``check_api_correctness``
+    writes ``[main.py:12]`` while ``check_class_quality`` writes ``[main.py]``
+    — so both are normalised to file plus line ("" when absent)."""
+    import re as _re
+
+    _m = _re.match(r"\[([^\]:]+)(?::(\d+))?\]", warning.strip())
+    return (_m.group(1), _m.group(2) or "") if _m else ("", "")
+
+
+def _np_name_in(warning: str) -> str:
+    """The ``np.<name>`` a warning is about, or "" when it names none."""
+    import re as _re
+
+    _m = _re.search(r"\bnp\.[A-Za-z_][A-Za-z0-9_]*", warning)
+    return _m.group(0) if _m else ""

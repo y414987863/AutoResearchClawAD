@@ -230,6 +230,89 @@ def _execute_result_analysis(
         except (json.JSONDecodeError, OSError):
             pass
 
+    # WS-6: LLM4AD attribution. When the boost is on, Stage 13's promoted
+    # experiment_final/ mixes stage-10 baselines with evolved proposed
+    # algorithms — not the system the refinement produced, and not one anybody
+    # chose. That was scored and decided before this stage ran; what remains is
+    # to make the delivered project's metrics the ones everything below
+    # aggregates, so every reported number belongs to the code that ships.
+    #
+    # Assigned rather than left to `_collect_experiment_results`, which picks
+    # the best run by primary metric across every stage's runs/ — with both
+    # Stage 12 and Stage 14 present that would select whichever happened to
+    # score higher, and would average the two into every metrics_summary entry.
+    # The delivered project's own numbers are the ones to report regardless of
+    # how they compare, including when the search made things worse.
+    _l4b = None
+    _l4b_attribution: dict[str, Any] | None = None
+    try:
+        from researchclaw.pipeline.llm4ad_utils.package_scoring import (
+            PKG_FINAL,
+            package_scoring_for_config,
+        )
+
+        _l4b = package_scoring_for_config(run_dir, stage_dir, config)
+    except Exception as _l4b_exc:  # noqa: BLE001 — additive analysis, never fatal
+        logger.warning("Stage 14: llm4ad attribution unavailable: %s", _l4b_exc)
+    if _l4b:
+        _l4b_final = (_l4b.get("packages") or {}).get(PKG_FINAL) or {}
+        _l4b_metrics = _l4b.get("final_metrics") or {}
+        if _l4b_metrics:
+            exp_data["best_run"] = {
+                "run_id": "llm4ad-final-package",
+                "task_id": PKG_FINAL,
+                "status": "completed",
+                "metrics": _l4b_metrics,
+                "timed_out": False,
+            }
+            exp_data["runs"] = [exp_data["best_run"]]
+            # Same min/max/mean/count reduction _collect_experiment_results
+            # applies, over the delivered project's values only — the earlier
+            # summary also covers Stage 12's stale run and would blend the two.
+            exp_data["metrics_summary"] = {
+                _k: {
+                    "min": round(float(_v), 6),
+                    "max": round(float(_v), 6),
+                    "mean": round(float(_v), 6),
+                    "count": 1,
+                }
+                for _k, _v in _l4b_metrics.items()
+                if isinstance(_v, (int, float))
+            }
+            logger.info(
+                "Stage 14: adopting %d metric(s) from %s (the delivered project)",
+                len(_l4b_metrics), f"packages/{PKG_FINAL}",
+            )
+        elif _l4b.get("final_metrics_error"):
+            logger.warning(
+                "Stage 14: the chosen package produced no metrics (%s); keeping "
+                "the numbers already collected.", _l4b["final_metrics_error"],
+            )
+        # Held until summary_payload exists — it is built far below, and
+        # assigning here would be a NameError.
+        _l4b_attribution = {
+            "used": _l4b.get("llm4ad_used", False),
+            "n_algorithms_replaced": _l4b.get("n_algorithms_replaced", 0),
+            "n_algorithms": _l4b_final.get("n_algorithms", 0),
+            "metric_key": _l4b.get("metric_key", ""),
+            "metric_direction": _l4b.get("metric_direction", ""),
+            "decision_rule": _l4b.get("decision_rule", ""),
+            "final_package": f"packages/{PKG_FINAL}",
+            "final_score": _l4b_final.get("score"),
+            "final_results_status": _l4b.get("final_results_status", ""),
+            "provenance": "algorithm_provenance.json",
+            # The full per-algorithm {stage10, refined, llm4ad, source} table —
+            # what the paper's method section and any write-up draw from.
+            "algorithms": _l4b.get("algorithms") or {},
+            "packages": _l4b.get("packages") or {},
+        }
+        logger.info(
+            "Stage 14: llm4ad attribution recorded — %d/%d algorithm(s) replaced; "
+            "final package score %s",
+            _l4b.get("n_algorithms_replaced", 0),
+            _l4b_final.get("n_algorithms", 0),
+            _l4b_final.get("score"),
+        )
     # --- R19-3: Build structured condition_summaries from metrics ---
     _condition_summaries: dict[str, dict[str, Any]] = {}
     _ms = exp_data.get("metrics_summary", {})
@@ -513,6 +596,8 @@ def _execute_result_analysis(
     }
     if _seed_insufficiency_warnings:
         summary_payload["seed_insufficiency_warnings"] = _seed_insufficiency_warnings
+    if _l4b_attribution:
+        summary_payload["llm4ad_attribution"] = _l4b_attribution
     # R13-1: Detect zero-variance across conditions (all conditions identical primary metric)
     if _condition_summaries and len(_condition_summaries) >= 2:
         _primary_vals = []

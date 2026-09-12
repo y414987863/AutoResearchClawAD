@@ -184,10 +184,43 @@ class TestPromptManagerDefaults:
         assert "HARD TOPIC CONSTRAINT" in block
 
     def test_block_pkg_hint(self) -> None:
+        """The package list is rendered from config, not hardcoded.
+
+        The block used to carry its own package list that contradicted the
+        offline-guidance block appended beside it, so the generated experiment
+        shipped two variants of every algorithm. It is now a template over the
+        configured allow-list, making `sandbox.allowed_imports` the only place a
+        package can be forbidden or permitted.
+        """
+        from researchclaw.prompts.shared import render_package_hint
+
         pm = PromptManager()
-        block = pm.block("pkg_hint_sandbox")
+        allowed = ("math", "json", "numpy", "scipy")
+        block = pm.block("pkg_hint_sandbox", packages=render_package_hint(allowed))
+        assert "Python stdlib" in block
         assert "numpy" in block
-        assert "torch" in block  # mentioned as prohibited
+        assert "scipy" in block
+        # `torch` appears only as an explicitly prohibited framework.
+        assert "torch" in block
+        assert "Do NOT import anything outside this list" in block
+        assert "{packages}" not in block
+
+    def test_render_package_hint_orders_and_classifies(self) -> None:
+        from researchclaw.prompts.shared import render_package_hint
+
+        # Config order is preserved; stdlib folds into the leading phrase.
+        assert render_package_hint(["numpy", "math", "scipy"]) == (
+            "Python stdlib, numpy, scipy"
+        )
+        # Duplicates collapse.
+        assert render_package_hint(["numpy", "numpy"]) == "Python stdlib, numpy"
+        # Empty / absent allow-list still names the stdlib it always has.
+        assert render_package_hint([]) == "Python stdlib"
+        assert render_package_hint(None) == "Python stdlib"
+        # Anything not stdlib is listed explicitly, in config order.
+        assert render_package_hint(["sklearn", "statsmodels"]) == (
+            "Python stdlib, sklearn, statsmodels"
+        )
 
     def test_sub_prompt_code_repair(self) -> None:
         pm = PromptManager()

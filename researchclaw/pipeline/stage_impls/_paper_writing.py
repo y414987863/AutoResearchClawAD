@@ -25,7 +25,10 @@ from researchclaw.pipeline._helpers import (
     _generate_framework_diagram_prompt,
     _generate_neurips_checklist,
     _get_evolution_overlay,
+    _llm4ad_adopted_final,
     _read_best_analysis,
+    _read_llm4ad_algorithm_details,
+    _read_llm4ad_evidence,
     _read_prior_artifact,
     _safe_json_loads,
     _topic_constraint_block,
@@ -208,19 +211,27 @@ def _collect_raw_experiment_metrics(run_dir: Path) -> tuple[str, bool]:
                             pass
 
     # R19-4 + R23-1: Collect metrics from refinement_log.json (Stage 13).
-    # If refinement has richer data than Stage 12 runs/, REPLACE Stage 12 data
-    # to avoid confusing the paper writer with conflicting sources.
+    #
+    # Skipped when Stage 14 adopted a delivered project's metrics: those are
+    # already the run's results (best_run in experiment_summary.json), and this
+    # block scans every refinement sandbox in the run — including iterations
+    # that were discarded — so letting it run would put a second, older set of
+    # numbers into the prompt beside the reported ones.
+    _adopted_final_metrics = _llm4ad_adopted_final(run_dir)
     _refine_lines: list[str] = []
     _refine_run_count = 0
-    # Scan ALL refinement logs across versions, pick by quality (primary
-    # metric) then richness (metric count).  BUG-207: Previous logic picked
-    # the sandbox entry with the most metric keys regardless of whether it
-    # represented a regression (e.g. sandbox_after_fix with 1.29% accuracy
-    # winning over sandbox with 78.93% because it had 6 more keys).
     _best_refine_metrics: dict[str, Any] = {}
     _best_refine_stdout = ""
     _best_refine_primary: float | None = None
-    for _rl_path in sorted(run_dir.glob("stage-13*/refinement_log.json")):
+    for _rl_path in (
+        [] if _adopted_final_metrics
+        else sorted(run_dir.glob("stage-13*/refinement_log.json"))
+    ):
+        # Scan ALL refinement logs across versions, pick by quality (primary
+        # metric) then richness (metric count).  BUG-207: Previous logic picked
+        # the sandbox entry with the most metric keys regardless of whether it
+        # represented a regression (e.g. sandbox_after_fix with 1.29% accuracy
+        # winning over sandbox with 78.93% because it had 6 more keys).
         try:
             _rlog = json.loads(_rl_path.read_text(encoding="utf-8"))
             for _it in _rlog.get("iterations", []):
@@ -1445,6 +1456,12 @@ def _execute_paper_draft(
         if has_real_metrics or _has_parsed_metrics or _has_condition_pattern:
             has_real_metrics = True
         exp_metrics_instruction += raw_metrics_block
+
+    # WS-6: State which algorithms an automated search improved, and what it
+    # found. Both blocks return "" when nothing was adopted, so a run without
+    # LLM4AD produces the same prompt as before this change.
+    exp_metrics_instruction += _read_llm4ad_evidence(run_dir)
+    exp_metrics_instruction += _read_llm4ad_algorithm_details(run_dir)
 
     # R18-1 + R19-6: Inject paired statistical comparisons AND condition summaries
     if exp_summary_text:

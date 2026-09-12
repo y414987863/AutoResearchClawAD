@@ -85,11 +85,36 @@ def _make_instance_reader(evaluator):
 
 
 def _load_optimize(algo_file: Path, algo_name: str):
-    spec = importlib.util.spec_from_file_location(f"_cmp_{algo_name}", str(algo_file))
+    """Load ``optimize`` from ``algo_file``, keeping ``algo_name`` as its module.
+
+    The module is registered under its real name — the algorithm's directory
+    name — because a generated evaluator may identify the algorithm it is
+    scoring from the callable it was handed:
+
+        f"condition={solve.__module__.split('.')[-1]}"
+
+    That is a reasonable thing for the experiment to do, and it is correct under
+    a normal import. Loading the file under a private alias instead (this used
+    to be ``f"_cmp_{algo_name}"``) made ``__module__`` report the alias, so the
+    evaluator looked up ``_cmp_listmle_lite`` in its own algorithm table, raised
+    ``ValueError("Unknown algorithm: ...")``, and every candidate scored
+    nothing — the fitness gate then skipped evolution entirely.
+
+    Registering in ``sys.modules`` is what makes the name stick: the spec's name
+    alone does not guarantee what the loader records. Collisions are not a
+    concern here — this script exists precisely to run as its own subprocess, so
+    its module table is private to the run.
+    """
+    spec = importlib.util.spec_from_file_location(algo_name, str(algo_file))
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load algorithm from {algo_file}")
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    sys.modules[algo_name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(algo_name, None)
+        raise
     fn = getattr(mod, "optimize", None)
     if fn is None:
         raise RuntimeError(f"{algo_file.name} has no optimize(instance, seed) function")

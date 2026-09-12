@@ -114,8 +114,54 @@ _DEFAULT_BLOCKS: dict[str, str] = {
         "  - Always print intermediate results so partial data is captured on timeout\n"
         "- MANDATORY: print a 'TIME_ESTIMATE: Xs' line before the main loop,\n"
         "  estimating total runtime based on a small pilot (run 1 condition, extrapolate)\n"
-        "- MANDATORY: implement a time guard — check elapsed time periodically and\n"
-        "  stop gracefully if approaching 80% of budget, saving all results collected so far\n"
+        "- MANDATORY: the primary metric must be a DETERMINISTIC function of\n"
+        "  (algorithm, instance, seed). Scoring the same combination twice must\n"
+        "  produce the same number. NEVER let the clock control the computation:\n"
+        "  `time.time()` / `time.perf_counter()` / `time.monotonic()` must NOT\n"
+        "  appear in an algorithm file or gate its loop. A run that stops on\n"
+        "  elapsed time does a different amount of work on a busy machine, so the\n"
+        "  same algorithm scores differently every time — such a metric cannot be\n"
+        "  optimised and the run is rejected before it starts.\n"
+        "  Size each run with a fixed COUNT taken from the instance instead:\n"
+        "  ```\n"
+        "  max_evals = int(instance['max_evals'])    # a number, not a duration\n"
+        "  while evals < max_evals:                  # same inputs -> same result\n"
+        "      ...\n"
+        "      evals += 1\n"
+        "  ```\n"
+        "  A clock read inside an algorithm is a rejection, with no exceptions —\n"
+        "  not even to measure how long a run took. If you want a runtime figure\n"
+        "  for reporting, measure it in `main.py` around the call.\n"
+        "- MANDATORY: implement a time guard — but it must NEVER drop a condition.\n"
+        "  The guard belongs in `main.py`, never inside an algorithm, and it may\n"
+        "  only skip a whole (condition, instance, seed) unit while recording that\n"
+        "  it did. It must NOT break out of the loop over conditions: that loses\n"
+        "  whole conditions, the experiment silently has no baseline, and every\n"
+        "  comparison it supports becomes invalid.\n"
+        "  REQUIRED SHAPE — every condition must be attempted:\n"
+        "  ```\n"
+        "  total_budget = {time_budget_sec}\n"
+        "  deadline = time.time() + total_budget          # in main.py only\n"
+        "\n"
+        "  for cond in ALGORITHMS:                  # NEVER break out of this loop\n"
+        "      for inst in instances:\n"
+        "          for seed in seeds:\n"
+        "              if time.time() >= deadline:\n"
+        "                  skipped.append((cond, inst, seed))   # record it\n"
+        "                  continue      # keep ATTEMPTING every condition\n"
+        "              value = run_one(cond, inst, seed)      # count-bounded inside\n"
+        "              print(f'condition={cond} instance={inst} seed={seed} '\n"
+        "                    f'{PRIMARY_METRIC}: {value}')   # print IMMEDIATELY\n"
+        "      print(f'CONDITION_DONE: {cond}')\n"
+        "  ```\n"
+        "  - Print each result as soon as it is computed, not only at the end: a\n"
+        "    stop part-way must still leave the finished conditions on stdout.\n"
+        "  - If you truly cannot run everything, FIRST print precisely which\n"
+        "    conditions did not run, as 'SKIPPED_CONDITIONS: <comma-separated\n"
+        "    names>'. Never stop silently, and never present a partial run as a\n"
+        "    complete comparison.\n"
+        "  - Order conditions so CHEAP ones run first — a run that ends early then\n"
+        "    loses the fewest.\n"
         "- MANDATORY: add NaN/divergence fast-fail guard:\n"
         "  - After each optimization step, check if loss is NaN or > 100\n"
         "  - If detected, print 'FAIL: NaN/divergence detected', save partial results, and exit\n"
@@ -133,16 +179,25 @@ _DEFAULT_BLOCKS: dict[str, str] = {
         "  ```\n"
         "  from experiment_harness import ExperimentHarness\n"
         "  harness = ExperimentHarness(time_budget={time_budget_sec})\n"
-        "  # In your experiment loop:\n"
-        "  if harness.should_stop():\n"
-        "      break  # graceful stop at 80% of budget\n"
-        "  if not harness.check_value(value, 'metric_name'):\n"
-        "      print('SKIP: NaN/Inf detected')  # skip invalid values\n"
-        "      continue\n"
-        "  harness.report_metric('metric_name', value)  # validated output\n"
-        "  # At the end of ALL experiments:\n"
+        "  # Check inside ONE run, never around the loop over conditions.\n"
+        "  # `break`/`continue` here must end only the current run — every\n"
+        "  # condition still has to run at least once.\n"
+        "  for cond in ALGORITHMS:                 # never break out of THIS loop\n"
+        "      for inst in instances:\n"
+        "          for seed in seeds:\n"
+        "              # `run_one` is bounded by a COUNT from the instance, never\n"
+        "              # by a deadline — see the determinism rule above.\n"
+        "              value = run_one(cond, inst, seed)   # run this one unit\n"
+        "              if not harness.check_value(value, 'metric_name'):\n"
+        "                  continue      # skip this value, NOT the remaining conditions\n"
+        "              harness.report_metric(f'{cond}/{inst}/{seed}', value)\n"
+        "      print(f'CONDITION_DONE: {cond}')\n"
         "  harness.finalize()  # writes results.json — MUST be called\n"
         "  ```\n"
+        "  `harness.should_stop()` reflects ONE global deadline: once it is true it\n"
+        "  stays true. Use it ONLY in `main.py` to stop starting new units — never\n"
+        "  inside an algorithm, and never as the condition-loop's exit, which would\n"
+        "  abandon every remaining condition and leave the comparison incomplete.\n"
         "  The harness provides: time budget enforcement, NaN/Inf detection,\n"
         "  validated metric reporting, and results.json output. NOT using it\n"
         "  means your metrics may be lost or malformed.\n"
@@ -164,12 +219,19 @@ _DEFAULT_BLOCKS: dict[str, str] = {
         "not environment status.\n"
         "=== END CONSTRAINT ===\n"
     ),
+    # The package list itself is NOT hardcoded here. It is rendered from
+    # `experiment.sandbox.allowed_imports` (see `render_package_hint`) so that
+    # config is the single source of truth. Hardcoding it produced a prompt that
+    # contradicted itself: this block said "ONLY numpy and stdlib, do NOT use
+    # scipy", while `network_disabled_guidance` — appended to the same GUIDANCE.md
+    # — listed scipy as pre-installed. The generated code then contained both
+    # variants of every algorithm.
     "pkg_hint_sandbox": (
-        "\nAVAILABLE PACKAGES (sandbox mode): Python stdlib, numpy, math, random, "
-        "statistics, json.\n"
-        "Do NOT use: torch, tensorflow, jax, sklearn, pandas, scipy, matplotlib, "
-        "or any deep learning framework.\n"
-        "Write the experiment using ONLY numpy and stdlib.\n"
+        "\nAVAILABLE PACKAGES (sandbox mode): {packages}.\n"
+        "Do NOT import anything outside this list.\n"
+        "Do NOT use GPU or deep-learning frameworks (torch, tensorflow, jax) — "
+        "there is no GPU available, and they are not installed.\n"
+        "Write the experiment using only the packages above.\n"
     ),
     "dataset_guidance": (
         "\n## Standard Datasets & Real Baselines (MANDATORY when applicable)\n"
@@ -288,30 +350,41 @@ _DEFAULT_BLOCKS: dict[str, str] = {
         "You may also include a `requirements.txt` file listing any additional "
         "pip packages your experiment needs beyond the pre-installed set.\n"
     ),
+    # Network-off guidance, deliberately domain-neutral. This block used to end
+    # with a hardcoded list of torchvision datasets AND a hardcoded
+    # "pre-installed packages" list — which both contradicted `pkg_hint_sandbox`
+    # and injected deep-learning advice into domains that have no datasets at all
+    # (a numerical-optimization experiment was told to prefer CIFAR-10). The
+    # dataset half now lives in `ml_offline_datasets`, injected only for ML
+    # domains; the package list is rendered from config (see
+    # `render_package_hint`). No network is a fact about the environment, so what
+    # is left here applies to every domain.
     "network_disabled_guidance": (
-        "\n## ⚠️ NO NETWORK ACCESS — CRITICAL CONSTRAINT ⚠️\n"
-        "This experiment runs with network_policy='none'. There is NO network access\n"
-        "at ANY phase (no pip install, no dataset downloads, no HTTP requests).\n\n"
-        "### ONLY these pre-cached datasets are available:\n"
+        "\n## NO NETWORK ACCESS — CRITICAL CONSTRAINT\n"
+        "This experiment runs with network_policy='none'. There is NO network "
+        "access at ANY phase (no pip install, no dataset downloads, no HTTP "
+        "requests).\n\n"
+        "### FORBIDDEN (will cause runtime failure):\n"
+        "- Do NOT create setup.py (it cannot run without network)\n"
+        "- Do NOT create requirements.txt (pip install is unavailable)\n"
+        "- Do NOT use `urllib`, `requests`, `httpx`, or any HTTP library\n"
+        "- Do NOT download anything, or set `download=True` anywhere\n"
+        "- Do NOT import packages that are not in the AVAILABLE PACKAGES list\n"
+    ),
+    # ML-only: the offline image ships image/vision datasets, which is useful
+    # only when the experiment consumes them. Injecting this into, say, an
+    # optimization study adds noise and nudges the model toward an unrelated
+    # dataset.
+    "ml_offline_datasets": (
+        "\n### Pre-cached datasets (ML domains only, use download=False):\n"
         "- `torchvision.datasets.CIFAR10(root='/opt/datasets', train=True/False, download=False)`\n"
         "- `torchvision.datasets.CIFAR100(root='/opt/datasets', train=True/False, download=False)`\n"
         "- `torchvision.datasets.MNIST(root='/opt/datasets', train=True/False, download=False)`\n"
         "- `torchvision.datasets.FashionMNIST(root='/opt/datasets', train=True/False, download=False)`\n"
         "- `torchvision.datasets.STL10(root='/opt/datasets', split='train'/'test', download=False)`\n"
-        "- `torchvision.datasets.SVHN(root='/opt/datasets', split='train'/'test', download=False)`\n\n"
-        "### FORBIDDEN (will cause runtime failure):\n"
-        "- Do NOT create setup.py (it cannot run without network)\n"
-        "- Do NOT create requirements.txt (pip install is unavailable)\n"
-        "- Do NOT use `download=True` on any dataset\n"
-        "- Do NOT use `urllib`, `requests`, `httpx`, or any HTTP library\n"
-        "- Do NOT use `datasets.load_dataset()` from HuggingFace (requires download)\n"
-        "- Do NOT import packages not pre-installed in the Docker image\n\n"
-        "### Available pre-installed packages:\n"
-        "torch, torchvision, torchaudio, numpy, scipy, sklearn, matplotlib, seaborn,\n"
-        "pandas, tqdm, gymnasium, networkx, PyYAML, Pillow, timm, einops, torchmetrics,\n"
-        "h5py, transformers, datasets, accelerate, peft, bitsandbytes.\n\n"
-        "If your research topic requires a dataset NOT in the pre-cached list,\n"
-        "you MUST adapt to use one of the 6 pre-cached datasets instead.\n"
+        "- `torchvision.datasets.SVHN(root='/opt/datasets', split='train'/'test', download=False)`\n"
+        "If your topic needs a dataset outside this list, adapt to one of these "
+        "instead.\n"
     ),
     "network_full_guidance": (
         "\n## Network Access: Full\n"
@@ -1048,6 +1121,54 @@ _DEFAULT_BLOCKS: dict[str, str] = {
     ),
 }
 
+# -- Package hint ---------------------------------------------------------
+
+#: Importable names that are part of Python itself. Listed separately from the
+#: config-declared packages so the rendered hint can say "Python stdlib, …"
+#: without the caller having to pre-split its own allow-list.
+_STDLIB_IMPORTS: frozenset[str] = frozenset({
+    "collections", "csv", "dataclasses", "functools", "itertools", "json",
+    "math", "os", "pathlib", "random", "re", "statistics", "sys", "time",
+    "typing", "warnings", "copy", "abc", "enum", "fractions", "decimal",
+    "heapq", "bisect", "string", "textwrap", "datetime", "hashlib",
+    "subprocess", "tempfile", "shutil", "pickle", "gzip", "zipfile",
+})
+
+
+def render_package_hint(allowed_imports: Any) -> str:
+    """Build the AVAILABLE PACKAGES line from the configured allow-list.
+
+    The allow-list in config is the single source of truth for what the sandbox
+    will actually have. Rendering the hint from it is what keeps the prompt
+    consistent with the environment: when the list was hardcoded in two
+    different places, the two copies disagreed (one forbade `scipy`, the other
+    advertised it as pre-installed) and the generated experiment shipped both
+    variants of every algorithm.
+
+    Order follows the config so the rendered text is stable run to run. Stdlib
+    names are folded into the leading "Python stdlib" phrase; everything else is
+    listed explicitly. An empty/absent list falls back to the stdlib phrase
+    alone, which is what a restrictive sandbox would really offer.
+    """
+    try:
+        declared = [str(p).strip() for p in (allowed_imports or []) if str(p).strip()]
+    except TypeError:
+        declared = []
+    # Preserve config order, drop duplicates.
+    seen: set[str] = set()
+    ordered = [p for p in declared if not (p in seen or seen.add(p))]
+
+    stdlib = [p for p in ordered if p in _STDLIB_IMPORTS]
+    third_party = [p for p in ordered if p not in _STDLIB_IMPORTS]
+
+    # `math`/`json`/… are importable whatever the config says — the allow-list
+    # governs packages, not the interpreter — so the phrase is always present.
+    parts: list[str] = ["Python stdlib"]
+    if third_party:
+        parts.append(", ".join(third_party))
+    return ", ".join(parts)
+
+
 # -- Sub-prompts (secondary LLM calls within a stage) --------------------
 
 _DEFAULT_SUB_PROMPTS: dict[str, dict[str, Any]] = {
@@ -1166,18 +1287,47 @@ _DEFAULT_SUB_PROMPTS: dict[str, dict[str, Any]] = {
             "(fix bugs, tune hyperparameters, improve training loops).\n"
             "- If the code has fundamental issues (wrong algorithm, missing "
             "components), fix the implementation but keep the same condition "
-            "names and class hierarchy.\n\n"
+            "names and class hierarchy.\n"
+            "- PRESERVE the LLM4AD structure of each `algorithms/<algo>/<algo>.py`. "
+            "A separate harness loads ONE algorithm at a time and rewrites only "
+            "the code between the markers, so a rewrite that drops them makes the "
+            "algorithm non-evolvable and silently wastes the whole evolution "
+            "stage. Keep, in every such file:\n"
+            "  * the `# EVOLVE_START` / `# EVOLVE_END` marker pair, wrapping the "
+            "entire `optimize` function (`# EVOLVE_START` on the line immediately "
+            "before `def optimize`, `# EVOLVE_END` after its final `return`);\n"
+            "  * the `optimize(instance, seed)` signature and the keys of the "
+            "dict it returns;\n"
+            "  * the module it imports from and the functions it uses from there.\n"
+            "- NEVER let the clock decide how much work an algorithm does. "
+            "`time.time()` / `time.perf_counter()` / `time.monotonic()` must not "
+            "gate a loop in `algorithms/<algo>/<algo>.py`: a run that stops on "
+            "elapsed time does a different amount of work on a busy machine, so "
+            "the same algorithm scores differently every time, and the metric is "
+            "rejected as nondeterministic before evolution starts. Bound the work "
+            "with a COUNT from the instance (max evaluations / iterations / "
+            "epochs) instead. Measuring time for reporting is fine; letting it "
+            "control the computation is not. If the code already does this, "
+            "remove it.\n"
+            "- Preserve `main.py`'s `--algorithm` / `--instance` selectors, its "
+            "dynamic `importlib` loading, its `<metric>: <value>` output, and "
+            "`evaluator.py`'s `PRIMARY_METRIC` / `METRIC_DEF` / "
+            "`evaluate_instance` exports — the same contract stage 10 generated.\n\n"
             "{condition_coverage_hint}"
             "SEED ENFORCEMENT (MANDATORY — BUG-183):\n"
             "- You MUST use exactly seeds = [0, 1, 2] (3 seeds minimum).\n"
             "- Each condition MUST loop over ALL seeds.\n"
             "- Print per-seed: condition=X seed=S {metric_key}: V\n"
             "- Print aggregated: condition=X {metric_key}_mean: M {metric_key}_std: S\n"
-            "- If 3 seeds × all conditions exceeds the time budget, REDUCE training "
-            "epochs or conditions — NEVER reduce seed count below 3.\n\n"
-            "CONDITION COUNT LIMIT (HARD RULE):\n"
-            "- MAXIMUM 8 total conditions (baselines + methods + ablations).\n"
-            "- If the previous code had >8 conditions, consolidate ablations to 2-3 values.\n\n"
+            "- If 3 seeds × all conditions exceeds the time budget, REDUCE the "
+            "work per run (epochs, steps, dataset size) — NEVER reduce the seed "
+            "count below 3, and never drop a condition.\n\n"
+            "CONDITION COUNT LIMIT:\n"
+            "- Aim for at most 8 total conditions (baselines + methods + ablations).\n"
+            "- If there are more than 8, reduce the WORK PER CONDITION (fewer "
+            "epochs/steps, smaller datasets) — do NOT delete conditions. The "
+            "condition set is fixed by the plan and a missing one is a missing "
+            "baseline, not a smaller experiment.\n\n"
             "DOCKER MOUNT TOPOLOGY (for fixing PermissionError/path issues):\n"
             "- WRITABLE: /workspace/ (project files), /tmp/, /workspace/data/\n"
             "- READ-ONLY: /opt/datasets/ (pre-cached CIFAR-10/100, MNIST, etc)\n"

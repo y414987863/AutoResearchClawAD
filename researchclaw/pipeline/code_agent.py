@@ -747,6 +747,7 @@ class CodeAgent:
             check_class_quality,
             check_code_complexity,
             check_api_correctness,
+            check_numpy_attribute_exists,
             check_variable_scoping,
             validate_syntax,
         )
@@ -803,6 +804,15 @@ class CodeAgent:
                     critical.append(w)
                 else:
                     warnings.append(w)
+            # A name the installed NumPy does not define raises AttributeError
+            # on the line that reads it — the same class of defect as the
+            # NameError cases above, and the one a hand-written table missed.
+            # Critical here rather than advisory: this path can afford the
+            # repair cycle, and the alternative was a 4c5e70cf-style run where
+            # the algorithm crashed inside a bare `except Exception` and scored
+            # `inf` through Stage 12 without a single warning.
+            for w in check_numpy_attribute_exists(code, fname):
+                critical.append(w)
 
         # 5. Variable scoping — UnboundLocalError is critical
         for fname, code in files.items():

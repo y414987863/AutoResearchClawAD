@@ -641,16 +641,22 @@ def execute_stage(
 
     stage_dir = run_dir / f"stage-{int(stage):02d}"
 
-    # Re-running into a directory that already holds results pollutes the fresh
-    # run (old task_packages/ carries a .git; stale evolution_results/ looks
-    # like this run's output). Wipe it, but only when there is no versioned
-    # snapshot: on a rollback the runner renames stage-NN/ to stage-NN_vN first
-    # (see _version_rollback_stages), so a leftover _v* dir is what a revisit
-    # needs, and deleting the live dir would break that.
-    _has_versioned = any(
-        run_dir.glob(f"stage-{int(stage):02d}_v*")
-    )
-    if stage_dir.exists() and not _has_versioned:
+    # A stage always starts from an empty directory. Anything a previous run
+    # left here is stale by definition: the stage is about to regenerate it.
+    # Leaving it behind is not merely untidy — a leftover llm4ad_comparison.json
+    # or task_packages/ reads as this run's output, and evolution_results/ in
+    # particular looks like the present evolution already finished.
+    #
+    # Rollback is unaffected. `_version_rollback_stages` renames stage-NN/ to
+    # stage-NN_vN/ *before* the rollback recurses (runner.py), so by the time a
+    # revisited stage gets here the snapshot is already in place and this
+    # directory holds nothing the revisit needs — the readers that do want a
+    # snapshot look for `stage-NN_v*/…`, never the bare name.
+    #
+    # Guarded rather than unconditional because the contract below may need to
+    # distinguish "no output" from "no directory": the mkdir is what every
+    # stage writes into.
+    if stage_dir.exists():
         _rmtree_force(stage_dir)
     stage_dir.mkdir(parents=True, exist_ok=True)
     _t_health_start = _time.monotonic()

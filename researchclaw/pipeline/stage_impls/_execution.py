@@ -764,13 +764,36 @@ def _generate_llm4ad_task_packages(
         # _resolve_run_best read a stale best. Generating it here ties gen +
         # collect to the same new token per package-generation call.
         _l4b_token = uuid.uuid4().hex[:8]
-        # Kept in a variable so the finally block below can delete it. llm4ad
-        # cuts a git worktree per candidate under here; nothing else removes
-        # them, so a long-lived machine accumulates one full checkout per
-        # individual per generation per run.
-        _l4b_runs_dir = (
-            Path(tempfile.gettempdir()) / "rc_llm4ad" / run_dir.name / f"run_{_l4b_token}"
+        # Where llm4ad writes its per-candidate worktrees.
+        #
+        # Default: a temp dir. It is kept in a variable so the finally block
+        # below can delete it — llm4ad cuts a git worktree per candidate and
+        # nothing else removes them, so a long-lived machine would otherwise
+        # accumulate one full checkout per individual per generation per run.
+        #
+        # Opt-in: keep everything inside the package (`<package>/runs`) so the
+        # worktrees, checkpoints, `best/` and the live `logs/llm4ad.log` are
+        # inspectable in the artifact tree while the run is in progress. The
+        # reason this is not the default is the Windows 260-character path
+        # limit — a nested worktree path can trip it, and llm4ad then fails
+        # every candidate with `fatal: '$GIT_DIR' too big`. Linux/macOS have no
+        # equivalent limit, so production on those platforms can enable it.
+        _in_package_runs = bool(
+            getattr(_l4b, "run_evolution_in_package", False)
         )
+        _l4b_runs_dir: Path | None = None
+        if not _in_package_runs:
+            _l4b_runs_dir = (
+                Path(tempfile.gettempdir()) / "rc_llm4ad" / run_dir.name
+                / f"run_{_l4b_token}"
+            )
+        else:
+            logger.info(
+                "Stage 13: run_evolution_in_package=true — llm4ad worktrees "
+                "stay under %s (inspectable, not cleaned up). This needs a "
+                "filesystem without Windows' 260-character path limit.",
+                _tp_out,
+            )
         _manifests = generate_task_packages(
             Path(_tp_exp), _tp_out, _llm_config, _evo_cfg, _res_cfg,
             background=_topic, metric_direction=_direction,
@@ -778,8 +801,8 @@ def _generate_llm4ad_task_packages(
             # algorithms. Category membership is resolved against the per-run
             # algorithms_classification.json stage-10 wrote.
             evolve_scope=_evo_cfg.get("evolve_scope") if _evo_cfg else None,
-            # Worktrees live under the temp dir (not task_packages/, whose deep
-            # path hits Windows' 260-char limit), scoped to this invocation.
+            # None => llm4ad writes under each package's own ./runs; a path =>
+            # worktrees live there instead, scoped to this invocation.
             runs_base_dir=_l4b_runs_dir,
             run_id=_l4b_token,
         )
@@ -787,6 +810,22 @@ def _generate_llm4ad_task_packages(
             "Stage 13: generated %d LLM4AD task package(s) under %s",
             len(_manifests), _tp_out,
         )
+        if not _manifests:
+            # Zero packages is the quiet failure mode: evolve_scope matched
+            # nothing (or every algorithm was unclassifiable), so evolution is
+            # skipped and the run looks like one that simply had nothing to
+            # evolve. Warn loudly — the llm4ad results will be empty and the
+            # cause is a configuration/classification mismatch, not a
+            # modelling failure.
+            logger.warning(
+                "Stage 13: LLM4AD generated 0 task packages — nothing will be "
+                "evolved. Check evolve_scope against "
+                "experiment/algorithms_classification.json, and that "
+                "experiment/algorithms/ holds evolvable modules.",
+            )
+            log["task_packages_error"] = (
+                "0 packages generated (evolve_scope matched no algorithm)"
+            )
         log["task_packages"] = {
             "dir": str(_tp_out),
             "count": len(_manifests),
@@ -1402,6 +1441,105 @@ def _promote_llm4ad_to_experiment_final(
     return n_promoted, comparison
 
 
+def _load_project_files(exp_dir: Path) -> dict[str, str]:
+    """Read every text file of an experiment project, keyed by relative path.
+
+    Recurses so nested modules and data (``algorithms/``, ``data/*.json``)
+    survive into refinement. Binary and unreadable files are skipped.
+    """
+    files: dict[str, str] = {}
+    if not exp_dir.is_dir():
+        return files
+    for src_file in sorted(exp_dir.rglob("*")):
+        if not src_file.is_file():
+            continue
+        if src_file.suffix.lower().lstrip(".") in (
+            "py", "txt", "yaml", "yml", "json", "cfg", "ini", "sh",
+        ):
+            try:
+                files[src_file.relative_to(exp_dir).as_posix()] = src_file.read_text(
+                    encoding="utf-8"
+                )
+            except UnicodeDecodeError:
+                pass  # skip binary files
+    return files
+
+
+def _plan_condition_names(exp_plan_text: str) -> set[str]:
+    """Condition names the experiment plan fixed, or an empty set.
+
+    Only ``conditions`` is read. ``baselines``/``ablations`` hold prose in real
+    plans (``"random_search_baseline as a budget-matched non-adaptive
+    baseline"``), and treating that as a name would reject every candidate that
+    legitimately lacks it. ``conditions`` names the runnable conditions and is
+    the list the prompt tells the model to preserve.
+
+    An empty set means "could not tell", which every caller reads as permission
+    rather than as a violation.
+    """
+    if not exp_plan_text.strip():
+        return set()
+    try:
+        import yaml as _yaml
+
+        plan = _yaml.safe_load(exp_plan_text)
+    except Exception:  # noqa: BLE001 — plan text is model-written, any failure is data
+        return set()
+    if not isinstance(plan, dict):
+        return set()
+
+    names: set[str] = set()
+    for entry in plan.get("conditions") or []:
+        if isinstance(entry, dict) and entry.get("name"):
+            names.add(str(entry["name"]).strip())
+        elif isinstance(entry, str) and entry.strip():
+            names.add(entry.strip())
+    return {n for n in names if n}
+
+
+def _algorithm_names_in_files(files: dict[str, str]) -> set[str]:
+    """Algorithm directory names present in a candidate file set."""
+    return {
+        key.split("/")[1]
+        for key in files
+        if key.startswith("algorithms/") and key.count("/") >= 2
+    }
+
+
+def _check_refine_preserved_plan(
+    files: dict[str, str],
+    plan_names: set[str],
+) -> str:
+    """Why a refined candidate departs from the experiment plan, or "".
+
+    Stage 13's prompt states the rule plainly — never rename or drop a
+    condition, never add one the plan did not name — and a model still
+    rewrote a four-condition plan into nine differently-named algorithms,
+    which silently invalidated the design the paper reports and left LLM4AD's
+    evolution (run against the clean project's names) with nothing to match.
+
+    Kept to the two things that are unambiguous: a plan name that vanished,
+    and an algorithm that is not a plan name at all. Both are facts about the
+    file set, so a genuine rename cannot be mistaken for a new condition.
+    """
+    if not plan_names:
+        return ""
+    present = _algorithm_names_in_files(files)
+    if not present:
+        return ""
+    lowered = {p.lower() for p in present}
+    missing = sorted(n for n in plan_names if n.lower() not in lowered)
+    added = sorted(p for p in present if p.lower() not in {n.lower() for n in plan_names})
+    # A name that disappeared AND an unrecognised one that appeared is the
+    # signature of a rename; either alone is still a departure worth naming.
+    problems = []
+    if missing:
+        problems.append(f"dropped/renamed plan condition(s): {missing}")
+    if added:
+        problems.append(f"added condition(s) not in the plan: {added}")
+    return "; ".join(problems)
+
+
 def _execute_iterative_refine(
     stage_dir: Path,
     run_dir: Path,
@@ -1708,23 +1846,8 @@ def _execute_iterative_refine(
         )
     if not exp_dir_text:
         exp_dir_text = _read_prior_artifact(run_dir, "experiment/")
-    best_files: dict[str, str] = {}
-    if exp_dir_text and Path(exp_dir_text).is_dir():
-        # Load all text files (requirements.txt, setup.py, config etc. are
-        # needed for Docker sandbox phases), recursing so nested modules and
-        # data (algorithms/, data/*.json) survive into refinement.
-        _exp_root = Path(exp_dir_text)
-        for src_file in sorted(_exp_root.rglob("*")):
-            if not src_file.is_file():
-                continue
-            if src_file.suffix.lower().lstrip(".") in (
-                "py", "txt", "yaml", "yml", "json", "cfg", "ini", "sh",
-            ):
-                _rel = src_file.relative_to(_exp_root).as_posix()
-                try:
-                    best_files[_rel] = src_file.read_text(encoding="utf-8")
-                except UnicodeDecodeError:
-                    pass  # skip binary files
+    best_files: dict[str, str] = _load_project_files(Path(exp_dir_text)) if exp_dir_text else {}
+
     if not best_files:
         # Backward compat: single experiment.py
         original_code = _read_prior_artifact(run_dir, "experiment.py") or ""
@@ -1777,6 +1900,90 @@ def _execute_iterative_refine(
             _wf = target_dir / fname
             _wf.parent.mkdir(parents=True, exist_ok=True)
             _wf.write_text(code, encoding="utf-8")
+
+    def _restore_evolve_markers(
+        new_files: dict[str, str], old_files: dict[str, str],
+    ) -> list[str]:
+        """Re-wrap `optimize` in EVOLVE markers that a refine rewrite dropped.
+
+        Stage 10 puts `# EVOLVE_START` / `# EVOLVE_END` around each algorithm's
+        `optimize` so the evolution stage can replace that function. Refining the
+        project legitimately rewrites an algorithm — but this loop's prompt is
+        about improving the implementation, and a model that rewrites the body
+        rarely remembers to re-emit the markers. When they vanish, LLM4AD's
+        analyzer finds zero evolvable blocks, every candidate is skipped with
+        "InitSampler requires analyzed_repository with at least one evolvable
+        block", and evolution produces nothing after burning the whole stage.
+
+        Re-wrapping rather than reverting keeps whatever the refinement actually
+        improved; reverting would throw that away to fix a formatting loss. A
+        file whose `optimize` no longer parses is left alone — there is nothing
+        to wrap, and the caller's validation reports it.
+
+        Returns the file names that were fixed.
+        """
+        import ast as _ast_markers
+
+        fixed: list[str] = []
+        for fname, code in list(new_files.items()):
+            if "/" not in fname or not fname.endswith(".py"):
+                continue
+            prior = old_files.get(fname, "")
+            had = "EVOLVE_START" in prior and "EVOLVE_END" in prior
+            has = "EVOLVE_START" in code and "EVOLVE_END" in code
+            # Only rescue a marker pair this refine step dropped. A file that
+            # never had markers is left as generated — inventing a block there
+            # would make an helper module evolvable.
+            if not had or has:
+                continue
+
+            # splitlines(keepends=True) leaves the last line without a newline
+            # when the file does not end in one; appending a marker after it
+            # would merge the two into `}# EVOLVE_END`. Normalise first.
+            lines = code.splitlines(keepends=True)
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] = lines[-1] + "\n"
+            lines = [ln if ln.endswith("\n") else ln + "\n" for ln in lines]
+            try:
+                tree = _ast_markers.parse(code)
+            except SyntaxError:
+                continue
+            fn = next(
+                (
+                    n for n in _ast_markers.walk(tree)
+                    if isinstance(n, _ast_markers.FunctionDef) and n.name == "optimize"
+                ),
+                None,
+            )
+            if fn is None:
+                continue
+            # Markers go OUTSIDE the function, as the reference task packages
+            # lay them out: the whole `def ... return` is the evolvable unit.
+            start_line = fn.lineno - 1          # 0-based, the `def` line
+            end_line = fn.end_lineno            # 0-based index just past the body
+            # Leave any decorator above `def` outside the block (Python 3.8+).
+            for dec in getattr(fn, "decorator_list", []):
+                start_line = min(start_line, dec.lineno - 1)
+            if not (0 <= start_line < end_line <= len(lines)):
+                continue
+            patched = (
+                lines[:start_line]
+                + ["# EVOLVE_START\n"]
+                + lines[start_line:end_line]
+                + ["# EVOLVE_END\n"]
+                + lines[end_line:]
+            )
+            new_files[fname] = "".join(patched)
+            fixed.append(fname)
+
+        if fixed:
+            logger.warning(
+                "Stage 13: restored dropped EVOLVE markers in %d file(s): %s — "
+                "a rewrite without them is not evolvable, and would have left "
+                "Stage 13 with nothing to evolve.",
+                len(fixed), ", ".join(fixed),
+            )
+        return fixed
 
     # --- Helper: format all files for LLM context ---
     def _files_to_context(
@@ -1910,6 +2117,15 @@ def _execute_iterative_refine(
 
     # R7-3: Read experiment plan to detect condition coverage gaps
     _exp_plan_text = _read_prior_artifact(run_dir, "exp_plan.yaml") or ""
+    # The plan's condition names, used to reject a candidate that rewrites the
+    # experiment rather than its implementations. Empty when the plan names
+    # none, which the guard reads as "nothing to enforce".
+    _plan_names = _plan_condition_names(_exp_plan_text)
+    if _plan_names:
+        logger.info(
+            "Stage 13: experiment plan fixes %d condition(s): %s",
+            len(_plan_names), sorted(_plan_names),
+        )
     _condition_coverage_hint = ""
     if _exp_plan_text and run_summaries:
         # Check if stdout contains condition labels
@@ -2007,14 +2223,30 @@ def _execute_iterative_refine(
         user_prompt = ip.user + _saturation_hint
         if prior_timed_out and baseline_metric is None:
             timeout_refine_attempts += 1
+            # Shrink the COMPUTE, not the comparison. The previous wording told
+            # the model to "remove conditions that are not essential" and to
+            # "add time.time() checks to stop gracefully" — i.e. exactly the two
+            # edits that silently destroy a controlled comparison: a dropped
+            # condition (one run lost its only tuned baseline this way, and the
+            # plan had named it) and a loop that abandons every remaining
+            # condition once the clock runs out. `iterative_improve` already
+            # forbids renaming/removing conditions; this hint used to contradict
+            # it, and the hint is what the model saw last.
             timeout_hint = (
                 f"\n\nCRITICAL: The experiment TIMED OUT after {prior_time_budget}s "
-                f"with NO results. You MUST drastically reduce the experiment scale:\n"
-                f"- Reduce total runs to ≤50\n"
-                f"- Reduce steps per run to ≤2000\n"
-                f"- Remove conditions that are not essential\n"
-                f"- Add time.time() checks to stop gracefully before timeout\n"
-                f"- Print intermediate metrics frequently so partial data is captured\n"
+                f"with NO results. Cut the COST of each run — never the condition\n"
+                f"list. Every condition named in the plan MUST still appear:\n"
+                f"- Keep ALL conditions from the experiment plan. Do NOT remove any:\n"
+                f"  a missing condition is a missing baseline, and the comparison\n"
+                f"  cannot be recovered downstream.\n"
+                f"- Reduce work per condition instead: fewer steps per run (≤2000),\n"
+                f"  smaller batches/instances, fewer epochs.\n"
+                f"- Give each (condition, instance, seed) run its OWN time slice, e.g.\n"
+                f"  per_run_budget = budget / (n_conditions * n_instances * n_seeds),\n"
+                f"  and check the deadline INSIDE a run. Never break out of the\n"
+                f"  condition loop — that drops every condition still to come.\n"
+                f"- Print each result the moment it is computed, so a stop still\n"
+                f"  leaves completed conditions on stdout.\n"
                 f"- Time budget is {prior_time_budget}s — design for ≤{int(prior_time_budget * 0.7)}s\n"
             )
             user_prompt = user_prompt + timeout_hint
@@ -2053,6 +2285,10 @@ def _execute_iterative_refine(
         candidate_files = dict(best_files)
         if extracted_files:
             candidate_files.update(extracted_files)
+        # A refine rewrite that drops the EVOLVE markers leaves LLM4AD with zero
+        # evolvable blocks, which silently wastes the whole evolution stage.
+        # Restore them before this iteration is written or run.
+        _restore_evolve_markers(candidate_files, best_files)
         # If LLM returned nothing at all, candidate_files == best_files (unchanged)
 
         # BUG-R6-02: Preserve entry point when LLM strips main() function.
@@ -2137,6 +2373,23 @@ def _execute_iterative_refine(
         }
         if issue_text:
             iter_record["validation_issues"] = issue_text
+
+        # Structural guard: a refinement must edit the implementations, not the
+        # experiment. Checked before the sandbox run so an off-plan candidate
+        # costs no compute, and recorded either way so the artifact shows what
+        # was rejected rather than silently omitting an iteration.
+        _plan_violation = _check_refine_preserved_plan(candidate_files, _plan_names)
+        if _plan_violation:
+            iter_record["plan_violation"] = _plan_violation
+            logger.warning(
+                "Stage 13 iteration %d departs from the experiment plan — %s. "
+                "Not evaluated: the paper reports this plan's conditions, so a "
+                "candidate that renames or adds them cannot be the result.",
+                iteration, _plan_violation,
+            )
+            log["iterations"].append(iter_record)
+            consecutive_no_metrics += 1
+            continue
 
         metric_val = None  # R6-3: initialize before conditional block
         if validation.ok and config.experiment.mode in ("sandbox", "docker"):

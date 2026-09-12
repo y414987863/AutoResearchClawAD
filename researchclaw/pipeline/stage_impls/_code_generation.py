@@ -220,6 +220,29 @@ def _is_llm4ad_enabled(config: Any) -> bool:
         return False
 
 
+def _topic_is_ml_domain(config: Any) -> bool:
+    """True when the configured topic resolves to an ML/AI domain.
+
+    Used to decide whether dataset-specific guidance applies — an ML experiment
+    may need the image datasets the image ships, a numerical or physical one does
+    not. Detection is delegated to the shared domain detector so this stays in
+    step with every other stage instead of growing its own keyword list.
+
+    Defaults to False on any failure: withholding dataset advice is recoverable
+    (the model can still write a working experiment), while injecting the wrong
+    advice actively misdirects it.
+    """
+    try:
+        from researchclaw.domains.detector import detect_domain, is_ml_domain
+
+        topic = getattr(getattr(config, "research", None), "topic", "") or ""
+        if not topic:
+            return False
+        return bool(is_ml_domain(detect_domain(topic=topic)))
+    except Exception:  # noqa: BLE001 - advisory classification
+        return False
+
+
 def _llm4ad_constraint_text(config: Any) -> str:
     """LLM4AD structure-constraint snippet, single source of truth.
 
@@ -268,6 +291,46 @@ def _check_rl_compatibility(code: str) -> list[str]:
     return errors
 
 
+#: Calls that return the argument they were given (or a shallow/deep copy of
+#: it), so `x = f(instance)` does keep `x` an instance. Anything else —
+#: `metrics = score_model(instance, ...)` — returns a different object that
+#: merely happened to take the instance as an argument, and treating it as an
+#: alias made the check accuse correct code of a missing data field.
+_ALIAS_PRESERVING_CALLS: frozenset[str] = frozenset({"dict", "copy", "deepcopy"})
+
+
+def _alias_source(value: ast.AST) -> str | None:
+    """Return the name ``value`` aliases, or ``None`` when it is not an alias.
+
+    Recognises only the value-preserving spellings generated code uses to carry
+    an instance around: ``x = instance``, ``x = dict(instance)``,
+    ``x = copy(instance)``, ``x = deepcopy(instance)`` and ``x = {**instance}``.
+
+    A constructor — ``x = Wrapper(instance)`` — is deliberately NOT recognised,
+    and neither is any other call: both return a new object that merely took the
+    instance as an argument, so counting them as aliases invents instance reads
+    that are not there. Staying narrow costs at most a missed alias, which only
+    weakens the check; being broad makes it report a defect in correct code, and
+    that is the failure that matters because it sends the repair loop after
+    working code.
+    """
+    if isinstance(value, ast.Name):
+        return value.id
+    if isinstance(value, ast.Dict) and len(value.keys) == 1 and value.keys[0] is None:
+        # ``{**instance}`` — the single value is the unpacked mapping.
+        inner = value.values[0]
+        return inner.id if isinstance(inner, ast.Name) else None
+    if isinstance(value, ast.Call) and value.args:
+        fn = value.func
+        name = fn.id if isinstance(fn, ast.Name) else (
+            fn.attr if isinstance(fn, ast.Attribute) else ""
+        )
+        if name in _ALIAS_PRESERVING_CALLS:
+            first = value.args[0]
+            return first.id if isinstance(first, ast.Name) else None
+    return None
+
+
 def _hard_indexed_instance_keys(code: str) -> set[str]:
     """Keys an algorithm reads as ``instance["k"]`` with no fallback.
 
@@ -307,12 +370,8 @@ def _hard_indexed_instance_keys(code: str) -> set[str]:
             target = node.targets[0]
             if not isinstance(target, ast.Name):
                 continue
-            src = node.value
-            if isinstance(src, ast.Call) and src.args:
-                src = src.args[0]
-            elif isinstance(src, ast.Dict) and len(src.keys) == 1 and src.keys[0] is None:
-                src = src.values[0]
-            if isinstance(src, ast.Name) and src.id in aliases:
+            src = _alias_source(node.value)
+            if src is not None and src in aliases:
                 aliases.add(target.id)
 
     keys: set[str] = set()
@@ -444,10 +503,22 @@ def _evolve_block_problems(path: str, code: str) -> list[str]:
             "whole function is the evolvable unit."
         )
 
+    # Only a helper defined OUTSIDE the markers can hide the algorithm: its body
+    # is then frozen and evolution cannot reach it. A module-level class or
+    # function that sits inside the marked region is part of the evolvable unit
+    # and is rewritten along with `optimize`, so calling it is not delegation —
+    # the reference task packages are laid out exactly that way (a
+    # `# EVOLVE_START` block containing a helper class *and* the function that
+    # uses it). Keying on "is a module-level definition" alone flagged those as
+    # broken and sent the repair loop after correct code.
     helpers = {
         n.name for n in tree.body
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
         and n.name != "optimize"
+        and not (
+            start_line <= n.lineno
+            and (n.end_lineno or n.lineno) <= end_line
+        )
     }
     if helpers:
         # A name bound inside `optimize` is a LOCAL that shadows the module-level
@@ -629,16 +700,38 @@ def _check_llm4ad_structure(files: dict[str, str], metric_key: str = "") -> list
             "LLM4AD_STRUCTURE: missing `main.py` entry point."
         )
     else:
+        # The metric-output needle is the metric this experiment actually
+        # reports, not the literal string "primary_metric": the generator picks
+        # the metric name freely (``ndcg_at_10``, ``accuracy``, …), and
+        # ``primary_metric`` is only a legacy placeholder. Searching for the
+        # placeholder made a correct `print(f"ndcg_at_10: {v}")` look like a
+        # missing output, which sent the repair loop after working code.
+        #
+        # Accept ANY plausible name — the evaluator's declared PRIMARY_METRIC,
+        # the config's metric_key, and the legacy placeholder — because the
+        # requirement is that `main.py` prints *its* metric; a mismatch between
+        # the two names is already reported by `_metric_mismatch_problem`.
+        _metric_names = sorted({
+            n for n in (
+                _generated_primary_metric(files),
+                (metric_key or "").strip(),
+                "primary_metric",
+            ) if n
+        })
         for needle, label in (
             ("--algorithm", "`--algorithm` CLI argument"),
             ("importlib", "dynamic `importlib` loading"),
-            ("primary_metric", "`primary_metric` output"),
             ('if __name__ == "__main__":', "`if __name__ == \"__main__\":` entry guard"),
         ):
             if needle not in main_code:
                 problems.append(
                     f"LLM4AD_STRUCTURE: `main.py` missing {label}."
                 )
+        if not any(n in main_code for n in _metric_names):
+            problems.append(
+                "LLM4AD_STRUCTURE: `main.py` missing the primary-metric output — "
+                f"it must print `<metric>: <value>` using one of {_metric_names}."
+            )
 
     # Stage-13's package runner imports these two symbols BY NAME and nothing
     # else; a missing export fails every algorithm at package-build time (after
@@ -1505,7 +1598,19 @@ def _execute_code_generation(
                     f"- Avoid large batch sizes\n"
                 )
         else:
-            pkg_hint = _pm.block("pkg_hint_sandbox")
+            # No GPU: the package list comes from config, not from a prompt
+            # constant. `experiment.sandbox.allowed_imports` is what the sandbox
+            # actually enforces, so rendering the hint from it is the only way
+            # the model and the runtime can agree. The two used to be separate
+            # hardcoded lists that contradicted each other.
+            from researchclaw.prompts.shared import render_package_hint
+
+            _allowed = getattr(
+                getattr(config.experiment, "sandbox", None), "allowed_imports", (),
+            )
+            pkg_hint = _pm.block(
+                "pkg_hint_sandbox", packages=render_package_hint(_allowed),
+            )
     else:
         pkg_hint = ""
 
@@ -1533,9 +1638,15 @@ def _execute_code_generation(
             else "none"  # sandbox mode has no network
         )
         if _net_policy == "none":
-            # Network disabled: inject strict offline-only guidance
+            # Network disabled: inject strict offline-only guidance.
             try:
                 extra_guidance += _pm.block("network_disabled_guidance")
+                # The pre-cached image datasets are useful only to a domain that
+                # consumes them. Appending them unconditionally told a numerical
+                # optimization study to prefer CIFAR-10, which is off-topic noise
+                # that competes with the actual method for the model's attention.
+                if _topic_is_ml_domain(config):
+                    extra_guidance += _pm.block("ml_offline_datasets")
             except Exception:  # noqa: BLE001
                 pass
         elif _net_policy == "full":
@@ -2504,11 +2615,23 @@ def _execute_code_generation(
                 max_tokens=_code_max_tokens,
             )
             repaired = _extract_multi_file_blocks(repair_resp.content)
+            _dr_prev = dict(files)  # pre-repair copy (marker provenance)
             files, _known = _merge_repaired_files(
                 files, repaired, label="deep repair"
             )
-            if _known:
-                for fname, code in _known.items():
+            # Same marker guard as the OpenCode and smoke-fix paths. A deep
+            # repair rewrites whole files to fix structural defects, which is
+            # exactly when a model drops the `# EVOLVE_START` / `# EVOLVE_END`
+            # pair; without this the algorithm silently becomes non-evolvable
+            # and the evolution stage produces nothing.
+            _dr_reverted = _revert_marker_dropped_files(
+                _dr_prev, _known, label="deep repair",
+            )
+            for _fn in _dr_reverted:
+                files[_fn] = _dr_prev[_fn]  # restore marker-bearing original
+            if _known or _dr_reverted:
+                for fname in dict.fromkeys(list(_known) + _dr_reverted):
+                    code = files[fname]
                     _wp = exp_dir / fname
                     _wp.parent.mkdir(parents=True, exist_ok=True)
                     _wp.write_text(code, encoding="utf-8")
@@ -2657,14 +2780,23 @@ def _execute_code_generation(
                         )
                         fixed_files = _extract_multi_file_blocks(fix_resp.content)
                         # Partial reply is normal — see deep-repair note above.
+                        _rf_prev = dict(files)  # pre-repair copy (marker provenance)
                         files, _fx = _merge_repaired_files(
                             files, fixed_files, label="review-fix"
                         )
-                        if _fx:
-                            for fname, code in _fx.items():
+                        # Same marker guard as the OpenCode/smoke-fix/deep-repair
+                        # paths: a review-driven rewrite must not strip the
+                        # EVOLVE pair, or the algorithm stops being evolvable.
+                        _rf_reverted = _revert_marker_dropped_files(
+                            _rf_prev, _fx, label="review-fix",
+                        )
+                        for _fn in _rf_reverted:
+                            files[_fn] = _rf_prev[_fn]
+                        if _fx or _rf_reverted:
+                            for fname in dict.fromkeys(list(_fx) + _rf_reverted):
                                 _wp = exp_dir / fname
                                 _wp.parent.mkdir(parents=True, exist_ok=True)
-                                _wp.write_text(code, encoding="utf-8")
+                                _wp.write_text(files[fname], encoding="utf-8")
                             logger.info(
                                 "Stage 10: Code fixed after review "
                                 "(was %d/10, %d critical issues)",
