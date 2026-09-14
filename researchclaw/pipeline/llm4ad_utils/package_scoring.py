@@ -959,6 +959,7 @@ __all__ = [
     "PKG_REFINE_LLM4AD",
     "ScoreResult",
     "build_and_score_packages",
+    "final_experiment_for_config",
     "metrics_from_stdout",
     "run_final_package",
     "package_scoring_for_config",
@@ -997,3 +998,169 @@ def package_scoring_for_config(
         if on_error is not None:
             on_error(exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Stage 14 consumes Stage 13's decision (the path that replaced the re-score)
+# ---------------------------------------------------------------------------
+
+def _find_final_experiment(run_dir: Path) -> Path | None:
+    """The current ``stage-13/experiment_final``, when it holds a project.
+
+    Stage 13's promote step rebuilds this directory from the *clean* stage-10
+    code and overlays only the evolved modules that beat their baseline under
+    the experiment's own evaluator. It is therefore the delivered system:
+    stage-10 plus whatever LLM4AD genuinely improved — and, unlike the four
+    packages Stage 14 used to assemble, it is internally consistent, because
+    every module in it was built against the same ``objectives``/``evaluator``
+    API that sits beside it.
+    """
+    stage13 = _newest_stage13(run_dir)
+    if stage13 is None:
+        return None
+    candidate = stage13 / "experiment_final"
+    if candidate.is_dir() and (candidate / "main.py").is_file():
+        return candidate
+    return None
+
+
+def _read_llm4ad_comparison(stage13: Path) -> tuple[int, dict[str, Any]]:
+    """Per-algorithm promotion verdicts written by Stage 13, and their count.
+
+    ``llm4ad_comparison.json`` is the record of the decision Stage 13 already
+    made: for every algorithm it attempted to evolve, the clean baseline, the
+    evolved score, the delta, and whether the evolved module was promoted into
+    ``experiment_final/``. Stage 14 reports this; it does not recompute it.
+
+    Returns ``(n_promoted, algorithms)``. A missing or unreadable file yields
+    ``(0, {})`` rather than raising — a run whose Stage 13 predates this file
+    should degrade to "no attribution recorded", not lose its analysis.
+    """
+    path = stage13 / "llm4ad_comparison.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "Stage 14: could not read %s (%s) — no per-algorithm attribution "
+            "will be recorded.", path, exc,
+        )
+        return 0, {}
+    if not isinstance(payload, dict):
+        return 0, {}
+    algos = payload.get("algorithms")
+    n = payload.get("n_promoted")
+    return (
+        int(n) if isinstance(n, int) else 0,
+        algos if isinstance(algos, dict) else {},
+    )
+
+
+def _inflate_scratch(final_dir: Path, scratch: Path) -> None:
+    """Copy *final_dir* into *scratch*, skipping VCS and bytecode caches."""
+    import shutil
+
+    def _ignore(_dir: str, names: list[str]) -> set[str]:
+        return {n for n in names if n in ("__pycache__", ".git", ".venv", "runs")}
+
+    shutil.copytree(final_dir, scratch, dirs_exist_ok=True, ignore=_ignore)
+
+
+def final_experiment_for_config(
+    run_dir: Path,
+    stage_dir: Path,
+    config: Any,
+    *,
+    timeout_sec: int = _SCORING_TIMEOUT_SEC,
+    python: str | None = None,
+) -> dict[str, Any] | None:
+    """Stage 14's LLM4AD path: report Stage 13's result, re-running it once.
+
+    Stage 13 owns the LLM4AD decision — it builds the task packages, runs the
+    evolution, compares each evolved algorithm against the clean stage-10
+    baseline through the experiment's own evaluator, and overlays only the
+    winners into ``experiment_final/``. Stage 14 re-deriving that decision was
+    the defect: it rebuilt four packages against ``legacy_refine_baseline``,
+    whose ``objectives.py`` the refine loop had rewritten, so code evolved
+    against the stage-10 API could not even be imported (``make_objective``
+    gone, ``get_objective`` in its place) and every evolved algorithm scored as
+    a failure in a project it was never written for.
+
+    What is left for this stage is to *report* the delivered system:
+
+    * the per-algorithm verdicts, read from ``llm4ad_comparison.json``;
+    * the delivered project's metrics, from running its own ``main.py`` — the
+      one number a reader can reproduce — in a scratch copy, so no
+      ``__pycache__`` or rewritten ``results.json`` is left in the artifact
+      directory a reviewer is pointed at.
+
+    "Re-run once" is not redundant: ``experiment_final/results.json`` is the
+    stage-10 snapshot, written before the evolved modules were overlaid, and
+    would otherwise be shipped next to code it does not describe.
+
+    Returns ``None`` when ``llm4ad_boost`` is off or Stage 13 left no
+    ``experiment_final/``, so the caller keeps whatever it collected. Otherwise
+    a dict with the attribution fields, the metric dict, and the run status —
+    including when that status is a failure. A failure is reported as a
+    failure; it never falls back to another stage's numbers.
+    """
+    boost = getattr(getattr(config, "experiment", None), "llm4ad_boost", None)
+    if not (boost is not None and getattr(boost, "enabled", False)):
+        return None
+
+    final_dir = _find_final_experiment(run_dir)
+    if final_dir is None:
+        logger.warning(
+            "Stage 14: llm4ad_boost is on but Stage 13 left no experiment_final/ "
+            "under %s — nothing to report.", run_dir,
+        )
+        return None
+
+    exp_cfg = getattr(config, "experiment", None)
+    metric_key = str(getattr(exp_cfg, "metric_key", "") or "")
+    metric_direction = str(getattr(exp_cfg, "metric_direction", "") or "")
+
+    stage13 = final_dir.parent
+    n_promoted, algorithms = _read_llm4ad_comparison(stage13)
+
+    scratch = stage_dir / "_final_run"
+    try:
+        _inflate_scratch(final_dir, scratch)
+    except OSError as exc:
+        logger.warning(
+            "Stage 14: could not stage %s for a clean run: %s", final_dir, exc,
+        )
+        scratch = final_dir
+
+    status, metrics = run_final_package(
+        scratch, timeout_sec=timeout_sec, python=python,
+    )
+    if status != "ok":
+        logger.warning(
+            "Stage 14: the delivered project (%s) did not produce metrics: %s. "
+            "Reporting the failure rather than substituting another stage's "
+            "numbers — every figure below must belong to the code that ships.",
+            final_dir, status,
+        )
+    else:
+        logger.info(
+            "Stage 14: read %d metric(s) from %s; %d algorithm(s) carry an "
+            "evolved implementation.", len(metrics), final_dir, n_promoted,
+        )
+
+    n_algorithms = len(algorithms)
+    return {
+        "package_dir": str(final_dir),
+        "n_promoted": n_promoted,
+        "n_algorithms": n_algorithms,
+        "metric_key": metric_key,
+        "metric_direction": metric_direction,
+        "results_status": status,
+        "metrics": metrics,
+        "algorithms": algorithms,
+        "decision_rule": (
+            "per-algorithm: Stage 13 keeps the evolved <algo>.py over the clean "
+            "stage-10 baseline only when it scores better on their shared "
+            "instances under the experiment's own evaluator; the rest of "
+            "experiment_final/ is clean stage-10 code"
+        ),
+    }
