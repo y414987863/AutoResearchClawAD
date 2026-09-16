@@ -70,6 +70,18 @@ _SKIP_PATTERNS = [
     re.compile(r"\\resizebox\{[^}]*\}\{[^}]*\}"),
     re.compile(r"\\begin\{algorithmic\}.*?\\end\{algorithmic\}", re.DOTALL),
     re.compile(r"\\begin\{algorithm\}.*?\\end\{algorithm\}", re.DOTALL),
+    # Section headings: the number is the section's own index ("### 5.2 ..."),
+    # not a measurement, and it is never in the registry.
+    re.compile(r"^#{1,6}\s*\d+(?:\.\d+)*[.)]?", re.MULTILINE),
+    # Structural counts inside a caption ("... 12 conditions.") describe the
+    # table, not its contents.
+    re.compile(
+        r"\b\d+(?:\.\d+)?\s+"
+        r"(?:conditions?|runs?|seeds?|instances?|functions?|methods?|tables?|"
+        r"figures?|sections?|experiments?|datasets?|rows?|columns?|trials?|"
+        r"repetitions?|samples?|epochs?|steps?)\b",
+        re.IGNORECASE,
+    ),
 ]
 
 # Strict sections — unverified numbers cause REJECT
@@ -413,29 +425,227 @@ def _check_condition_names(
         "results", "table", "figure", "section",
     }
 
-    def _is_candidate(name: str) -> bool:
-        """Check if a cleaned name looks like a real condition name."""
-        return bool(
-            name
-            and name.lower() not in known_lower
-            and name.lower() not in _GENERIC_TERMS
-            and not name.startswith("\\")
-            and len(name) > 1
-            and not name.isdigit()
-            # BUG-DA8-15: Reject numeric-looking strings (e.g. "91.5" from \textbf{91.5})
-            and not re.match(r'^[\d.eE+\-]+$', name)
-        )
+    def _norm(name: str) -> str:
+        """Collapse a display name to a comparable key.
+
+        A paper renders ``cma_es`` as "CMA-ES" and ``random_search_baseline``
+        as "Random Search"; comparing those strings literally marks every
+        correctly named row as a fabricated condition. Letters, digits and
+        word boundaries are what carry identity here, so punctuation, case,
+        spacing, and a trailing "/<instance>" qualifier are all dropped.
+        """
+        base = name.split("/")[0]
+        base = re.sub(r"[^0-9a-z]+", "", base.lower())
+        return base
+
+    _known_norm = {_norm(n) for n in registry.condition_names}
+    # Generic header words a table's first column may hold ("Abbrev.",
+    # "Comparison", "Method"). These introduce a table, they do not name a
+    # condition, and no experiment would register one.
+    _TABLE_HEADER_TERMS = {
+        "abbrev", "abbreviation", "comparison", "comparisons", "method",
+        "methods", "metric", "metrics", "condition", "conditions", "regime",
+        "regimes", "objective", "objectives", "function", "functions",
+        "instance", "instances", "dataset", "datasets", "model", "models",
+        "statistic", "statistics", "symbol", "notation", "term", "terms",
+        "value", "values", "parameter", "parameters", "name", "names",
+        "seed", "seeds", "task", "tasks", "suite", "benchmark",
+        # Column labels a statistics or aggregate table uses.
+        "meandiff", "stddiff", "std", "diff", "tstatistic", "tstat", "pvalue",
+        "significance", "aggregate", "meanoverfunctions", "meanoverinstances",
+        "valley", "multimodal", "hardvalley", "easymultimodal",
+    }
 
     def _clean_latex(s: str) -> str:
         s = re.sub(r"\\textbf\{([^}]*)\}", r"\1", s)
         s = re.sub(r"\\textit\{([^}]*)\}", r"\1", s)
         return s.replace("\\_", "_").strip()
 
+    def _initials(text: str) -> str:
+        """Initials of the words in *text* ("Nelder--Mead" -> "nm")."""
+        return "".join(w[0] for w in re.findall(r"[0-9a-z]+", text.lower()))
+
+    _known_initials = {_initials(n) for n in _known_norm} | {
+        _initials(re.sub(r"[^0-9a-z]+", " ", n)) for n in registry.condition_names
+    }
+    # Single-letter initials are not evidence of anything — "MyMethod" would
+    # abbreviate to "m" and any word starting with that letter would pass.
+    _known_initials = {i for i in _known_initials if len(i) >= 2}
+
+    # A definitions table maps an abbreviation to the name it stands for
+    # ("NM & Nelder--Mead", "P-OLS & pointwise\_linear"). Record those pairs so
+    # an abbreviation is only accepted where the paper itself says what it
+    # abbreviates, and only when the expansion names a condition that ran.
+    #
+    # The label is matched on its collapsed form rather than on "short, all
+    # uppercase, letters only": abbreviations like "P-OLS" and "RNet-L" carry a
+    # hyphen and mixed case, and rejecting those made the definitions table the
+    # source of a false REJECT — every use of an abbreviation the paper had
+    # just defined was reported as a fabricated condition.
+    _abbrev_ok: set[str] = set()
+
+    _in_tabular = False
+    _table_has_numbers = False
+    for line in lines:
+        if r"\begin{tabular}" in line:
+            _in_tabular = True
+            _table_has_numbers = False
+            continue
+        if r"\end{tabular}" in line:
+            _in_tabular = False
+            continue
+        if not _in_tabular or "&" not in line:
+            continue
+        cells = [c.strip() for c in line.split("&")]
+        if len(cells) < 2:
+            continue
+        # A results table's cell is a number. A table whose data cells are all
+        # text is describing something — a configuration schema ("NM & simplex
+        # init scale; xtol/ftol & N/A"), a definitions list, a notation table —
+        # and its first column holds labels for those fields, not names of
+        # conditions that were supposed to run. Reading one as a results table
+        # reports every label in it as a fabricated condition.
+        _numeric_cells = 0
+        for _c in cells[1:]:
+            _cs = _clean_latex(_c.strip().rstrip("\\").strip())
+            if re.match(r"^[-+]?[\d.]+(?:[eE][-+]?\d+)?$", _cs):
+                _numeric_cells += 1
+        if _numeric_cells:
+            _table_has_numbers = True
+        if not _table_has_numbers:
+            continue
+        raw_label = _clean_latex(cells[0].strip().rstrip("\\").strip())
+        raw_value = _clean_latex(cells[1].strip().rstrip("\\").strip())
+        _label_norm = _norm(raw_label)
+        if not (1 < len(raw_label) <= 12 and _label_norm and len(_label_norm) <= 8):
+            continue
+        # The expansion must name a condition that ran. Compare on initials
+        # ("NM" for "Nelder--Mead", "PL" for "Pointwise Linear") as well as on
+        # the collapsed form, since a hyphenated name carries no space to split
+        # on and "P-OLS" collapses to the same key as "POLS".
+        _init = _initials(raw_value)
+        if _init and _init.upper() == _label_norm.upper():
+            _abbrev_ok.add(_label_norm)
+            continue
+        if _init and _init in _known_initials:
+            _abbrev_ok.add(_label_norm)
+            continue
+        _value_norm = _norm(raw_value)
+        if _value_norm and any(
+            _value_norm in known or known in _value_norm for known in _known_norm
+        ):
+            _abbrev_ok.add(_label_norm)
+            continue
+        for known in _known_norm:
+            if _init and _init in known:
+                _abbrev_ok.add(_label_norm)
+                break
+
+    #: Words that introduce a table rather than name a condition.
+    _TABLE_HEADER_TERMS = {
+        "abbrev", "abbreviation", "comparison", "comparisons", "method",
+        "methods", "metric", "metrics", "condition", "conditions", "regime",
+        "regimes", "objective", "objectives", "function", "functions",
+        "instance", "instances", "dataset", "datasets", "model", "models",
+        "statistic", "statistics", "symbol", "notation", "term", "terms",
+        "value", "values", "parameter", "parameters", "name", "names",
+        "seed", "seeds", "task", "tasks", "suite", "benchmark",
+        # Column labels a statistics or aggregate table uses.
+        "meandiff", "stddiff", "std", "diff", "tstatistic", "tstat", "pvalue",
+        "significance", "aggregate", "meanoverfunctions", "meanoverinstances",
+        "valley", "multimodal", "hardvalley", "easymultimodal",
+    }
+
+    def _is_candidate(name: str) -> bool:
+        """Check if a cleaned name looks like a real condition name."""
+        if not name or name.startswith("\\") or len(name) <= 1:
+            return False
+        if name.lower() in known_lower or name.lower() in _GENERIC_TERMS:
+            return False
+        if name.isdigit() or re.match(r"^[\d.eE+\-]+$", name):
+            # BUG-DA8-15: numeric-looking strings (e.g. "91.5" from \textbf)
+            return False
+        # A cell may hold a multi-word label rather than a name: a group
+        # heading ("Multimodal (Ackley+Rastrigin)", "Aggregate primary_metric
+        # (mean over functions)") or a column header ("Mean Diff"). Those
+        # describe a table's structure. A condition name is a single token, so
+        # a cell with several words is not one.
+        if len(name.split()) > 1:
+            return False
+        norm = _norm(name)
+        if not norm:
+            return False
+        # Already a registered condition under any rendering.
+        if norm in _known_norm:
+            return False
+        # An abbreviation the paper defines, whose expansion names a condition
+        # that ran, is not a fabricated condition.
+        if norm in _abbrev_ok:
+            return False
+        # A substring of a registered condition, or a label one contains —
+        # e.g. "Ackley" for "cma_es/ackley_10d". The check exists to catch
+        # conditions that never ran; a fragment of a real name is not that.
+        if not norm.isalpha():
+            return True
+        for known in _known_norm:
+            if norm and (norm in known or known in norm):
+                return False
+        if norm in _TABLE_HEADER_TERMS:
+            return False
+        return True
+
+
     _seen_names: set[str] = set()
 
     # 1. Extract potential condition names from TABLE ROWS
+    #
+    # A row is `&`-separated and ends with `\\`, but so are the branches of an
+    # `aligned`/`cases`/`array` block inside a display equation: a wrapper
+    # definition renders as `f(x) & \text{if } c < B,\\`, whose first cell is a
+    # mathematical symbol, not a condition. Track math environments and skip
+    # their lines, or every formula that uses alignment is read as a table.
+    _MATH_ENV_RE = re.compile(
+        r"\\begin\{(aligned|align|align\*|cases|array|matrix|pmatrix|bmatrix|"
+        r"split|gather|gather\*|eqnarray|eqnarray\*|smallmatrix)\}"
+    )
+    _MATH_END_RE = re.compile(
+        r"\\end\{(aligned|align|align\*|cases|array|matrix|pmatrix|bmatrix|"
+        r"split|gather|gather\*|eqnarray|eqnarray\*|smallmatrix)\}"
+    )
+    _in_math = 0
+    _in_tabular_rows = False
+    _tabular_has_numbers = False
     for i, line in enumerate(lines):
+        if _MATH_ENV_RE.search(line):
+            _in_math += 1
+        if _MATH_ENV_RE.search(line) and _MATH_END_RE.search(line):
+            _in_math -= 1
+            continue
+        if _in_math and _MATH_END_RE.search(line):
+            _in_math -= 1
+            continue
+        if _in_math:
+            continue
+        # Track tabular blocks. A row is a condition row only if the table it
+        # belongs to reports numbers somewhere — a schema, notation, or
+        # definitions table has text in every data cell, so its first column
+        # names fields rather than conditions that ran.
+        if r"\begin{tabular}" in line:
+            _in_tabular_rows = True
+            _tabular_has_numbers = False
+            continue
+        if r"\end{tabular}" in line:
+            _in_tabular_rows = False
+            continue
+        if _in_tabular_rows and "&" in line and "\\\\" in line:
+            for _c in line.split("&")[1:]:
+                _cs = _clean_latex(_c.strip().rstrip("\\").strip())
+                if re.match(r"^[-+]?[\d.]+(?:[eE][-+]?\d+)?$", _cs):
+                    _tabular_has_numbers = True
+                    break
         if "&" in line and "\\\\" in line:
+            if _in_tabular_rows and not _tabular_has_numbers:
+                continue
             cells = line.split("&")
             if cells:
                 cand_clean = _clean_latex(cells[0].strip().rstrip("\\").strip())

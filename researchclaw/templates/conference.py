@@ -16,6 +16,18 @@ from pathlib import Path
 # Root directory for bundled style files
 _STYLES_DIR = Path(__file__).parent / "styles"
 
+# Math symbols papers use that only *some* preambles define.
+#
+# \triangleq ("≜", "is defined as") comes from amssymb. Templates that load
+# amssymb — and any style file that pulls it in — already have it, but the
+# article-based ones do not, and a paper that writes
+# "n_{\mathrm{eval}} \triangleq \sum ..." then fails with "Undefined control
+# sequence" and no PDF. \providecommand defines the macro only when it is not
+# already defined, so this is a no-op wherever the symbol already exists.
+_MATH_SYMBOL_FALLBACKS = (
+    "\\providecommand{\\triangleq}{\\mathrel{\\overset{\\triangle}{=}}}%"
+)
+
 
 @dataclass(frozen=True)
 class ConferenceTemplate:
@@ -100,6 +112,7 @@ class ConferenceTemplate:
             f"{docclass_line}"
             f"{style_line}"
             f"{pkg_lines}\n"
+            f"{_MATH_SYMBOL_FALLBACKS}\n"
             f"{preamble_extra}\n"
             f"\n"
             f"{preamble_title}"

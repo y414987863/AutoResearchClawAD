@@ -802,6 +802,92 @@ Generated: {_utcnow_iso()}
 # _sanitize_fabricated_data helper
 # ---------------------------------------------------------------------------
 
+def _derive_table_aggregates(exp_data: dict[str, Any]) -> set[float]:
+    """Numbers a results table reports but the artifact never stores.
+
+    ``experiment_summary.json`` holds per-(condition, instance, seed) values.
+    A table cell reports the mean over seeds and a summary row reports the mean
+    of those means; both are recomputed here so the sanitizer can recognise
+    them. Returns an empty set when the summary has no per-seed keys, which
+    leaves single-seed and single-instance runs behaving as before.
+    """
+    metrics_summary = exp_data.get("metrics_summary")
+    if not isinstance(metrics_summary, dict):
+        return set()
+
+    _per_seed = re.compile(
+        r"^(?P<cond>[^/]+)/(?P<inst>[^/]+)/(?P<seed>\d+)/(?P<metric>[^/]+)$"
+    )
+    derived: set[float] = set()
+    # metric -> condition -> instance -> {seed: value}
+    grouped: dict[str, dict[str, dict[str, dict[int, float]]]] = {}
+    for key, stats in metrics_summary.items():
+        m = _per_seed.match(str(key))
+        if not m or not isinstance(stats, dict):
+            continue
+        value = stats.get("mean")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            continue
+        value = float(value)
+        if not math.isfinite(value):
+            continue
+        metric = m.group("metric")
+        grouped.setdefault(metric, {}).setdefault(m.group("cond"), {}).setdefault(
+            m.group("inst"), {}
+        )[int(m.group("seed"))] = value
+
+    for conds in grouped.values():
+        for instances in conds.values():
+            instance_means: list[float] = []
+            for seeds in instances.values():
+                vals = [seeds[s] for s in sorted(seeds)]
+                if not vals:
+                    continue
+                mean = sum(vals) / len(vals)
+                instance_means.append(mean)
+                derived.add(mean)
+                if len(vals) >= 2:
+                    var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
+                    derived.add(math.sqrt(var))
+            if len(instance_means) >= 2:
+                _add_subset_means(derived, instance_means)
+    return derived
+
+
+def _add_subset_means(out: set[float], instance_means: list[float]) -> None:
+    """The full mean and every sub-group mean a regime table would report.
+
+    A draft that splits instances into regimes (e.g. "multimodal" = Ackley +
+    Rastrigin) reports the mean over that subset, which is neither the full
+    aggregate nor any single instance. Enumerating the subsets keeps such a
+    table verifiable without the sanitizer having to guess the partition: the
+    only subsets it accepts are means of instances that were actually run.
+    """
+    n = len(instance_means)
+    if n > 16:
+        # Exponential in n; fall back to the full mean plus pairs, which covers
+        # the regime splits a results table realistically reports.
+        _add_mean_of(out, instance_means)
+        for i in range(n):
+            for j in range(i + 1, n):
+                _add_mean_of(out, [instance_means[i], instance_means[j]])
+        return
+    for mask in range(1, 1 << n):
+        subset = [instance_means[i] for i in range(n) if mask & (1 << i)]
+        _add_mean_of(out, subset)
+
+
+def _add_mean_of(out: set[float], values: list[float]) -> None:
+    """Register the mean and std of *values*, when there are enough of them."""
+    if not values:
+        return
+    mean = sum(values) / len(values)
+    out.add(mean)
+    if len(values) >= 2:
+        var = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
+        out.add(math.sqrt(var))
+
+
 def _sanitize_fabricated_data(
     paper: str,
     run_dir: Path,
@@ -874,6 +960,40 @@ def _sanitize_fabricated_data(
         ):
             if key in exp_data:
                 _collect_numbers(exp_data[key])
+
+        # Register the aggregations a results table is built from. The summary
+        # stores per-(instance, seed) values, but a table cell reports the mean
+        # over seeds and the summary row reports the mean of those means — and
+        # neither number appears anywhere in the file. Without them here, every
+        # correct table cell was replaced with "---" while a stale value that
+        # happened to round to a stored one survived.
+        for _v in _derive_table_aggregates(exp_data):
+            verified_values.add(_v)
+
+    # Rounding-equivalent spellings of every verified value. A paper prints
+    # ``46.20`` where the artifact holds ``46.19646348873409``; the fixed 1%
+    # relative tolerance rejects the printed form of a correct number whenever
+    # the value is near zero or the printed precision is coarse (e.g. ``0.2846``
+    # against ``0.284649…`` is a 0.017% error at 4dp but ``6.2368`` vs
+    # ``6.236789…`` is finer still). Matching on rounding at a range of
+    # precisions accepts the printed forms of real values without admitting a
+    # fabricated one, which still has to survive being rounded to the same
+    # number as a real measurement.
+    def _with_rounded_forms(values: set[float]) -> set[float]:
+        out = set(values)
+        for v in values:
+            if not math.isfinite(v) or v == 0:
+                continue
+            for _nd in (0, 1, 2, 3, 4, 5, 6):
+                try:
+                    r = round(v, _nd)
+                except (ValueError, OverflowError):
+                    continue
+                if math.isfinite(r):
+                    out.add(r)
+        return out
+
+    verified_values = _with_rounded_forms(verified_values)
 
     # BUG-222: Removed BUG-206 refinement_log scanning.  The original BUG-206
     # rationale was "Stage 17 injects sandbox metrics, so the sanitizer must
@@ -1170,7 +1290,14 @@ def _sanitize_fabricated_data(
                 result_parts.append(part)
                 continue
 
-            # Data row — split by & and sanitize cells after the first
+            # Data row — split by & and sanitize cells after the first.
+            #
+            # The markdown pass skips cells at index <= 1 because a markdown row
+            # starts with two pipes, so its first *data* column sits at index 1.
+            # A LaTeX row has no leading pipe: index 0 is the label column and
+            # index 1 already holds a number. The old `ci == 0` guard therefore
+            # left the first numeric column of every LaTeX table unsanitized —
+            # the one column a reader is most likely to check.
             cells = part.split("&")
             sanitized_cells: list[str] = []
             for ci, cell in enumerate(cells):
@@ -1189,7 +1316,62 @@ def _sanitize_fabricated_data(
     # Scan Results/Experiments sections for inline numeric claims like
     # "achieved 94.2% accuracy" or "obtained an AUROC of 0.87".
     # Replace unverified numbers with "[value removed]".
+    #
+    # This is a CONSISTENCY check, not a correctness one: it can only remove a
+    # number it cannot ground, so it errs toward silence. Two renderings of the
+    # same quantity are therefore both acceptable and neither is rewritten —
+    # an exact match, and this many-significant-figures rounding of it.
     prose_numbers_replaced = 0
+
+    def _rounded_variants(value: float) -> set[float]:
+        """Rounding-equivalent spellings of *value* that must also verify.
+
+        A paper writes ``4.15`` or ``22.5`` where the artifact holds
+        ``4.150275736765955``; comparing the printed form against the raw value
+        with a fixed 1% tolerance rejects the shorter spellings of correct
+        numbers. Accept a value when it is a correct rounding of a verified one
+        at any plausible precision.
+        """
+        out: set[float] = set()
+        if value == 0:
+            return out
+        for digits in (1, 2, 3, 4, 5, 6):
+            try:
+                out.add(round(value, digits))
+            except (ValueError, OverflowError):
+                continue
+        av = abs(value)
+        if av >= 1000:
+            out.add(float(f"{value:.6g}"))
+        return out
+
+    def _is_verified_or_rounding_of(num: float, *, as_percent: bool = False) -> bool:
+        """Whether *num* is a reported measurement, at the paper's precision.
+
+        Deliberately stricter than ``_is_verified``. That helper's 1% relative
+        tolerance suits comparing two computed statistics, but applied to a
+        short printed number it is far too permissive: 81.5 sits within 1% of
+        82.206, so a fabricated percentage change passed as verified. Here a
+        value must round *exactly* to a verified one at some precision the
+        paper would plausibly print.
+
+        *as_percent* also accepts a verified fraction printed as a percentage
+        (the artifact stores ``0.85``; the paper writes ``85.0%``), which
+        ``_is_verified`` handled via its 100x cross-match.
+        """
+        if num == 0:
+            return any(v == 0 for v in verified_values)
+        for v in verified_values:
+            if v == 0:
+                continue
+            scaled = v * 100.0 if as_percent else v
+            # Printed at this precision (or coarser) and rounding back to the
+            # same string is what makes it the same number.
+            for digits in (1, 2, 3, 4, 5, 6):
+                if round(scaled, digits) == num:
+                    return True
+        return False
+
     _prose_pattern = _re_san.compile(
         r"(?:achiev|obtain|reach|attain|yield|report|record|produc|demonstrat|show|observ)"
         r"(?:ed|es|ing|s)?\s+"
@@ -1198,22 +1380,65 @@ def _sanitize_fabricated_data(
         r"(%|\\%)?",
         _re_san.IGNORECASE,
     )
+    # A ratio claim ("25x lower", "3.7-fold faster") is an unverified number in
+    # a different costume: it is derived arithmetic, not a reported metric, so
+    # it can never match the registry. A wrong ratio is exactly the claim a
+    # reader cannot check, so flag those too.
+    _ratio_pattern = _re_san.compile(
+        r"(\d+\.?\d*)\s*(?:\\times\s*|×\s*|x\s+|-\s*fold\s*|fold\s+)"
+        r"(?:lower|higher|smaller|larger|less|more|better|worse|faster|slower)",
+        _re_san.IGNORECASE,
+    )
+    # A percentage change ("reduced the mean by 81.5%") is the same class of
+    # derived claim as a ratio, and is the more common phrasing in an abstract.
+    #
+    # Deliberately narrow. An earlier version anchored only on the verb and a
+    # bare "%", which swallowed measured percentages ("accuracy 92.5%") while
+    # still missing "reduced the mean final objective by 81.5%" — a single
+    # "word word number%" window cannot tell a measurement from a change. So
+    # the number must be introduced by "by" (or sit directly after "to/from"),
+    # which is what makes it a delta rather than a reading.
+    _pct_change_pattern = _re_san.compile(
+        r"\b(?:reduc|increas|improv|decreas|lower|rais|cut|drop|gain|shrink|shrank)"
+        r"(?:e|ed|es|ing|s|d|t)?\b"
+        # No "%" inside the gap: that keeps a measured percentage earlier in
+        # the sentence from being absorbed as the distance to this one.
+        r"(?:[^.\n%;]{0,60}?)"
+        r"\b(?:by|to|from)\s+"
+        r"(\d+\.?\d*)\s*(?:%|\\%|percent)",
+        _re_san.IGNORECASE,
+    )
     # Only process lines in Results/Experiments sections
     _in_results_section = False
     _results_headers = _re_san.compile(
-        r"^#{1,3}\s*(Results|Experiments|Experimental|Evaluation|Ablation)",
+        # Section numbers ("## 7. Results", "## 7 Results") are stripped before
+        # matching. The old pattern required a bare "Results" and so matched no
+        # real draft, leaving this whole pass a silent no-op.
+        r"^#{1,3}\s*(?:\d+(?:\.\d+)*[.)]?\s*)?"
+        r"(Results|Experiments|Experimental|Evaluation|Ablation)",
         _re_san.IGNORECASE,
     )
-    _any_header = _re_san.compile(r"^#{1,3}\s+")
+    _any_header = _re_san.compile(
+        r"^#{1,3}\s*(?:\d+(?:\.\d+)*[.)]?\s*)?\S"
+    )
+    # The abstract and conclusion state headline numbers and are never covered
+    # by a "Results" section. A fabricated number there is the most damaging
+    # one, so include them in scope.
+    _headline_headers = _re_san.compile(
+        r"^#{1,3}\s*(?:\d+(?:\.\d+)*[.)]?\s*)?"
+        r"(Abstract|Summary|Conclusion|Conclusions|Discussion)",
+        _re_san.IGNORECASE,
+    )
     _sanitized_lines = []
     for _line in sanitized.split("\n"):
-        if _results_headers.match(_line):
+        if _results_headers.match(_line) or _headline_headers.match(_line):
             _in_results_section = True
         elif _any_header.match(_line) and _in_results_section:
             # Check if we're leaving Results for a different top-level section
             _header_text = _line.lstrip("#").strip().lower()
             if _header_text and not any(kw in _header_text for kw in
-                    ("result", "experiment", "ablation", "evaluation", "comparison")):
+                    ("result", "experiment", "ablation", "evaluation", "comparison",
+                     "abstract", "summary", "conclusion", "discussion")):
                 _in_results_section = False
         if _in_results_section and "|" not in _line:  # skip table rows
             def _replace_prose_num(m: _re_san.Match[str]) -> str:
@@ -1228,10 +1453,59 @@ def _sanitize_fabricated_data(
                     return m.group(0)
                 if val == int(val) and abs(val) <= 20:
                     return m.group(0)
-                if _is_verified(val):
+                # A trailing % means the number is a percentage; the
+                # artifact may store the same quantity as a fraction.
+                _as_pct = bool((m.group(2) or "").strip())
+                if _is_verified_or_rounding_of(val, as_percent=_as_pct):
                     return m.group(0)
                 prose_numbers_replaced += 1
                 return m.group(0).replace(num_str + (m.group(2) or ""), "[value removed]")
+
+            def _replace_ratio(m: _re_san.Match[str]) -> str:
+                """Strip a derived ratio claim; nothing in the artifact is a ratio.
+
+                Only the number is removed — the sentence keeps its comparative
+                phrasing, which is a claim about direction, not magnitude.
+                """
+                nonlocal prose_numbers_replaced
+                num_str = m.group(1)
+                try:
+                    val = float(num_str)
+                except ValueError:
+                    return m.group(0)
+                if val == int(val) and abs(val) <= 20:
+                    return m.group(0)
+                prose_numbers_replaced += 1
+                return m.group(0).replace(num_str, "", 1)
+
+            def _replace_pct_change(m: _re_san.Match[str]) -> str:
+                """Strip a derived percentage change, keeping the sentence.
+
+                A change of state is not a measured quantity, so it never
+                appears in the registry and can never be verified from it. The
+                verb and the "%" are left in place: what is removed is the
+                unsupported magnitude, not the prose.
+                """
+                nonlocal prose_numbers_replaced
+                num_str = m.group(1)
+                try:
+                    val = float(num_str)
+                except ValueError:
+                    return m.group(0)
+                # A verified value quoted as a percentage is a measurement, not
+                # a change; keep it. 1.0/100.0 leniency mirrors _is_verified's
+                # fraction-vs-percent cross-match.
+                if _is_verified_or_rounding_of(val, as_percent=True):
+                    return m.group(0)
+                prose_numbers_replaced += 1
+                return m.group(0).replace(num_str, "", 1)
+
+            # Order matters. `_prose_pattern` consumes the verb ("reduced",
+            # "improved") that introduces a derived change, so running it first
+            # left the ratio and percentage passes with nothing to match. Most
+            # specific first, then the verb-anchored catch-all.
+            _line = _pct_change_pattern.sub(_replace_pct_change, _line)
+            _line = _ratio_pattern.sub(_replace_ratio, _line)
             _line = _prose_pattern.sub(_replace_prose_num, _line)
         _sanitized_lines.append(_line)
     sanitized = "\n".join(_sanitized_lines)
@@ -1244,9 +1518,38 @@ def _sanitize_fabricated_data(
         "prose_numbers_replaced": prose_numbers_replaced,
         "verified_values_count": len(verified_values),
         "replaced_samples": replaced_values[:20],
+        "suspicious_zero_variance": _find_zero_variance_claims(sanitized),
         "generated": _utcnow_iso(),
     }
     return sanitized, report
+
+
+#: A "± 0.0000" (or "± 0") claim. Every reported table spans several instances
+#: or seeds, so a dispersion of exactly zero over a multi-entry column means
+#: the writer had no dispersion to cite and in-filled one — it is not a
+#: measurement of zero variance.
+_ZERO_VARIANCE_RE = re.compile(
+    r"\\pm\s*\$?\s*0(?:\.0+)?\s*\$?\s*(?=[&\\}\s]|$)"   # LaTeX: $\pm$ 0.0000
+    r"|[±]\s*0(?:\.0+)?(?![.\d])"                        # markdown: ± 0.0000
+    r"|[±]\s*\$?\s*0(?:\.0+)?\s*\$?\s*(?=[&\\}\s]|$)"
+)
+
+
+def _find_zero_variance_claims(paper: str) -> list[str]:
+    """Lines asserting a standard deviation of exactly zero.
+
+    Reported, not rewritten: the row is usually a correct aggregate whose
+    dispersion the writer simply did not have. The right repair is to supply
+    the number upstream (see ``_build_per_instance_stats_block``), so this
+    surfaces the row for review rather than editing a value it cannot replace.
+    """
+    out: list[str] = []
+    for line in paper.splitlines():
+        if _ZERO_VARIANCE_RE.search(line):
+            stripped = line.strip()
+            if stripped:
+                out.append(stripped[:200])
+    return out[:20]
 
 
 # ---------------------------------------------------------------------------
@@ -1507,6 +1810,199 @@ def _resolve_missing_citations(
 # Stage 22: Export & Publish
 # ---------------------------------------------------------------------------
 
+#: A complete LaTeX float: ``\begin{table}...\end{table}`` and the figure
+#: equivalent, non-greedy so consecutive floats are captured separately.
+_FLOAT_RE = re.compile(
+    r"\\begin\{(table|figure)\*?\}.*?\\end\{\1\*?\}",
+    re.DOTALL,
+)
+_FLOAT_LABEL_RE = re.compile(r"\\label\{([^}]*)\}")
+
+
+def _strip_caption(text: str) -> str:
+    """Remove ``\\caption{...}``, matching braces so nested math survives.
+
+    Captions carry digits that are not data ("12 conditions", the significance
+    legend ``$p<0.05$``) and are exactly what differs between the generator's
+    copy of a table and the writer's relabelled one.
+    """
+    out = []
+    i = 0
+    while True:
+        j = text.find("\\caption{", i)
+        if j < 0:
+            out.append(text[i:])
+            return "".join(out)
+        out.append(text[i:j])
+        k = j + len("\\caption{")
+        depth = 1
+        while k < len(text) and depth:
+            if text[k] == "{":
+                depth += 1
+            elif text[k] == "}":
+                depth -= 1
+            k += 1
+        i = k
+
+
+def _float_numeric_signature(block: str) -> str:
+    """Collapse a float to the numbers it prints, ignoring caption and headers.
+
+    A float re-inserted after a rewrite is not byte-identical to the copy that
+    was already present: the caption and the column headers are regenerated
+    while the values are not. Comparing on the numbers catches that as the
+    duplicate it is; comparing on ``\\label`` alone does not, because a copy
+    regenerated from a metric key gets a different label.
+    """
+    # \label{tab:2} would otherwise contribute its own digit and make two
+    # copies of one table look different once one of them is relabelled.
+    body = _strip_caption(block)
+    body = re.sub(r"\\(?:label|ref|cite|includegraphics|url)\{[^}]*\}", "", body)
+    body = re.sub(r"\\begin\{(?:table|figure)\*?\}.*?\\toprule", "", body, flags=re.DOTALL)
+    body = re.sub(r"\\end\{(?:table|figure)\*?\}.*", "", body, flags=re.DOTALL)
+    body = re.sub(r"\\(?:textbf|textit|emph|texttt|mathbf|underline)\{", "", body)
+    for ch in "${}":
+        body = body.replace(ch, "")
+    nums = re.findall(r"\d+(?:\.\d+)?", body)
+    if len(nums) < 4:
+        return ""
+    out = []
+    for n in nums:
+        try:
+            out.append(f"{round(float(n), 3):g}")
+        except ValueError:
+            continue
+    return ",".join(out)
+
+
+def _restore_missing_floats(original: str, rewritten: str) -> str:
+    """Re-insert floats present in *original* but dropped from *rewritten*.
+
+    Background generation of tables and figures produces complete LaTeX floats.
+    A stage that rewrites the paper end-to-end tends to summarise or omit them,
+    and the loss is silent: the surrounding prose still cites the float, so the
+    PDF renders a dangling reference and the per-instance numbers the float
+    carried appear nowhere else.
+
+    Identification is by ``\\label`` — two floats with the same label are the
+    same float — with a numeric-signature fallback for a float whose label was
+    regenerated. Floats without a label cannot be tracked this way and are left
+    alone rather than guessed at.
+
+    A float whose numbers are already in *rewritten* under a *different* label
+    is treated as present, not as missing. The earlier behaviour keyed only on
+    the label, so re-inserting such a float produced the paper with the same
+    results table printed twice — once in the Results section and once after
+    the bibliography.
+
+    Returns *rewritten* unchanged when nothing is missing, so a faithful
+    rewrite is byte-identical to what the model produced.
+    """
+    if not original or not rewritten:
+        return rewritten
+
+    present = set(_FLOAT_LABEL_RE.findall(rewritten))
+    present_sigs = {
+        sig
+        for sig in (_float_numeric_signature(m.group(0)) for m in _FLOAT_RE.finditer(rewritten))
+        if sig
+    }
+    missing: list[str] = []
+    for m in _FLOAT_RE.finditer(original):
+        block = m.group(0)
+        labs = _FLOAT_LABEL_RE.findall(block)
+        if not labs:
+            continue
+        if any(lab in present for lab in labs):
+            continue
+        # Same numbers under a different label — already in the paper.
+        sig = _float_numeric_signature(block)
+        if sig and sig in present_sigs:
+            continue
+        missing.append(block)
+        present.update(labs)
+        if sig:
+            present_sigs.add(sig)
+    if not missing:
+        return rewritten
+
+    logger.warning(
+        "Stage 22: rewrite dropped %d float(s) present in the input "
+        "(%s) — restoring them",
+        len(missing),
+        ", ".join(
+            lab
+            for block in missing
+            for lab in _FLOAT_LABEL_RE.findall(block)
+        ),
+    )
+
+    # Place each after the paragraph that cites it, falling back to the end of
+    # the paper. Appending at the end would order the floats arbitrarily; the
+    # reference site is where a results float belongs.
+    for block in missing:
+        labs = _FLOAT_LABEL_RE.findall(block)
+        site = -1
+        for lab in labs:
+            m = re.search(rf"\\ref\{{{re.escape(lab)}\}}", rewritten)
+            if m:
+                site = max(site, m.end())
+        if site < 0:
+            rewritten = rewritten.rstrip() + "\n\n" + block + "\n"
+            continue
+        # Splice in at the end of the paragraph containing that reference.
+        para_end = rewritten.find("\n\n", site)
+        if para_end == -1:
+            para_end = len(rewritten)
+        rewritten = rewritten[:para_end] + "\n\n" + block + rewritten[para_end:]
+    return rewritten
+
+
+def _degradation_report_is_current(
+    signal_path: Path, quality_report_path: Path
+) -> bool:
+    """True when *signal_path* describes the quality report beside it.
+
+    The signal is written only in the degraded branch of the quality gate, so
+    comparing the two files' scores is the direct test: a signal whose score
+    does not match the report on disk describes a superseded attempt. When the
+    report is missing or unreadable there is nothing to corroborate the signal
+    against, and an uncorroborated claim is not put in front of a reader.
+    """
+    try:
+        signal = json.loads(signal_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    if not quality_report_path.is_file():
+        logger.warning(
+            "Stage 22: degradation signal present but stage-20/quality_report.json "
+            "is missing — not inserting the degraded-mode notice"
+        )
+        return False
+    try:
+        report = json.loads(quality_report_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+
+    signaled = signal.get("score")
+    reported = report.get("score_1_to_10", report.get("quality_score"))
+    if signaled is None or reported is None:
+        return False
+    try:
+        _same = abs(float(signaled) - float(reported)) < 1e-6
+    except (TypeError, ValueError):
+        return False
+    if not _same:
+        logger.warning(
+            "Stage 22: stale degradation signal (score %s) does not match the "
+            "current quality report (score %s) — not inserting the degraded-mode "
+            "notice",
+            signaled,
+            reported,
+        )
+    return _same
+
+
 def _execute_export_publish(
     stage_dir: Path,
     run_dir: Path,
@@ -1562,6 +2058,15 @@ def _execute_export_publish(
     if not final_paper.strip():
         final_paper = "# Final Paper\n\nNo content generated."
 
+    # Restore any float the rewrite dropped. This stage rewrites the whole
+    # paper, and a LaTeX float embedded verbatim in the input is easy for the
+    # model to summarise away — it is not prose it can paraphrase. When one
+    # goes missing, the body text still cites it and the numbers it carries
+    # (per-instance results the summary text never repeats) reach the exported
+    # PDF nowhere. The floats are machine-generated from verified data, so
+    # restoring them is a copy, not an authorial act.
+    final_paper = _restore_missing_floats(revised, final_paper)
+
     # --- Always-on fabrication sanitization (Phase 1 anti-fabrication) ---
     # Back up pre-sanitized version
     (stage_dir / "paper_presanitized.md").write_text(
@@ -1582,9 +2087,20 @@ def _execute_export_publish(
             _san_report.get("numbers_kept", 0),
         )
 
-    # Graceful degradation: insert notice only when quality gate was degraded
+    # Graceful degradation: insert notice only when the *current* quality gate
+    # was degraded.
+    #
+    # ``degradation_signal.json`` lives at the run root, not under ``stage-20/``,
+    # so it survives a rollback and re-run — while the quality gate that wrote
+    # it does not. A re-run whose gate then passed still saw the previous
+    # attempt's signal and stamped "produced in degraded mode ... score
+    # (3.0/5.0)" onto a paper the gate had scored 5.8/10. The notice has to be
+    # tied to the report it describes, or it is a claim the pipeline made up.
     _degradation_signal_path = run_dir / "degradation_signal.json"
-    if _degradation_signal_path.exists():
+    _quality_report_path = run_dir / "stage-20" / "quality_report.json"
+    if _degradation_signal_path.exists() and _degradation_report_is_current(
+        _degradation_signal_path, _quality_report_path
+    ):
         try:
             _deg_signal = json.loads(
                 _degradation_signal_path.read_text(encoding="utf-8")
@@ -2262,6 +2778,21 @@ def _execute_export_publish(
                 _vresult.fabrication_rate * 100,
                 _vresult.strict_violations,
             )
+            # Sanitization is destructive — it blanks numbers in the compiled
+            # PDF — and it is driven by the list of *unverified numbers*. A
+            # REJECT can also come from `fabricated_conditions` alone, with a
+            # fabrication_rate of 0 and no unverified numbers at all; in that
+            # case the loop below has nothing to act on and the verdict is a
+            # warning about naming, not evidence that any number is wrong.
+            # Saying so explicitly keeps a condition-naming complaint from
+            # reading as "the results were fabricated".
+            if not _vresult.unverified_numbers:
+                logger.warning(
+                    "Stage 22: REJECT came from %d condition-name complaint(s) "
+                    "with no unverified numbers (fabrication_rate=0) — nothing "
+                    "to sanitize",
+                    len(_vresult.fabricated_conditions),
+                )
             # Replace unverified numbers in strict sections/tables with "---"
             import re as _re_san2
 

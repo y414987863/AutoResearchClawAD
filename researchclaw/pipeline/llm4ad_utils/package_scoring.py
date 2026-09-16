@@ -879,23 +879,14 @@ def _newest_stage13(run_dir: Path) -> Path | None:
     """The current ``stage-13`` directory, excluding versioned workspaces.
 
     ``stage-13_v1``/``_v2`` are *earlier* pivot rounds, not newer ones, and a
-    plain reverse name sort puts them after ``stage-13`` — so this applies the
-    same rule ``_read_prior_artifact`` does (descending stage number, with
-    ``_repair*`` and ``_vN`` filtered out; ``_vN`` sorts *before* the bare name
-    because ``ver=0`` comes first under the reverse sort). Picking a pivot
-    workspace here would snapshot a superseded refinement as the baseline.
+    plain reverse name sort puts them after ``stage-13`` — so this defers to the
+    shared prior-stage scan (see :func:`_iter_prior_stage_dirs`), which orders by
+    stage number descending with ``_repair*`` and ``_vN`` filtered out. Picking a
+    pivot workspace here would snapshot a superseded refinement as the baseline.
     """
-    from researchclaw.pipeline._helpers import _STAGE_NAME_RE, _STAGE_VER_RE
+    from researchclaw.pipeline._helpers import _iter_prior_stage_dirs
 
-    def _key(p: Path) -> tuple[float, int, str]:
-        m = _STAGE_NAME_RE.match(p.name)
-        num = float(m.group(1)) if m else float("inf")
-        m2 = _STAGE_VER_RE.search(p.name)
-        return (num, int(m2.group(1)) if m2 else 0, p.name)
-
-    for candidate in sorted(run_dir.glob("stage-13*"), key=_key, reverse=True):
-        if "_repair" in candidate.name or _STAGE_VER_RE.search(candidate.name):
-            continue
+    for candidate in _iter_prior_stage_dirs(run_dir, "stage-13*"):
         if candidate.is_dir():
             return candidate
     return None
@@ -1065,6 +1056,117 @@ def _inflate_scratch(final_dir: Path, scratch: Path) -> None:
     shutil.copytree(final_dir, scratch, dirs_exist_ok=True, ignore=_ignore)
 
 
+def _baseline_algo_files(clean_dir: Path) -> dict[str, Path]:
+    """``{algo: <algo>.py}`` under *clean_dir*'s ``algorithms/`` tree.
+
+    Both layouts a project may use are covered: ``algorithms/<algo>/<algo>.py``
+    and a flat ``algorithms/<algo>.py``. Nested matches are keyed by their own
+    module name so the two never collide.
+    """
+    root = clean_dir / "algorithms"
+    files: dict[str, Path] = {}
+    if not root.is_dir():
+        return files
+    for path in root.rglob("*.py"):
+        if path.name == "__init__.py":
+            continue
+        files.setdefault(path.stem, path)
+    return files
+
+
+def _reconcile_promotion(
+    final_dir: Path,
+    clean_dir: Path,
+    n_promoted: int,
+    algorithms: dict[str, Any],
+) -> tuple[int, dict[str, Any], list[str]]:
+    """Make the reported promotion count match the code actually shipped.
+
+    ``llm4ad_comparison.json`` records the decision Stage 13 made, but it is
+    written once per Stage 13 run and the live ``stage-13/`` is re-run on later
+    passes (pivots, repairs, forced proceeds). When a re-run leaves the summary
+    carrying an earlier round's verdict, Stage 14 announced a promotion whose
+    code is not in ``experiment_final/`` — the b220dfb9 run reported
+    ``n_algorithms_replaced=1`` with ``evolved=0.9744`` while the delivered
+    ``mc_dropout_p30_T20.py`` was byte-identical to the stage-10 baseline, so the
+    paper claimed an improvement over the code it shipped. 8e36634f failed the
+    other way: two evolved modules were shipped, the summary said none were.
+
+    The delivered directory is the ground truth — it is what the reader gets —
+    so each verdict is checked against it. A "promoted" algorithm whose file
+    matches the baseline never shipped and is demoted to ``promoted=False``
+    with the reason recorded; an algorithm holding code that differs from the
+    baseline is a promotion the summary left out. The count is recomputed from
+    the surviving verdicts.
+
+    Returns ``(n_promoted, algorithms, corrections)``. A missing baseline or a
+    file that cannot be read leaves its verdict untouched, because an absent
+    comparison is not evidence of a mismatch.
+    """
+    baseline = _baseline_algo_files(clean_dir)
+    if not baseline:
+        return n_promoted, algorithms, []
+
+    corrections: list[str] = []
+    reconciled: dict[str, Any] = {}
+    for algo, verdict in algorithms.items():
+        _algo = str(algo)
+        delivered = _delivered_algo_file(final_dir, _algo)
+        base_file = baseline.get(_algo)
+        if delivered is None or base_file is None:
+            reconciled[_algo] = verdict
+            continue
+        if not isinstance(verdict, dict):
+            reconciled[_algo] = verdict
+            continue
+
+        _verdict = dict(verdict)
+        _shipped = not _identical_files(delivered, base_file)
+        _claimed = bool(_verdict.get("promoted"))
+        if _claimed and not _shipped:
+            _verdict["promoted"] = False
+            _verdict["reason"] = (
+                "recorded as promoted by Stage 13 but the module under "
+                "experiment_final/ is byte-identical to the clean baseline — "
+                "nothing evolved ships; verdict reconciled to the delivered code"
+            )
+            corrections.append(f"{_algo}: claimed promoted, delivered baseline")
+        elif _shipped and not _claimed:
+            _verdict["promoted"] = True
+            _verdict["reason"] = (
+                "delivered module differs from the clean baseline; promotion "
+                "reconciled upward from the delivered code"
+            )
+            corrections.append(f"{_algo}: shipped evolved code, verdict said no")
+        reconciled[_algo] = _verdict
+
+    _n = sum(1 for v in reconciled.values() if isinstance(v, dict) and v.get("promoted"))
+    if n_promoted != _n:
+        corrections.append(
+            f"n_promoted reconciled {n_promoted} -> {_n} from the delivered code"
+        )
+    if corrections:
+        logger.warning(
+            "Stage 14: llm4ad promotion verdict disagrees with the delivered "
+            "project — %s", "; ".join(corrections),
+        )
+    return _n, reconciled, corrections
+
+
+def _delivered_algo_file(final_dir: Path, algo: str) -> Path | None:
+    """The shipped ``<algo>.py`` under *final_dir*, whichever layout it uses."""
+    root = final_dir / "algorithms"
+    candidates = (root / algo / f"{algo}.py", root / f"{algo}.py")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    if root.is_dir():
+        # A single hit anywhere under algorithms/ still identifies the module.
+        for path in root.rglob(f"{algo}.py"):
+            return path
+    return None
+
+
 def final_experiment_for_config(
     run_dir: Path,
     stage_dir: Path,
@@ -1121,6 +1223,12 @@ def final_experiment_for_config(
 
     stage13 = final_dir.parent
     n_promoted, algorithms = _read_llm4ad_comparison(stage13)
+    # The comparison file is Stage 13's own record, but the live stage-13/ can be
+    # re-run after it was written, leaving a verdict about a round whose code is
+    # no longer the one shipping. Check every verdict against experiment_final/.
+    n_promoted, algorithms, _reconciled = _reconcile_promotion(
+        final_dir, run_dir / "stage-10" / "experiment", n_promoted, algorithms,
+    )
 
     scratch = stage_dir / "_final_run"
     try:
@@ -1157,6 +1265,7 @@ def final_experiment_for_config(
         "results_status": status,
         "metrics": metrics,
         "algorithms": algorithms,
+        "promotion_reconciled": _reconciled,
         "decision_rule": (
             "per-algorithm: Stage 13 keeps the evolved <algo>.py over the clean "
             "stage-10 baseline only when it scores better on their shared "

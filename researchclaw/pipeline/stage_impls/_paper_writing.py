@@ -25,6 +25,7 @@ from researchclaw.pipeline._helpers import (
     _generate_framework_diagram_prompt,
     _generate_neurips_checklist,
     _get_evolution_overlay,
+    _iter_prior_stage_dirs,
     _llm4ad_adopted_final,
     _read_best_analysis,
     _read_llm4ad_algorithm_details,
@@ -152,6 +153,220 @@ def _execute_paper_outline(
     )
 
 
+def _build_per_instance_stats_block(exp_summary: dict[str, Any]) -> str:
+    """Per-condition, per-instance mean and dispersion, for the paper prompt.
+
+    ``metrics_summary`` keys of the form ``<condition>/<instance>/<seed>/<metric>``
+    let us recompute the two numbers a results table needs per cell — the mean
+    across seeds and its dispersion — plus the cross-instance aggregate a
+    summary row reports. Without this block the writer has only the
+    condition-level aggregate and silently fills the per-instance dispersion
+    with zeros.
+
+    Returns "" when the summary carries no per-(instance, seed) keys, so a
+    single-instance or single-seed run gets the same prompt as before.
+    """
+    metrics_summary = exp_summary.get("metrics_summary")
+    if not isinstance(metrics_summary, dict):
+        return ""
+
+    # <condition>/<instance>/<seed>/<metric> -> value
+    _per_seed = re.compile(r"^(?P<cond>[^/]+)/(?P<inst>[^/]+)/(?P<seed>\d+)/(?P<metric>[^/]+)$")
+    grouped: dict[str, dict[str, dict[int, float]]] = {}
+    for key, stats in metrics_summary.items():
+        m = _per_seed.match(str(key))
+        if not m or not isinstance(stats, dict):
+            continue
+        value = stats.get("mean")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            continue
+        metric = m.group("metric")
+        grouped.setdefault(metric, {}).setdefault(m.group("cond"), {}).setdefault(
+            m.group("inst"), {}
+        )[int(m.group("seed"))] = float(value)
+
+    if not grouped:
+        return ""
+
+    # Prefer the metric the most conditions report; ties break alphabetically so
+    # the choice is deterministic. Picking by presence rather than by name keeps
+    # this working for experiments whose metric is not `primary_metric`.
+    _counts = {
+        k: sum(len(v) for v in conds.values()) for k, conds in grouped.items()
+    }
+    headline = max(sorted(_counts), key=lambda k: _counts[k])
+
+    conds = grouped[headline]
+    block = (
+        f"\n\n## PER-INSTANCE RESULTS ({headline})\n"
+        "Per-instance mean over seeds, with the standard deviation across seeds "
+        "(sample std, n-1). The 'mean of instance means' row is the aggregate a "
+        "summary table reports; its std is the spread ACROSS instances, not "
+        "across seeds. Cite these numbers directly — do not recompute, and do "
+        "not report a std of 0.0000 for a row whose instances differ.\n"
+    )
+    for cond in sorted(conds):
+        block += f"\n### {cond}\n"
+        inst_means: list[float] = []
+        for inst in sorted(conds[cond]):
+            seeds = conds[cond][inst]
+            vals = [seeds[s] for s in sorted(seeds)]
+            mean = sum(vals) / len(vals)
+            inst_means.append(mean)
+            if len(vals) >= 2:
+                var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
+                std = math.sqrt(var)
+                block += f"- {inst}: mean={mean:.4f}, std={std:.4f}, n={len(vals)}\n"
+            else:
+                block += f"- {inst}: mean={mean:.4f}, n={len(vals)}\n"
+        if len(inst_means) >= 2:
+            agg = sum(inst_means) / len(inst_means)
+            agg_std = math.sqrt(
+                sum((v - agg) ** 2 for v in inst_means) / (len(inst_means) - 1)
+            )
+            block += (
+                f"- mean of instance means: {agg:.4f} "
+                f"(std across the {len(inst_means)} instances: {agg_std:.4f})\n"
+            )
+    return block
+
+
+def _build_aggregate_summary_block(exp_summary: dict[str, Any]) -> str:
+    """Cross-instance aggregate per condition, for a summary table.
+
+    A per-condition row that averages several instances has a dispersion the
+    artifact never records, so a writer building that table has nothing to
+    cite and emits ``0.0000`` - which reads as a measured zero rather than a
+    missing number. Only emitted when a metric genuinely spans more than one
+    instance.
+
+    Returns "" when no metric is computed over multiple instances, so
+    single-instance runs get the same prompt as before.
+    """
+    metrics_summary = exp_summary.get("metrics_summary")
+    if not isinstance(metrics_summary, dict):
+        return ""
+
+    _per_seed = re.compile(
+        r"^(?P<cond>[^/]+)/(?P<inst>[^/]+)/(?P<seed>\d+)/(?P<metric>[^/]+)$"
+    )
+    # metric -> condition -> instance -> {seed: value}. Collapsing an
+    # instance to its seed mean first is what keeps the two dispersions
+    # distinct: the row below reports spread ACROSS instances, and folding
+    # the seeds in directly would report a mixture of both.
+    grouped: dict[str, dict[str, dict[str, dict[int, float]]]] = {}
+    for key, stats in metrics_summary.items():
+        m = _per_seed.match(str(key))
+        if not m or not isinstance(stats, dict):
+            continue
+        value = stats.get("mean")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            continue
+        grouped.setdefault(m.group("metric"), {}).setdefault(
+            m.group("cond"), {}
+        ).setdefault(m.group("inst"), {})[int(m.group("seed"))] = float(value)
+
+    # One block per metric that averages over instances. Only emitted when the
+    # metric genuinely spans several, so single-instance runs are unaffected.
+    block = ""
+    for metric in sorted(grouped):
+        per_cond = grouped[metric]
+        if not per_cond or all(len(v) < 2 for v in per_cond.values()):
+            continue
+        rows: list[str] = []
+        for cond in sorted(per_cond):
+            inst_means = [
+                sum(s for _, s in sorted(seeds.items())) / len(seeds)
+                for _, seeds in sorted(per_cond[cond].items())
+                if seeds
+            ]
+            if not inst_means:
+                continue
+            agg = sum(inst_means) / len(inst_means)
+            if len(inst_means) >= 2:
+                var = sum((v - agg) ** 2 for v in inst_means) / (len(inst_means) - 1)
+                std = math.sqrt(var)
+                rows.append(
+                    f"- {cond}: {agg:.4f} (std across {len(inst_means)} instances: {std:.4f})"
+                )
+            else:
+                rows.append(f"- {cond}: {agg:.4f}")
+        if rows:
+            block += (
+                f"\n\n## AGGREGATE ROW ({metric}, mean over instances)\n"
+                "Use these values verbatim if you report an aggregate row; the "
+                "std is the spread across instances, not across seeds. Do NOT "
+                "write 0.0000 here - the instances differ by construction.\n"
+                + "\n".join(rows)
+                + "\n"
+                # A regime or subset row (e.g. "multimodal" = two of the three
+                # functions) is a different average with a different spread.
+                # Enumerate every subset large enough to report so the writer
+                # picks a real value instead of estimating one.
+                + _subset_aggregate_lines(per_cond, metric)
+            )
+    return block
+
+
+def _subset_aggregate_lines(per_cond: dict[str, dict[str, dict[int, float]]],
+                            metric: str) -> str:
+    """Mean and std for every instance subset a draft might report.
+
+    A per-regime table row averages a subset of instances, which is neither any
+    single instance nor the full set, and its std is the spread within that
+    subset. Enumerating them keeps the writer from estimating the spread — the
+    failure this replaces produced values matching no aggregation the data
+    supports. Capped: past this many subsets the listing costs more prompt than
+    it saves, and a draft that groups that finely is not summarising.
+    """
+    cond_instances: dict[str, list[str]] = {}
+    for cond, instances in per_cond.items():
+        names = sorted(instances)
+        if len(names) >= 2:
+            cond_instances[cond] = names
+    if not cond_instances:
+        return ""
+
+    reference = max(cond_instances.values(), key=len)
+    n = len(reference)
+    subsets: list[tuple[str, ...]] = []
+    for mask in range(1, 1 << n):
+        subset = tuple(reference[i] for i in range(n) if mask & (1 << i))
+        if 2 <= len(subset) < n:
+            subsets.append(subset)
+    if not subsets or len(subsets) > 8:
+        return (
+            "\nReport no subset (regime) row: this experiment's instance set "
+            "does not admit a small number of natural groupings.\n"
+        )
+
+    lines = [
+        f"\nIf you report a regime or subset row for {metric}, use these "
+        "(different instances give a different mean and spread — do not "
+        "reuse the full-set values or estimate one):\n"
+    ]
+    for subset in subsets:
+        label = "+".join(subset)
+        parts = []
+        for cond in sorted(cond_instances):
+            means = []
+            for inst in subset:
+                seeds = per_cond.get(cond, {}).get(inst)
+                if seeds:
+                    means.append(sum(s for _, s in sorted(seeds.items())) / len(seeds))
+            if not means:
+                continue
+            mean = sum(means) / len(means)
+            if len(means) >= 2:
+                var = sum((v - mean) ** 2 for v in means) / (len(means) - 1)
+                parts.append(f"{cond}={mean:.4f}±{math.sqrt(var):.4f}")
+            else:
+                parts.append(f"{cond}={mean:.4f}")
+        if parts:
+            lines.append(f"- {label}: " + ", ".join(parts) + "\n")
+    return "".join(lines)
+
+
 def _collect_raw_experiment_metrics(run_dir: Path) -> tuple[str, bool]:
     """Collect raw experiment metric lines from stdout for paper writing.
 
@@ -163,7 +378,17 @@ def _collect_raw_experiment_metrics(run_dir: Path) -> tuple[str, bool]:
     run_count = 0
     has_parsed_metrics = False
 
-    for stage_subdir in sorted(run_dir.glob("stage-*/runs")):
+    # WS-6: When Stage 14 adopted Stage 13's delivered project, its numbers are
+    # the run's results (``best_run`` in experiment_summary.json). Stage 12's
+    # runs/ hold the *pre-refinement* experiment, which the refinement rewrote;
+    # collecting them too would put a second, older set of numbers in the prompt
+    # beside the reported ones and let the writer pick either. Same reasoning as
+    # the refinement-log skip below — this path just did not honour it.
+    _adopted_delivered = _llm4ad_adopted_final(run_dir)
+
+    for stage_subdir in (
+        [] if _adopted_delivered else sorted(run_dir.glob("stage-*/runs"))
+    ):
         for run_file in sorted(stage_subdir.glob("*.json")):
             if run_file.name == "results.json":
                 continue
@@ -217,7 +442,7 @@ def _collect_raw_experiment_metrics(run_dir: Path) -> tuple[str, bool]:
     # block scans every refinement sandbox in the run — including iterations
     # that were discarded — so letting it run would put a second, older set of
     # numbers into the prompt beside the reported ones.
-    _adopted_final_metrics = _llm4ad_adopted_final(run_dir)
+    _adopted_final_metrics = _adopted_delivered
     _refine_lines: list[str] = []
     _refine_run_count = 0
     _best_refine_metrics: dict[str, Any] = {}
@@ -225,16 +450,36 @@ def _collect_raw_experiment_metrics(run_dir: Path) -> tuple[str, bool]:
     _best_refine_primary: float | None = None
     for _rl_path in (
         [] if _adopted_final_metrics
-        else sorted(run_dir.glob("stage-13*/refinement_log.json"))
+        else [d / "refinement_log.json" for d in _iter_prior_stage_dirs(run_dir, "stage-13*")]
     ):
-        # Scan ALL refinement logs across versions, pick by quality (primary
-        # metric) then richness (metric count).  BUG-207: Previous logic picked
+        # Scan the refinement log's iterations, pick by quality (primary metric)
+        # then richness (metric count).  BUG-207: Previous logic picked
         # the sandbox entry with the most metric keys regardless of whether it
         # represented a regression (e.g. sandbox_after_fix with 1.29% accuracy
         # winning over sandbox with 78.93% because it had 6 more keys).
+        #
+        # Only the *live* Stage 13 is read (``_iter_prior_stage_dirs`` drops
+        # ``_vN``). Globbing ``stage-13*`` pulled in the pivot rounds too, and
+        # since the winner is chosen by "highest primary metric", a rolled-back
+        # round could outscore the delivered one and become the numbers the
+        # draft reports. On the fbdc43fe audit run that is exactly what
+        # happened: ``stage-13_v1``'s superseded sandbox won on primary_metric,
+        # and its per-condition means (nelder_mead 1.2940, cma_es 1.0341) went
+        # into the paper while Stage 14 — which reads through
+        # ``_read_prior_artifact`` — reported the clean stage-13's numbers.
         try:
             _rlog = json.loads(_rl_path.read_text(encoding="utf-8"))
+            # Honour the log's own verdict first. Stage 13 records which
+            # iteration it settled on in ``best_version``, and Stage 14's merge
+            # (``_analysis.py`` R13-1) selects by exactly that. Choosing by a
+            # different rule here is what let the two stages quote different
+            # iterations of the same refinement — the paper's tables and the
+            # summary's aggregates came from different rounds on the fbdc43fe
+            # audit run (v1's 5.9930 vs v5's 2.2246).
+            _rlog_best_ver = str(_rlog.get("best_version") or "")
             for _it in _rlog.get("iterations", []):
+                if _rlog_best_ver and _it.get("version_dir", "") != _rlog_best_ver:
+                    continue
                 for _sbx_key in ("sandbox", "sandbox_after_fix"):
                     _sbx = _it.get(_sbx_key, {})
                     if not isinstance(_sbx, dict):
@@ -251,7 +496,10 @@ def _collect_raw_experiment_metrics(run_dir: Path) -> tuple[str, bool]:
                             except (ValueError, TypeError):
                                 pass
                             break
-                    # Prefer higher primary metric; fall back to count
+                    # Prefer higher primary metric; fall back to count.
+                    # BUG-207: this guards *within* an iteration — do not let
+                    # ``sandbox_after_fix`` win on key count after scoring worse
+                    # (1.29% accuracy beating 78.93%).
                     _dominated = False
                     if _best_refine_primary is not None and _sbx_primary is not None:
                         if _sbx_primary > _best_refine_primary:
@@ -308,11 +556,40 @@ def _collect_raw_experiment_metrics(run_dir: Path) -> tuple[str, bool]:
             unique.append(line)
 
     # BUG-29: Reformat raw metric lines into human-readable condition summaries
-    # to prevent LLM from pasting raw path-style lines into the paper
+    # to prevent LLM from pasting raw path-style lines into the paper.
+    #
+    # Each line is also labelled with what it *is*. The block mixes two kinds
+    # of number that look alike and mean different things — a single seed's
+    # outcome, and an aggregate over seeds — and an unlabelled dump leaves the
+    # writer free to cite a lone seed as if it were the condition's average.
+    # That is not a hypothetical: a draft reported a run's last seed as its
+    # mean. Labelling costs a few words per line and removes the ambiguity.
+    _PER_SEED_RE = re.compile(
+        r"^condition=(?P<cond>[^\s]+)\s+instance=(?P<inst>[^\s]+)\s+"
+        r"seed=(?P<seed>\d+)\s+(?P<metric>[^:]+):\s*(?P<value>.+)$"
+    )
+    _COND_AGG_RE = re.compile(
+        r"^condition=(?P<cond>[^\s]+)\s+instance=(?P<inst>[^\s]+)\s+"
+        r"(?P<metric>[^:\s]+)_mean:\s*(?P<value>.+?)\s+"
+    )
+    _per_seed_lines: list[str] = []
+    _cond_agg_lines: list[str] = []
     _grouped: dict[str, list[str]] = {}
     _ungrouped: list[str] = []
     for line in unique[:200]:
         stripped = line.strip()
+        _ps = _PER_SEED_RE.match(stripped)
+        if _ps:
+            _per_seed_lines.append(
+                f"  {_ps.group('cond')} on {_ps.group('inst')}, "
+                f"seed {_ps.group('seed')}: {_ps.group('metric')}="
+                f"{_ps.group('value').strip()}"
+            )
+            continue
+        _ca = _COND_AGG_RE.match(stripped)
+        if _ca:
+            _cond_agg_lines.append(f"  {stripped}")
+            continue
         # Match pattern: condition/env/step/metric: value
         parts = stripped.split("/")
         if len(parts) >= 3 and ":" in parts[-1]:
@@ -329,14 +606,35 @@ def _collect_raw_experiment_metrics(run_dir: Path) -> tuple[str, bool]:
             formatted_lines.extend(details[:30])
     if _ungrouped:
         formatted_lines.extend(_ungrouped)
+    _raw_body = "\n".join(formatted_lines[:200])
+
+    _sectioned = ""
+    if _per_seed_lines:
+        _sectioned += (
+            "\n--- Per-seed observations (RAW — one seed each; an individual "
+            "value is NOT a condition's result) ---\n"
+            + "\n".join(_per_seed_lines[:120])
+            + "\n"
+        )
+    if _cond_agg_lines:
+        _sectioned += (
+            "\n--- Condition aggregates (AUTHORITATIVE — this is the mean over "
+            "seeds, and the number to cite) ---\n"
+            + "\n".join(_cond_agg_lines[:60])
+            + "\n"
+        )
+    if _raw_body:
+        _sectioned += _raw_body + "\n"
 
     return (
         f"\n\nACTUAL EXPERIMENT DATA (from {run_count} run(s) — use ONLY these numbers):\n"
         "```\n"
-        + "\n".join(formatted_lines[:200])
+        + _sectioned
         + "\n```\n"
         "CRITICAL: Every number in the Results table MUST come from the data above. "
         "Do NOT round excessively, do NOT invent numbers, do NOT change values. "
+        "When a section is labelled RAW, do not report a single raw value as a "
+        "condition's result — cite the matching AUTHORITATIVE aggregate instead. "
         f"The experiment ran {run_count} time(s) — state this accurately in the methodology.\n"
         "NEVER paste raw metric paths (like 'condition/env/step/metric: value') "
         "into the paper. Always convert to formatted LaTeX tables or inline prose.\n"
@@ -1340,6 +1638,158 @@ def _detect_result_contradictions(
     return advisories
 
 
+def _strip_caption(text: str) -> str:
+    """Remove ``\\caption{...}``, matching braces so nested math survives.
+
+    A caption carries digits that are not data — "12 conditions", the
+    significance legend ``$p<0.05$`` — and the caption is exactly what differs
+    between the generator's copy of a table and the writer's relabelled one.
+    Leaving it in made the two stop matching.
+    """
+    out = []
+    i = 0
+    while True:
+        j = text.find("\\caption{", i)
+        if j < 0:
+            out.append(text[i:])
+            return "".join(out)
+        out.append(text[i:j])
+        k = j + len("\\caption{")
+        depth = 1
+        while k < len(text) and depth:
+            if text[k] == "{":
+                depth += 1
+            elif text[k] == "}":
+                depth -= 1
+            k += 1
+        i = k
+
+
+def _table_numeric_signature(table_text: str) -> str:
+    """Collapse a table to the sequence of numbers it prints.
+
+    Two copies of one results table can differ in caption, column headers, and
+    printed precision while carrying identical values. The numbers are what the
+    reader compares, so identity is decided on those.
+    """
+    if not table_text:
+        return ""
+    body = _strip_caption(table_text)
+    # Drop commands whose arguments are text rather than data. `\label{tab:2}`
+    # otherwise contributes its own digit and two copies of one table stop
+    # matching once the writer relabels one of them.
+    body = re.sub(r"\\(?:label|ref|cite|includegraphics|url)\{[^}]*\}", "", body)
+    body = re.sub(r"\\toprule", "", body)
+    body = re.sub(r"\\(?:textbf|textit|emph|texttt|mathbf|underline)\{", "", body)
+    for ch in "${}":
+        body = body.replace(ch, "")
+    nums = re.findall(r"\d+(?:\.\d+)?", body)
+    if len(nums) < 4:
+        return ""
+    out = []
+    for n in nums:
+        try:
+            out.append(f"{round(float(n), 3):g}")
+        except ValueError:
+            continue
+    return ",".join(out)
+
+
+def _ensure_prebuilt_tables(draft: str, prebuilt: list[Any]) -> str:
+    """Insert any generated results table the draft failed to include.
+
+    The prompt asks the writer to copy these verbatim, but they are produced by
+    ``build_results_tables`` from verified data — not authored — so compliance
+    is not something to rely on. When one is dropped, the body text still cites
+    it (``\\ref{tab:main_results}``) and the per-instance numbers it carries
+    appear nowhere in the paper. Re-inserting keeps the evidence the numbers
+    were computed from.
+
+    Tables already present are left alone, so a compliant draft is unchanged.
+    """
+    if not draft or not prebuilt:
+        return draft
+
+    def _already_present(draft_text: str, table: Any) -> bool:
+        """True when the draft carries this table under *any* label.
+
+        The writer is asked to copy the generated float verbatim, but it
+        sometimes retitles the caption and relabels the float while keeping the
+        rows. Keying only on the label re-inserted the generator's copy next to
+        the writer's, so the PDF printed the same results table twice.
+        """
+        label = getattr(table, "label", "")
+        if label and f"\\label{{{label}}}" in draft_text:
+            return True
+        code = getattr(table, "latex_code", "")
+        sig = _table_numeric_signature(code)
+        if not sig:
+            return False
+        return sig in {
+            _table_numeric_signature(m.group(0))
+            for m in re.finditer(r"\\begin\{table\*?\}.*?\\end\{table\*?\}", draft_text, re.DOTALL)
+        }
+
+    missing = [t for t in prebuilt if not _already_present(draft, t)]
+    if not missing:
+        return draft
+
+    block = "\n\n".join(t.latex_code for t in missing)
+    names = ", ".join(t.label for t in missing)
+
+    # Place them at the end of the Results section, where a results table
+    # belongs. Anchoring before the *next* heading after "Results" keeps them
+    # inside that section; falling back to the end of the document does not —
+    # a draft whose Results heading the regex missed (e.g. "## 5. Results" with
+    # a prefix the pattern does not cover) had its tables appended *after the
+    # bibliography*, so the compiled PDF printed a second copy of every results
+    # table past the references.
+    insert_at = _results_section_end(draft)
+    if insert_at is None:
+        logger.warning(
+            "Stage 17: no Results heading found; appending %d pre-built "
+            "table(s) before the bibliography", len(missing),
+        )
+        insert_at = _before_bibliography(draft)
+
+    logger.info(
+        "Stage 17: draft omitted pre-built table(s) %s — inserted at offset %d",
+        names, insert_at,
+    )
+    return draft[:insert_at].rstrip() + "\n\n" + block + "\n\n" + draft[insert_at:].lstrip()
+
+
+#: Headings that end the body of the paper. A float placed after one of these
+#: is printed after the bibliography, which is never where a results table
+#: belongs.
+_BACK_MATTER_RE = re.compile(
+    r"^#{1,3}\s*(?:\d+(?:\.\d+)*[.)]?\s*)?"
+    r"(?:References|Bibliography|Appendix|Acknowledg\w*|Supplementary)\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _results_section_end(draft: str) -> int | None:
+    """Offset just before the heading that ends the Results section."""
+    _heading = re.compile(r"^#{1,3}\s+\S", re.MULTILINE)
+    start = re.search(
+        r"^#{1,3}\s*(?:\d+(?:\.\d+)*[.)]?\s*)?Results\b",
+        draft,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if not start:
+        return None
+    for m in _heading.finditer(draft, start.end()):
+        return m.start()
+    return None
+
+
+def _before_bibliography(draft: str) -> int:
+    """Offset of the bibliography heading, or the end of the draft."""
+    m = _BACK_MATTER_RE.search(draft)
+    return m.start() if m else len(draft)
+
+
 def _execute_paper_draft(
     stage_dir: Path,
     run_dir: Path,
@@ -1407,8 +1857,16 @@ def _execute_paper_draft(
     has_real_metrics = False
     _verified_registry = None  # Phase 1: anti-fabrication verified data registry
     # BUG-108: Load refinement_log so VerifiedRegistry has per-iteration metrics
+    #
+    # Live Stage 13 only — ``_vN`` holds a superseded round, and letting one in
+    # would seed the anti-fabrication registry with values the paper is not
+    # allowed to quote, which is how a rolled-back round's numbers got restored
+    # as "verified" on the fbdc43fe audit run.
     _refinement_log_for_vr: dict | None = None
-    _rl_candidates = sorted(run_dir.glob("stage-13*/refinement_log.json"), reverse=True)
+    _rl_candidates = [
+        d / "refinement_log.json"
+        for d in _iter_prior_stage_dirs(run_dir, "stage-13*")
+    ]
     _rl_path = _rl_candidates[0] if _rl_candidates else None
     if _rl_path and _rl_path.is_file():
         try:
@@ -1499,7 +1957,15 @@ def _execute_paper_draft(
             # R19-6 + R33: Inject condition summaries with CIs
             cond_summaries = exp_summary_parsed.get("condition_summaries", {})
             if isinstance(cond_summaries, dict) and cond_summaries:
-                cond_block = "\n\n## PER-CONDITION SUMMARY (use in Results tables)\n"
+                cond_block = (
+                    "\n\n## PER-CONDITION SUMMARY (use in Results tables)\n"
+                    "One block per condition. Each metric appears under a single "
+                    "name, and that value is already the aggregate — cite it as "
+                    "written and do not recompute it from anything else in this "
+                    "prompt. Where a metric shows both a pooled value and a "
+                    "'mean_of_instances' value, they are the same quantity "
+                    "computed two ways; report one of them, never a mix.\n"
+                )
                 for cname, cdata in sorted(cond_summaries.items()):
                     cond_block += f"\n### {cname}\n"
                     if not isinstance(cdata, dict):
@@ -1515,9 +1981,14 @@ def _execute_paper_draft(
                         cond_block += f"- Seeds: {ns}\n"
                     ci_lo = cdata.get("ci95_low")
                     ci_hi = cdata.get("ci95_high")
+                    _ci_key = cdata.get("ci95_metric_key")
                     if ci_lo is not None and ci_hi is not None:
+                        _ci_what = f" for {_ci_key}" if _ci_key else ""
                         try:
-                            cond_block += f"- Bootstrap 95% CI: [{float(ci_lo):.4f}, {float(ci_hi):.4f}]\n"
+                            cond_block += (
+                                f"- Bootstrap 95% CI{_ci_what}: "
+                                f"[{float(ci_lo):.4f}, {float(ci_hi):.4f}]\n"
+                            )
                         except (ValueError, TypeError):
                             cond_block += f"- Bootstrap 95% CI: [{ci_lo}, {ci_hi}]\n"
                     cm = cdata.get("metrics") or {}
@@ -1527,7 +1998,45 @@ def _execute_paper_draft(
                                 cond_block += f"- {mk}: {mv:.4f}\n"
                             else:
                                 cond_block += f"- {mk}: {mv}\n"
+                    # Per-instance detail, so a per-instance table row has a
+                    # number to cite instead of a zero-filled placeholder.
+                    _insts = cdata.get("instances")
+                    if isinstance(_insts, dict) and _insts:
+                        cond_block += "- Per instance (mean over seeds"
+                        cond_block += ", ± std across seeds):\n"
+                        for _iname, _istat in sorted(_insts.items()):
+                            if not isinstance(_istat, dict):
+                                continue
+                            _im = _istat.get("mean")
+                            _is = _istat.get("std")
+                            _in = _istat.get("n")
+                            if not isinstance(_im, (int, float)):
+                                continue
+                            _line = f"    - {_iname}: {_im:.4f}"
+                            if isinstance(_is, (int, float)):
+                                _line += f" ± {_is:.4f}"
+                            if _in:
+                                _line += f" (n={_in})"
+                            cond_block += _line + "\n"
                 exp_metrics_instruction += cond_block
+
+            # Per-instance aggregation. ``condition_summaries`` above reports one
+            # number per condition across *all* instances, so a writer that
+            # disaggregates by instance (or averages those means into an
+            # aggregate row) has nothing to cite for the dispersion — and
+            # invents ``± 0.0000`` rather than omitting the column. These are
+            # the same numbers the pre-built results table shows, for the same
+            # reason: keep the writer out of the arithmetic.
+            _per_instance_block = _build_per_instance_stats_block(exp_summary_parsed)
+            if _per_instance_block:
+                exp_metrics_instruction += _per_instance_block
+            # The aggregate row (mean of instance means, and the spread
+            # across instances) is the other number a summary table needs
+            # and the artifact does not store. Emitted as a ready block so
+            # the writer copies rather than reconstructs it.
+            _agg_block = _build_aggregate_summary_block(exp_summary_parsed)
+            if _agg_block:
+                exp_metrics_instruction += _agg_block
 
             # R18-1: Inject paired statistical comparisons
             paired = exp_summary_parsed.get("paired_comparisons", [])
@@ -1909,6 +2418,9 @@ def _execute_paper_draft(
         )
 
     # Phase 1: Inject pre-built results tables from VerifiedRegistry
+    # Initialised outside the block: a registry or build failure below leaves
+    # this empty, and the post-draft check reads it unconditionally.
+    _prebuilt_tables: list[Any] = []
     if _verified_registry is not None:
         try:
             from researchclaw.templates.results_table_builder import (
@@ -1952,6 +2464,17 @@ def _execute_paper_draft(
         "- If only N conditions completed, simply report results for those N conditions\n"
         "  without repeating apologies or disclaimers about missing conditions\n"
         "- Any table cell without real data must show '\u2014' (not a plausible number)\n"
+        # A row aggregating several instances always has dispersion. Writing
+        # "0.0000" asserts the instances agreed exactly, which is a claim the
+        # data cannot support and reads as a measured result.
+        "- Do NOT write a standard deviation of 0.0000 for a row that aggregates\n"
+        "  several instances or seeds. If the data above does not give you the\n"
+        "  dispersion, either omit the ± term or cite the value provided;\n"
+        "  never fill it with zeros\n"
+        # Same rule for derived ratios: nothing in the artifact is a ratio, so a
+        # ratio can only be an unverified invention of the writer.
+        "- Do NOT introduce derived ratios or multipliers (e.g. \"25x lower\",\n"
+        "  \"3-fold faster\") that are not present in the data above\n"
         "- FORBIDDEN: generating numbers that 'look right' based on your training data\n"
     )
 
@@ -2222,6 +2745,14 @@ def _execute_paper_draft(
         if ref_match:
             draft = draft[:ref_match.start()].rstrip()
             logger.info("Stage 17: Stripped LLM-generated References section (R7 fix)")
+
+        # Ensure every pre-built results table actually reached the draft.
+        # The prompt says to copy them verbatim, but a writer that summarises
+        # instead of copying leaves the body text citing a float that does not
+        # exist — and the per-instance numbers those tables carry then appear
+        # nowhere in the paper. Insert any that are missing rather than trusting
+        # compliance, since the tables are generated, not authored.
+        draft = _ensure_prebuilt_tables(draft, _prebuilt_tables)
     else:
         # Build template with real data if available
         results_section = "Template results summary."

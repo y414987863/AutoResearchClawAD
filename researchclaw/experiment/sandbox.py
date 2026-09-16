@@ -76,6 +76,10 @@ _SUMMARY_PATTERN = re.compile(
 _CONDITION_MULTI_METRIC_RE = re.compile(
     r"(\w[\w.]*)\s*:\s*(" + _FLOAT_RE + r")"
 )
+#: Suffixes that mark a name as an aggregate the project states itself
+#: ("<metric>_mean", "<metric>_std", ...) rather than a raw measurement.
+#: Mirrors the suffix set ``package_scoring.metrics_from_stdout`` keeps.
+_AGGREGATE_SUFFIXES = ("_mean", "_std", "_median", "_best", "_final")
 
 
 def _to_text(value: str | bytes | None) -> str:
@@ -87,7 +91,32 @@ def _to_text(value: str | bytes | None) -> str:
 
 
 def parse_metrics(stdout: str) -> dict[str, float]:
+    """Metric values from *stdout*, keyed so every value keeps its identity.
+
+    A line naming a condition or an instance — ``condition=C instance=I
+    <metric>: <v>`` — describes one measurement, and lands under the full
+    ``condition/instance/seed/metric`` key that names it. The same line also
+    yields a shorter ``condition/metric`` alias, which is the reduction the
+    results table reads.
+
+    A bare ``<metric>`` key, whose name carries no identity at all, is written
+    ONLY for a line the experiment printed without a condition prefix. Letting a
+    condition-scoped line define one is what this function used to do, and with
+    every condition and instance writing to the same slot the last line won:
+    ``test_accuracy_mean`` ended up holding one instance's seed mean (the final
+    condition's final instance) under a name that reads like the run's overall
+    average — and the paper quoted it. A bare key is now either true (the
+    project stated it globally) or rebuilt from every per-instance value.
+    """
     metrics: dict[str, float] = {}
+    #: Bare names that a condition- or instance-scoped line tried to write. Such
+    #: a line describes ONE measurement, so the bare slot it reached for is
+    #: contested by every condition and instance; the last writer would win.
+    #: Tracked so those writes can be discarded at the end instead of applied.
+    _contested: set[str] = set()
+    #: Bare names written by a prefix-free line, i.e. the project stating a
+    #: run-level value outright. Later duplicates overwrite, as a dict write does.
+    _global_bare: dict[str, float] = {}
     for line in stdout.splitlines():
         stripped = line.strip()
 
@@ -106,7 +135,7 @@ def parse_metrics(stdout: str) -> dict[str, float]:
                     metrics[f"{cond_name}/{metric_name}"] = mean_val
                     metrics[f"{cond_name}/{metric_name}_mean"] = mean_val
                     metrics[f"{cond_name}/{metric_name}_std"] = std_val
-                    metrics[metric_name] = mean_val
+                    _contested.add(metric_name)
             continue
 
         # R16-1: Try ratio format first: "condition=X [tags] metric: N/M"
@@ -126,7 +155,7 @@ def parse_metrics(stdout: str) -> dict[str, float]:
                 composite_key = "/".join(tag_parts)
                 metrics[f"{composite_key}/{name}"] = val
                 metrics[f"{cond_name}/{name}"] = val
-                metrics[name] = val
+                _contested.add(name)
             continue
 
         # Try condition-prefixed format: "condition=X [tags] metric: value"
@@ -149,7 +178,7 @@ def parse_metrics(stdout: str) -> dict[str, float]:
                 composite_key = "/".join(tag_parts)
                 metrics[f"{composite_key}/{name}"] = val
                 metrics[f"{cond_name}/{name}"] = val
-                metrics[name] = val
+                _contested.add(name)
             continue
 
         # BUG-181: Multi-metric condition line fallback
@@ -176,7 +205,7 @@ def parse_metrics(stdout: str) -> dict[str, float]:
                         if _seed is not None:
                             metrics[f"{_cond}/{_seed}/{_mname}"] = _mval
                         metrics[f"{_cond}/{_mname}"] = _mval
-                        metrics[_mname] = _mval
+                        _contested.add(_mname)
                 continue
 
         # Plain format: "metric: value"
@@ -194,7 +223,39 @@ def parse_metrics(stdout: str) -> dict[str, float]:
         if math.isnan(val) or math.isinf(val):
             logger.warning("Skipping non-finite metric %s=%s", name, value)
             continue
-        metrics[name] = val
+        if name.endswith(_AGGREGATE_SUFFIXES):
+            # A project-stated aggregate ("<metric>_mean: 0.964081") with no
+            # condition prefix. Kept as-is: this is the only place it says what
+            # the run's overall number is, and no per-instance value can be
+            # reduced into it.
+            _global_bare[name] = val
+        else:
+            metrics[name] = val
+            _global_bare[name] = val
+    metrics.update(_global_bare)
+
+    # Untangle the aliases above. A condition-scoped line wrote
+    # "<condition>/<metric>" and reached for the bare "<metric>"; both are
+    # resolved here, because neither can stand as written. The bare name is a
+    # slot every condition and instance writes to, so it holds whichever line
+    # came last until it is dropped — unless a prefix-free line claimed it, in
+    # which case the project itself stated a run-level value and that stands. The
+    # "<condition>/<metric>" alias is replaced by the mean over every per-instance
+    # value that condition produced, which is the reduction it is supposed to
+    # denote; the old value was one instance's, the final one in the stdout.
+    _per_condition: dict[str, dict[str, list[float]]] = {}
+    for key, value in metrics.items():
+        parts = key.split("/")
+        if len(parts) != 4 or not math.isfinite(value):
+            continue
+        _per_condition.setdefault(parts[0], {}).setdefault(parts[3], []).append(value)
+
+    for _name in _contested:
+        if _name not in _global_bare:
+            metrics.pop(_name, None)
+    for _cond, _by_metric in _per_condition.items():
+        for _metric, _values in _by_metric.items():
+            metrics[f"{_cond}/{_metric}"] = sum(_values) / len(_values)
     return metrics
 
 

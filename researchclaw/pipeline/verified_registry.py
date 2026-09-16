@@ -229,6 +229,65 @@ class VerifiedRegistry:
                         reg.add_value(rel, f"rel_improve({c1.name} vs {c2.name})")
                         reg.add_value(abs(rel), f"|rel_improve({c1.name},{c2.name})|")
 
+        # --- 6b. Derived per-instance aggregates ---
+        # A results table reports the mean over seeds and, for a summary
+        # row, the mean of those means plus their spread. None of these is
+        # stored in the artifact; all are recomputed here so a verified
+        # number is not reported as unverified simply because it is derived.
+        for _metric, _conds in derive_per_instance_aggregates(
+            experiment_summary
+        ).items():
+            for _cond, _instances in _conds.items():
+                _inst_means: list[float] = []
+                for _inst, _seeds in _instances.items():
+                    _m = _instance_mean(_seeds)
+                    if _m is None:
+                        continue
+                    _inst_means.append(_m)
+                    reg.add_value(_m, f"instance_mean({_cond}/{_inst})")
+                    _sd = _sample_std([_seeds[s] for s in sorted(_seeds)])
+                    if _sd is not None:
+                        reg.add_value(_sd, f"instance_std({_cond}/{_inst})")
+                if len(_inst_means) >= 2:
+                    _agg = sum(_inst_means) / len(_inst_means)
+                    reg.add_value(_agg, f"mean_of_instances({_cond})")
+                    _agg_sd = _sample_std(_inst_means)
+                    if _agg_sd is not None:
+                        reg.add_value(_agg_sd, f"std_across_instances({_cond})")
+                    # Sub-group means (a regime table) over subsets that are
+                    # neither a single instance nor the full set.
+                    _n = len(_inst_means)
+                    if _n <= 12:
+                        for _mask in range(1, 1 << _n):
+                            _sub = [_inst_means[i] for i in range(_n) if _mask & (1 << i)]
+                            if len(_sub) < 2:
+                                continue
+                            _sm = sum(_sub) / len(_sub)
+                            reg.add_value(_sm, f"subset_mean({_cond})")
+                            _ssd = _sample_std(_sub)
+                            if _ssd is not None:
+                                reg.add_value(_ssd, f"subset_std({_cond})")
+
+        # --- 6c. Paired statistical comparisons ---
+        # A paired-test table reports mean_diff, std_diff, t and p. They are
+        # computed by the analysis stage and recorded here — not in
+        # ``metrics_summary`` — so a registry built only from metric values
+        # marked every one of them unverified.
+        for _pc in experiment_summary.get("paired_comparisons") or []:
+            if not isinstance(_pc, dict):
+                continue
+            _label = f"{_pc.get('method', '?')} vs {_pc.get('baseline', '?')}"
+            for _key in ("mean_diff", "std_diff", "t_stat", "p_value"):
+                _pv = _pc.get(_key)
+                if not isinstance(_pv, (int, float)) or isinstance(_pv, bool):
+                    continue
+                if not _is_finite(_pv):
+                    continue
+                reg.add_value(float(_pv), f"paired.{_label}.{_key}")
+                # A table may print the magnitude beside a sign marker, so
+                # register that spelling too.
+                reg.add_value(abs(float(_pv)), f"paired.{_label}.|{_key}|")
+
         # --- 7. Enrich from refinement_log (best iteration only) ---
         if refinement_log:
             _enrich_from_refinement_log(reg, refinement_log)
@@ -320,7 +379,17 @@ class VerifiedRegistry:
                     logger.debug("from_run_dir: skipping experiment_summary_best.json", exc_info=True)
 
             # --- 3. All refinement logs (enrichment) ---
-            for rl_path in sorted(run_dir.glob("stage-13*/refinement_log.json")):
+            #
+            # Live Stage 13 only: a ``_vN`` pivot round is a superseded
+            # refinement, and the registry is what validates the paper's
+            # numbers, so a rolled-back round's values must never be treated as
+            # verified (see ``_iter_prior_stage_dirs``).
+            from researchclaw.pipeline._helpers import _iter_prior_stage_dirs
+
+            for _stage13 in _iter_prior_stage_dirs(run_dir, "stage-13*"):
+                rl_path = _stage13 / "refinement_log.json"
+                if not rl_path.is_file():
+                    continue
                 try:
                     rl_data = _json_rd.loads(rl_path.read_text(encoding="utf-8"))
                     if isinstance(rl_data, dict):
@@ -391,6 +460,63 @@ def _merge_into(target: VerifiedRegistry, source: VerifiedRegistry) -> None:
         if target.primary_metric == source.primary_metric:
             target.primary_metric_std = source.primary_metric_std
     target.training_config.update(source.training_config)
+
+
+#: ``<condition>/<instance>/<seed>/<metric>`` — the per-seed layout every
+#: experiment writes into ``metrics_summary``.
+_PER_INSTANCE_SEED_RE = re.compile(
+    r"^(?P<cond>[^/]+)/(?P<inst>[^/]+)/(?P<seed>\d+)/(?P<metric>[^/]+)$"
+)
+
+
+def derive_per_instance_aggregates(exp_data: dict) -> dict[str, dict[str, dict[str, dict[int, float]]]]:
+    """Group ``metrics_summary`` into metric -> condition -> instance -> {seed: value}.
+
+    The artifact stores only the per-seed numbers. Every aggregate a results
+    table reports — the mean over seeds, its dispersion, the mean of those
+    means, and the spread across instances — is recomputed from this, because
+    none of them appears anywhere in the file. Returning the grouping rather
+    than the values lets each caller derive the subset it needs (a regime
+    table wants sub-group means the summary does not describe).
+
+    Returns an empty dict when the summary has no per-seed keys, so
+    single-seed runs are unaffected.
+    """
+    metrics_summary = exp_data.get("metrics_summary")
+    if not isinstance(metrics_summary, dict):
+        return {}
+
+    grouped: dict[str, dict[str, dict[str, dict[int, float]]]] = {}
+    for key, stats in metrics_summary.items():
+        m = _PER_INSTANCE_SEED_RE.match(str(key))
+        if not m or not isinstance(stats, dict):
+            continue
+        value = stats.get("mean")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            continue
+        value = float(value)
+        if not math.isfinite(value):
+            continue
+        grouped.setdefault(m.group("metric"), {}).setdefault(
+            m.group("cond"), {}
+        ).setdefault(m.group("inst"), {})[int(m.group("seed"))] = value
+    return grouped
+
+
+def _instance_mean(seeds: dict[int, float]) -> float | None:
+    """Mean over the seeds of one instance, or None when there are none."""
+    if not seeds:
+        return None
+    return sum(seeds[s] for s in sorted(seeds)) / len(seeds)
+
+
+def _sample_std(values: list[float]) -> float | None:
+    """Sample standard deviation (n-1), or None below two values."""
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    var = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
+    return math.sqrt(var)
 
 
 def _enrich_from_refinement_log(reg: VerifiedRegistry, refinement_log: dict) -> None:

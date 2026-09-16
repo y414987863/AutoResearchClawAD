@@ -29,6 +29,7 @@ from researchclaw.pipeline._helpers import (
     _extract_yaml_block,
     _get_evolution_overlay,
     _load_hardware_profile,
+    _METRIC_DIRECTION_DICT_RE,
     _read_prior_artifact,
     _safe_json_loads,
     _utcnow_iso,
@@ -771,10 +772,7 @@ def _check_llm4ad_structure(files: dict[str, str], metric_key: str = "") -> list
     # bare MetricType import couples the module to a class it may not need.
     _eval_dir_code = files.get("evaluator.py", "")
     if "evaluate_instance" in _eval_dir_code and "PRIMARY_METRIC" in _eval_dir_code:
-        if not re.search(
-            r'METRIC_DEF\s*=\s*\{[^}]*"direction"\s*:\s*"(minimize|maximize)"',
-            _eval_dir_code,
-        ):
+        if not _METRIC_DIRECTION_DICT_RE.search(_eval_dir_code):
             problems.append(
                 "LLM4AD_STRUCTURE: `evaluator.py` must define a static direction "
                 "declaration so downstream stages agree on which way is better. "

@@ -13,6 +13,7 @@ from researchclaw.config import RCConfig
 from researchclaw.llm.client import LLMClient
 from researchclaw.pipeline._domain import _detect_domain, _is_ml_domain
 from researchclaw.pipeline._helpers import (
+    LLM4AD_DELIVERED_RUN_ID,
     StageResult,
     _build_context_preamble,
     _chat_with_prompt,
@@ -294,7 +295,7 @@ def _execute_result_analysis(
         _l4b_metrics = _l4b.get("metrics") or {}
         if _l4b_metrics:
             exp_data["best_run"] = {
-                "run_id": "llm4ad-experiment-final",
+                "run_id": LLM4AD_DELIVERED_RUN_ID,
                 "task_id": "experiment_final",
                 "status": "completed",
                 "metrics": _l4b_metrics,
@@ -362,11 +363,20 @@ def _execute_result_analysis(
         _best_metrics = exp_data["best_run"].get("metrics", {})
 
     # Group metrics by condition prefix (e.g., "ppo/primary_metric" → condition "ppo")
+    #
+    # The metric name is whatever follows the condition, not the last path
+    # segment. A per-seed key ("cma_es/rosenbrock_10d/2/primary_metric") ends in
+    # "primary_metric", so taking the last segment folds every seed of every
+    # instance onto one key and lets the final seed overwrite the rest — the
+    # summary then reports the *last* seed as the condition's primary metric
+    # while the mean sits beside it in "<metric>_mean". Keeping the interior
+    # path ("rosenbrock_10d/2/primary_metric") leaves the seeds distinct; the
+    # seed values are then pooled into a real mean below.
     for _mk, _mv in _best_metrics.items():
-        parts = _mk.split("/")
+        parts = _mk.split("/", 1)
         if len(parts) >= 2:
             cond = parts[0]
-            metric_name = parts[-1]
+            metric_name = parts[1]
             if cond not in _condition_summaries:
                 _condition_summaries[cond] = {"metrics": {}}
             try:
@@ -380,10 +390,10 @@ def _execute_result_analysis(
     if not _condition_summaries and _ms:
         # Try to parse condition data from metrics_summary keys
         for _mk, _mv in _ms.items():
-            parts = _mk.split("/")
+            parts = _mk.split("/", 1)
             if len(parts) >= 2:
                 cond = parts[0]
-                metric_name = parts[-1]
+                metric_name = parts[1]
                 if cond not in _condition_summaries:
                     _condition_summaries[cond] = {"metrics": {}}
                 try:
@@ -432,34 +442,51 @@ def _execute_result_analysis(
                          "to avoid cond_count=0 correctness penalty.",
             }
 
-    # R33: Build per-seed data structure (needed for CIs and paired tests below)
+    # R33: Build per-seed data structure (needed for CIs and paired tests below).
+    # Pooled per condition ACROSS instances — this is the "one number per
+    # method" a summary table reports, and what the paired tests below compare.
     _seed_data: dict[str, dict[int, float]] = {}  # {condition: {seed: value}}
+    # Kept separate: {condition: {instance: {seed: value}}}. The same seed id
+    # runs on every instance, so pooling without this dimension would let the
+    # last instance silently stand in for all of them.
+    _seed_data_by_instance: dict[str, dict[str, dict[int, float]]] = {}
     for _mk, _mv in _best_metrics.items():
         parts = _mk.split("/")
-        # Pattern: condition/regime/seed_id/primary_metric
+        # Pattern: condition/regime/seed_id/metric
         if len(parts) >= 4 and parts[-1] == config.experiment.metric_key:
-            cond = parts[0]
+            cond, inst = parts[0], "/".join(parts[1:-2])
             try:
-                seed_id = int(parts[2])
+                seed_id = int(parts[-2])
                 val = float(_mv)
-                _seed_data.setdefault(cond, {})[seed_id] = val
             except (ValueError, TypeError):
-                pass
+                continue
+            _seed_data.setdefault(cond, {})[seed_id] = val
+            _seed_data_by_instance.setdefault(cond, {}).setdefault(inst, {})[seed_id] = val
 
     # Enrich condition summaries with seed counts, success rates, and CIs
     for _ck, _cv in _condition_summaries.items():
-        # Look for success_rate in metrics
-        sr_key = f"{_ck}/success_rate"
-        if sr_key in _best_metrics:
+        # Look for the success-rate metric the evaluator actually emits. Its
+        # name is not fixed — the generated evaluator writes "success_rate",
+        # "success_rate_eps", "success_rate@1e-6" and similar — so match on the
+        # prefix rather than one hard-coded spelling. The old key was
+        # "<cond>/success_rate", which never matched an evaluator that logged
+        # "<cond>/success_rate_eps": the rate was silently dropped from the
+        # summary and the paper was left with no access to it at all.
+        for _mk, _mv in _best_metrics.items():
+            _cond_part, _, _metric_part = _mk.partition("/")
+            if _cond_part != _ck or not _metric_part.startswith("success_rate"):
+                continue
             try:
-                _cv["success_rate"] = float(_best_metrics[sr_key])
+                _cv["success_rate"] = float(_mv)
+                _cv["success_rate_key"] = _metric_part
             except (ValueError, TypeError):
                 pass
-        # Count seed-level entries to estimate n_seeds
-        _seed_count = 0
-        for _mk in _best_metrics:
-            if _mk.startswith(f"{_ck}/") and "seed" in _mk.lower():
-                _seed_count += 1
+            break
+        # Count seed-level entries to estimate n_seeds. The seeds live in the
+        # third path segment ("<cond>/<inst>/<seed>/<metric>") — the literal
+        # word "seed" never appears in the key, so the previous substring test
+        # matched nothing and n_seed_metrics was never recorded.
+        _seed_count = len(_seed_data.get(_ck, {}))
         if _seed_count > 0:
             _cv["n_seed_metrics"] = _seed_count
 
@@ -469,9 +496,47 @@ def _execute_result_analysis(
             import statistics as _stats_mod
             _mean = _stats_mod.mean(_vals)
             _std = _stats_mod.stdev(_vals)
-            _cv["metrics"][f"{config.experiment.metric_key}_mean"] = round(_mean, 6)
-            _cv["metrics"][f"{config.experiment.metric_key}_std"] = round(_std, 6)
+            _mk_key = config.experiment.metric_key
+            # One canonical value per (condition, metric). The pooled mean is
+            # the number a summary table cites, and it is the same value under
+            # both "<metric>" and "<metric>_mean" — before this, "<metric>" held
+            # whatever seed happened to be written last, so the paper could
+            # report a point estimate that its own confidence interval did not
+            # contain. Both spellings are kept because callers read either one.
+            _cv["metrics"][_mk_key] = round(_mean, 6)
+            _cv["metrics"][f"{_mk_key}_mean"] = round(_mean, 6)
+            _cv["metrics"][f"{_mk_key}_std"] = round(_std, 6)
             _cv["n_seeds"] = len(_vals)
+            # Per-instance mean and dispersion. The pooled std above mixes
+            # between-instance spread into the seed-level dispersion, so a
+            # results table needs these to report a cell's mean ± std without
+            # attributing instance differences to seed noise.
+            _per_inst = _seed_data_by_instance.get(_ck, {})
+            if len(_per_inst) >= 1:
+                _inst_stats: dict[str, dict[str, float | int]] = {}
+                for _inst_name, _inst_seeds in _per_inst.items():
+                    _iv = [_inst_seeds[s] for s in sorted(_inst_seeds)]
+                    _im = _stats_mod.mean(_iv)
+                    _entry: dict[str, float | int] = {
+                        "mean": round(_im, 6),
+                        "n": len(_iv),
+                    }
+                    if len(_iv) >= 2:
+                        _entry["std"] = round(_stats_mod.stdev(_iv), 6)
+                    _inst_stats[_inst_name] = _entry
+                _cv["instances"] = _inst_stats
+                # The aggregate a summary row reports: the mean of the
+                # instance means, not the mean of all pooled seeds. With
+                # balanced seed counts they coincide; with unbalanced ones
+                # only this equals averaging the table's rows.
+                _inst_means = [float(v["mean"]) for v in _inst_stats.values()]
+                _cv["metrics"][f"{_mk_key}_mean_of_instances"] = round(
+                    _stats_mod.mean(_inst_means), 6
+                )
+                if len(_inst_means) >= 2:
+                    _cv["metrics"][f"{_mk_key}_std_across_instances"] = round(
+                        _stats_mod.stdev(_inst_means), 6
+                    )
             # Bootstrap 95% CI (use local RNG to avoid corrupting global state)
             import random as _rng_mod
             _rng_local = _rng_mod.Random(42)
@@ -494,6 +559,7 @@ def _execute_result_analysis(
                 _ci_high = round(_mean + 1.96 * _se, 6)
             _cv["ci95_low"] = _ci_low
             _cv["ci95_high"] = _ci_high
+            _cv["ci95_metric_key"] = _mk_key
 
     # Count totals
     _total_conditions = len(_condition_summaries) if _condition_summaries else None

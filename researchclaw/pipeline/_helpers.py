@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import yaml
 
@@ -465,10 +465,74 @@ def _read_best_analysis(run_dir: Path) -> str:
     return _read_prior_artifact(run_dir, "analysis.md") or ""
 
 
-# Numeric stage dir and version-suffix patterns for `_read_prior_artifact`.
+# Numeric stage dir and version-suffix patterns for the prior-artifact scan.
 _STAGE_NAME_RE = re.compile(r"stage-(\d+)")
 _STAGE_VER_RE = re.compile(r"_v(\d+)")
 
+
+def _is_scratch_stage_dir(name: str, include_versioned: bool = False) -> bool:
+    """True for a stage directory that is scratch, not a stage's real output.
+
+    ``stage-14_repair_v1`` and ``stage-13_v2`` are workspaces the repair and
+    rollback machinery writes. They are never a valid artifact source: they hold
+    superseded or half-finished work that a later stage would otherwise read as
+    the current output.
+
+    ``include_versioned`` keeps the ``_vN`` pivot/rollback rounds. Only the
+    repair machinery wants those, and it opts in.
+    """
+    if "_repair" in name:
+        return True
+    return not include_versioned and _STAGE_VER_RE.search(name) is not None
+
+
+def _stage_sort_key(p: Path) -> tuple[float, int, str]:
+    """Sort key for stage directories: ascending stage number, then clean first.
+
+    Numeric, not lexicographic — ``stage-14_repair_v1`` sorts after ``stage-10``
+    as a string, which is how a stale Stage-14 repair workspace came to shadow the
+    stage-10 experiment ("No instances found under data/*.json"). Under the
+    reverse sort the callers apply, ``ver=0`` (the clean directory) comes before
+    ``_vN``; scratch directories are filtered out anyway, so ``ver`` only orders
+    anything that filtering missed. ``p.name`` is the final tiebreaker, which
+    keeps the order total and stable.
+    """
+    m = _STAGE_NAME_RE.match(p.name)
+    num = float(m.group(1)) if m else float("inf")
+    m2 = _STAGE_VER_RE.search(p.name)
+    ver = int(m2.group(1)) if m2 else 0
+    return (num, ver, p.name)
+
+
+def _iter_prior_stage_dirs(
+    run_dir: Path,
+    pattern: str = "stage-*",
+    include_versioned: bool = False,
+) -> Iterator[Path]:
+    """Yield stage directories newest-first, scratch workspaces removed.
+
+    The single scan behind every "find the newest stage-N artifact" lookup. Each
+    caller used to carry its own copy of the order and the filter, and a fix
+    applied to one copy silently left the others picking a ``_repair``/``_vN``
+    workspace.
+
+    ``_repair*`` is always dropped. ``_vN`` (pivot/rollback) directories are
+    dropped unless ``include_versioned`` is set: they hold a *superseded* round,
+    so a caller that merely wants "the current Stage 13 output" must not see
+    them. The repair machinery is the exception — re-entering a failed round's
+    workspace is its whole purpose — and it opts in explicitly.
+
+    This is what made the reported numbers disagree with the delivered ones:
+    the paper path globbed ``stage-13*/refinement_log.json``, picked
+    ``stage-13_v1`` (the rolled-back round) by "highest primary metric wins",
+    and wrote that round's per-condition means into the draft, while Stage 14's
+    own merge — which goes through ``_read_prior_artifact`` — read the clean
+    ``stage-13``. Two sources, one paper.
+    """
+    for stage_subdir in sorted(run_dir.glob(pattern), key=_stage_sort_key, reverse=True):
+        if _is_scratch_stage_dir(stage_subdir.name, include_versioned):
+            continue
+        yield stage_subdir
 
 def _read_prior_artifact(run_dir: Path, filename: str) -> str | None:
     """Read the newest prior-stage artifact by its file/directory name.
@@ -484,23 +548,7 @@ def _read_prior_artifact(run_dir: Path, filename: str) -> str | None:
     instead of the stage-10 experiment and crashed with "No instances found
     under data/*.json".
     """
-
-    def _stage_sort_key(p: Path) -> tuple[float, int, str]:
-        m = _STAGE_NAME_RE.match(p.name)
-        num = float(m.group(1)) if m else float("inf")
-        ver = 0
-        m2 = _STAGE_VER_RE.search(p.name)
-        if m2:
-            ver = int(m2.group(1))
-        # Reverse-sort below: higher stage number first; within a stage, ver=0
-        # (clean) first. Versioned dirs are excluded anyway, so `ver` only orders
-        # anything we failed to filter — name is the final tiebreaker.
-        return (num, ver, p.name)
-
-    for stage_subdir in sorted(run_dir.glob("stage-*"), key=_stage_sort_key, reverse=True):
-        name = stage_subdir.name
-        if "_repair" in name or _STAGE_VER_RE.search(name):
-            continue  # repair/versioned workspaces are never a valid artifact source
+    for stage_subdir in _iter_prior_stage_dirs(run_dir):
         candidate = stage_subdir / filename
         if candidate.is_file():
             try:
@@ -515,17 +563,27 @@ def _read_prior_artifact(run_dir: Path, filename: str) -> str | None:
 
 # The generated experiment declares which way its primary metric is judged, in
 # either the static dict (preferred — readable without running the code) or the
-# runtime line it prints. The dict pattern stays inside one brace pair
-# (``[^}]*``, which already spans newlines) rather than using a lazy ``.*?``:
-# the lazy form walks past a METRIC_DEF that omits ``direction`` and latches
-# onto the next unrelated dict that happens to have one.
-_METRIC_DIRECTION_DICT_RE = re.compile(
-    r'METRIC_DEF\s*=\s*\{[^}]*"direction"\s*:\s*"(maximize|minimize)"',
-    re.IGNORECASE,
+# runtime line it prints.
+#
+# Quoting is deliberately lax (``['\"]``). Python accepts both quote styles and
+# the model writes both, sometimes on the same line; a pattern that accepted only
+# ``"..."`` read a single-quoted declaration as "declares nothing", which sent
+# every consumer to its own fallback default — and those defaults disagree (the
+# chart helper reads "" as higher-is-better, the registry as lower), so the same
+# undeclared metric got two opposite verdicts in one run.
+_METRIC_DIRECTION_DICT_PATTERN = (
+    r"METRIC_DEF\s*[:=]\s*\{[^}]*['\"]direction['\"]\s*:\s*['\"](maximize|minimize)['\"]"
 )
+# The runtime ``print("METRIC_DEF: ... direction=higher")`` line.
 _METRIC_DIRECTION_PRINT_RE = re.compile(
     r"METRIC_DEF\s*:.*?direction\s*=\s*(higher|lower)", re.IGNORECASE
 )
+
+# The dict pattern stays inside one brace pair (``[^}]*``, which already spans
+# newlines) rather than using a lazy ``.*?``: the lazy form walks past a
+# METRIC_DEF that omits ``direction`` and latches onto the next unrelated dict
+# that happens to have one.
+_METRIC_DIRECTION_DICT_RE = re.compile(_METRIC_DIRECTION_DICT_PATTERN, re.IGNORECASE)
 
 
 def correct_metric_direction(run_dir: Path, config: RCConfig) -> RCConfig:
@@ -614,21 +672,19 @@ def _detect_metric_direction(exp_dir: Path) -> str:
 
 
 def _find_prior_file(run_dir: Path, filename: str) -> Path | None:
-    """Like ``_read_prior_artifact`` but returns the *Path* instead of content."""
-    def _stage_sort_key(p: Path) -> tuple[str, int]:
-        name = p.name
-        if "_v" in name:
-            base, _, ver = name.rpartition("_v")
-            try:
-                return (base, -int(ver))
-            except ValueError:
-                return (name, -999)
-        return (name, 0)
+    """Like ``_read_prior_artifact`` but returns the *Path* instead of content.
 
-    for stage_subdir in sorted(run_dir.glob("stage-*"), key=_stage_sort_key, reverse=True):
+    Same scan, so it inherits the same order and the same scratch filtering: this
+    used to keep its own lexicographic key with no ``_repair``/``_vN`` filter, so
+    ``stage-14_repair_v1`` outranked ``stage-14`` and callers read a stale repair
+    workspace's ``draft_quality.json`` as the current quality report.
+    """
+    for stage_subdir in _iter_prior_stage_dirs(run_dir):
         candidate = stage_subdir / filename
         if candidate.is_file():
             return candidate
+        if filename.endswith("/") and (stage_subdir / filename.rstrip("/")).is_dir():
+            return stage_subdir / filename.rstrip("/")
     return None
 
 
@@ -1455,6 +1511,44 @@ def _collect_json_context(
     return "\n\n".join(chunks)
 
 
+def _group_seed_metric_keys(
+    metrics_summary: dict[str, Any],
+    consumed: set[str] | None = None,
+) -> dict[str, dict[str, list[float]]]:
+    """Regroup ``<cond>/<instance>/<seed>/<metric>`` keys by (metric, group).
+
+    Returns ``{metric: {"<cond>/<instance>": [values...]}}``. Empty when no key
+    follows that shape. *consumed* collects the keys folded into the result, so
+    a caller rendering the remaining keys as-is knows which ones it has already
+    covered.
+
+    The keys a run emits are per-seed, so a table built straight from them can
+    only ever print ``min == max == mean`` with ``N = 1`` — one row per seed,
+    every row describing a single observation. Regrouping is what turns those
+    rows back into the "mean over seeds ± dispersion for this cell" a results
+    table is supposed to show. Keys that don't match the pattern are left for
+    the caller to render as-is.
+    """
+    _per_seed = re.compile(
+        r"^(?P<group>[^/]+/[^/]+)/(?P<seed>\d+)/(?P<metric>[^/]+)$"
+    )
+    if consumed is None:
+        consumed = set()
+    grouped: dict[str, dict[str, list[float]]] = {}
+    for key, stats in metrics_summary.items():
+        m = _per_seed.match(str(key))
+        if not m:
+            continue
+        value: Any = stats.get("mean") if isinstance(stats, dict) else stats
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            continue
+        grouped.setdefault(m.group("metric"), {}).setdefault(
+            m.group("group"), []
+        ).append(float(value))
+        consumed.add(str(key))
+    return grouped
+
+
 def _collect_experiment_results(
     run_dir: Path,
     metric_key: str = "",
@@ -1551,23 +1645,56 @@ def _collect_experiment_results(
         _cmp = min if metric_direction == "minimize" else max
         best_run = _cmp(runs_data, key=_primary_metric)
 
-    # Build LaTeX table
+    # Build LaTeX table.
+    #
+    # Per-seed keys are regrouped to one row per (condition, instance) with the
+    # real seed count, because a table that reports each seed as its own
+    # min==max==mean, N=1 row tells the writer nothing about dispersion and
+    # invites it to fill in a std of 0.0000. Condition-level keys (no seed
+    # segment) carry their own count already and are rendered unchanged.
     latex_lines = [
         r"\begin{table}[h]",
         r"\centering",
         r"\caption{Experiment Results}",
     ]
     if metrics_summary:
-        cols = sorted(metrics_summary.keys())
-        header = "Metric & Min & Max & Mean & N \\\\"
+        consumed: set[str] = set()
+        _grouped = _group_seed_metric_keys(metrics_summary, consumed)
+        _rows: list[tuple[str, float, float, float, int]] = []
+        for _metric in sorted(_grouped):
+            for _group in sorted(_grouped[_metric]):
+                _vals = _grouped[_metric][_group]
+                _rows.append((
+                    f"{_group}/{_metric}",
+                    min(_vals),
+                    max(_vals),
+                    sum(_vals) / len(_vals),
+                    len(_vals),
+                ))
+        for _col in sorted(metrics_summary.keys()):
+            if _col in consumed:
+                continue  # already folded into a grouped row above
+            _s = metrics_summary[_col]
+            if not isinstance(_s, dict):
+                continue
+            try:
+                _rows.append((
+                    str(_col),
+                    float(_s["min"]),
+                    float(_s["max"]),
+                    float(_s["mean"]),
+                    int(_s.get("count", 1)),
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue
         latex_lines.append(r"\begin{tabular}{l" + "r" * 4 + "}")
         latex_lines.append(r"\hline")
-        latex_lines.append(header)
+        latex_lines.append("Metric & Min & Max & Mean & N \\\\")
         latex_lines.append(r"\hline")
-        for col in cols:
-            s = metrics_summary[col]
-            row = f"{col} & {s['min']:.4f} & {s['max']:.4f} & {s['mean']:.4f} & {s['count']} \\\\"
-            latex_lines.append(row)
+        for _label, _mn, _mx, _mean, _n in _rows:
+            latex_lines.append(
+                f"{_label} & {_mn:.4f} & {_mx:.4f} & {_mean:.4f} & {_n} \\\\"
+            )
         latex_lines.append(r"\hline")
         latex_lines.append(r"\end{tabular}")
     else:
@@ -1617,16 +1744,61 @@ def _read_llm4ad_provenance(run_dir: Path) -> dict[str, Any]:
     return data
 
 
+#: ``best_run.run_id`` Stage 14 stamps on the summary whose metrics came from
+#: Stage 13's ``experiment_final/``. Defined here because it is the marker
+#: every consumer of "did this run's numbers come from the delivered project?"
+#: has to agree on — it is written by ``_analysis.py`` and read by the paper
+#: writing and export stages.
+LLM4AD_DELIVERED_RUN_ID = "llm4ad-experiment-final"
+
+
+def _llm4ad_delivered_in_summary(run_dir: Path) -> bool:
+    """True when the promoted summary's ``best_run`` is the delivered project.
+
+    ``experiment_summary_best.json`` is the summary every paper-writing reader
+    uses, so its ``best_run.run_id`` is the one place that says which numbers
+    the run reports. Read here rather than inferring it from the numbers
+    themselves, which is what let a discarded refinement iteration stand in
+    for the delivered project.
+    """
+    path = run_dir / "experiment_summary_best.json"
+    if not path.is_file():
+        # Pre-promotion fallback: a run that never triggered the repair cycle
+        # still has the stage-14 summary itself.
+        path = run_dir / "stage-14" / "experiment_summary.json"
+    if not path.is_file():
+        return False
+    try:
+        data = _safe_json_loads(path.read_text(encoding="utf-8"), {})
+    except OSError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    best_run = data.get("best_run")
+    if not isinstance(best_run, dict):
+        return False
+    return best_run.get("run_id") == LLM4AD_DELIVERED_RUN_ID
+
+
 def _llm4ad_adopted_final(run_dir: Path) -> bool:
     """True when the run's reported metrics come from a delivered package.
 
     Stage 14 adopts the chosen package's own numbers as the run's results when
-    it can read them; the producer records that in the provenance. Callers use
-    this to avoid re-deriving results from the earlier sandboxes, which would
-    contradict the reported ones.
+    it can read them; callers use this to avoid re-deriving results from the
+    earlier sandboxes, which would contradict the reported ones.
+
+    Two markers are accepted because only one of Stage 14's paths writes a
+    provenance file. ``build_and_score_packages`` records ``final_metrics``
+    there, but the path that actually runs — ``final_experiment_for_config``,
+    which reports Stage 13's decision instead of re-deriving it — does not, so
+    a provenance-only check silently read "no adoption" on every real run and
+    let discarded refinement iterations back into the prompt. The summary's
+    ``best_run.run_id`` is written by both paths.
     """
     prov = _read_llm4ad_provenance(run_dir)
-    return bool(prov.get("final_metrics"))
+    if prov.get("final_metrics"):
+        return True
+    return _llm4ad_delivered_in_summary(run_dir)
 
 
 def _read_llm4ad_evidence(run_dir: Path) -> str:
@@ -2547,4 +2719,134 @@ def reconcile_figure_refs(
             ", ".join(f"{k} → {v}" for k, v in fixes.items()),
         )
 
+    # Second pass: the \ref side. Repairing the paths above does not make a
+    # single figure referenceable, because the body and the figure block name
+    # the same chart differently — the body writes a label it chose from the
+    # chart's subject ("fig:ablation_gain"), while the block's \label comes
+    # from its caption text ("fig:incremental_gains_over_pointwi") or, for a
+    # generic alt text, from the file stem. pdflatex then emits "LaTeX Warning:
+    # Reference `fig:ablation_gain' on page 7 undefined" and the PDF prints
+    # "??" wherever the number belongs.
+    #
+    # The image file stem is the one identifier both sides were handed, so a
+    # dangling \ref is matched against those stems and rewritten to the label
+    # of the figure block that embeds the winner. Only unambiguous matches are
+    # applied: a reference naming no chart, or tied between two, is left alone
+    # (a wrong number is worse than "??").
+    try:
+        _resolve_ref_labels(tex_path, tex_text)
+    except Exception as _ref_exc:  # noqa: BLE001
+        logger.debug("reconcile_figure_refs: label pass skipped: %s", _ref_exc)
+
     return fixes
+
+
+def _resolve_ref_labels(
+    tex_path: Path,
+    tex_text: str,
+) -> dict[str, str]:
+    """Rewrite dangling ``\\ref{}`` targets to the \\label of the figure they mean.
+
+    The body and the figure block name the same chart differently — the body
+    writes a label it chose from the chart's subject ("fig:ablation_gain"),
+    while the block's ``\\label`` comes from the caption text ("fig:
+    incremental_gains_over_pointwi") or, for a generic alt text, from the file
+    stem. String-matching the two never works, so the match runs against the
+    **image file stem**, which is the one name both sides were handed: the
+    figure block's ``\\includegraphics`` holds it, and the reference is a
+    paraphrase of it.
+
+    The label written back is the one actually emitted by that figure block,
+    read out of the block rather than recomputed — the converter owns the
+    ``\\label`` spelling, and duplicating its slug rules here would silently
+    break the moment it changes them.
+
+    Returns ``{old_ref: new_label}``.
+    """
+    labels = set(re.findall(r"\\label\{([^}]+)\}", tex_text))
+    refs = set(re.findall(r"\\ref\{([^}]+)\}", tex_text))
+    dangling = {r for r in refs if r not in labels}
+    if not dangling:
+        return {}
+
+    _STOP = frozenset({
+        "fig", "figure", "chart", "plot", "png", "jpg", "jpeg", "pdf", "svg",
+        "the", "a", "an", "of", "over", "for", "across", "vs", "with",
+    })
+
+    def _to_tokens(text: str) -> frozenset[str]:
+        """Meaningful words of a name, with fillers dropped."""
+        words = re.split(r"[^0-9a-z]+", text.lower())
+        return frozenset(w for w in words if w and w not in _STOP)
+
+    # stem -> the \label of the figure block embedding that chart. Iterating
+    # blocks (rather than scanning flat regexes) keeps each chart's own label
+    # attached to it.
+    label_of_stem: dict[str, str] = {}
+    tokens_of_stem: dict[str, frozenset[str]] = {}
+    # Some pipelines name charts "figure_5_fig_main_ndcg10_methods.png", where
+    # the leading ordinal is an artifact of the export step, not part of the
+    # chart's name. Left in, it inflates the union and sinks an otherwise exact
+    # match ("fig:seed_variability_pt" against
+    # "figure_7_fig_seed_variability_..." scores below any sane threshold).
+    _ordinal_prefix = re.compile(r"^(?:figure|fig|table)?_?\d+_+")
+    block_re = re.compile(r"\\begin\{figure\}.*?\\end\{figure\}", re.DOTALL)
+    for block in block_re.findall(tex_text):
+        inc = re.search(r"\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}", block)
+        lab = re.search(r"\\label\{([^}]+)\}", block)
+        if not inc or not lab:
+            continue
+        stem = Path(inc.group(1)).stem.lower()
+        if stem in label_of_stem:
+            continue
+        label_of_stem[stem] = lab.group(1)
+        tokens_of_stem[stem] = _to_tokens(_ordinal_prefix.sub("", stem))
+
+    if not label_of_stem:
+        return {}
+
+    result: dict[str, str] = {}
+    for ref in sorted(dangling):
+        ref_tokens = _to_tokens(ref)
+        if not ref_tokens:
+            continue
+        scored: list[tuple[float, float, str]] = []
+        for stem, stem_tokens in tokens_of_stem.items():
+            if not stem_tokens:
+                continue
+            # Recall alone is not enough: "fig:main_ndcg10_methods" is fully
+            # contained in "...main_ndcg10_comparison" too, so a chart whose
+            # stem merely contains the reference's words would win by
+            # accident. Jaccard requires the two names to be about the same
+            # thing, not just to overlap.
+            inter = len(ref_tokens & stem_tokens)
+            if not inter:
+                continue
+            jaccard = inter / len(ref_tokens | stem_tokens)
+            scored.append((jaccard, inter / len(ref_tokens), stem))
+        scored.sort(key=lambda t: (-t[0], -t[1], t[2]))
+        if not scored:
+            continue
+        best, best_recall, best_stem = scored[0]
+        if best_recall < 0.6 or best < 0.4:
+            continue
+        # Act only on a clear winner — a tie means the reference is ambiguous,
+        # and pointing it at either chart risks citing the wrong figure. A "??"
+        # is visible in the PDF and fixable; a wrong number is neither.
+        if len(scored) > 1 and scored[1][0] == best:
+            continue
+        candidate = label_of_stem[best_stem]
+        if candidate in labels:
+            result[ref] = candidate
+
+    if result:
+        for old_ref, new_label in result.items():
+            tex_text = tex_text.replace(f"\\ref{{{old_ref}}}", f"\\ref{{{new_label}}}")
+        tex_path.write_text(tex_text, encoding="utf-8")
+        logger.warning(
+            "reconcile_figure_refs: Rewrote %d dangling \\ref(s): %s",
+            len(result),
+            ", ".join(f"{k} → {v}" for k, v in result.items()),
+        )
+
+    return result

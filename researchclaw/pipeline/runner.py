@@ -17,7 +17,7 @@ from researchclaw.config import RCConfig
 from researchclaw.evolution import EvolutionStore, extract_lessons
 from researchclaw.knowledge.base import write_stage_to_kb
 from researchclaw.pipeline.executor import StageResult, execute_stage
-from researchclaw.pipeline._helpers import correct_metric_direction
+from researchclaw.pipeline._helpers import correct_metric_direction, _iter_prior_stage_dirs
 from researchclaw.pipeline.stages import (
     DECISION_ROLLBACK,
     MAX_DECISION_PIVOTS,
@@ -265,9 +265,14 @@ def _run_experiment_diagnosis(run_dir: Path, config: RCConfig, run_id: str) -> N
                 except (json.JSONDecodeError, OSError):
                     pass
 
-        # Load refinement log if available
+        # Load refinement log if available. Live Stage 13 only — a ``_vN``
+        # pivot round is a superseded refinement, and this feeds the diagnosis
+        # and quality assessment that decide whether to repair at all.
         ref_log = None
-        for candidate in sorted(run_dir.glob("stage-13*/refinement_log.json")):
+        for _stage13 in _iter_prior_stage_dirs(run_dir, "stage-13*"):
+            candidate = _stage13 / "refinement_log.json"
+            if not candidate.is_file():
+                continue
             try:
                 ref_log = json.loads(candidate.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):

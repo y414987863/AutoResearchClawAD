@@ -19,6 +19,7 @@ import re
 import textwrap
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from researchclaw.templates.conference import ConferenceTemplate
 
@@ -29,6 +30,7 @@ def _reset_render_counters() -> None:
     """Reset per-render figure and table counters for the current thread."""
     _render_counters.table = 0
     _render_counters.figure = 0
+    _render_counters.labels = set()
 
 
 def _next_table_num() -> int:
@@ -43,6 +45,42 @@ def _next_figure_num() -> int:
     next_num = getattr(_render_counters, "figure", 0) + 1
     _render_counters.figure = next_num
     return next_num
+
+
+def _normalize_figure_stem(stem: str) -> str:
+    """Collapse an image file stem to the key used in a ``fig:`` label.
+
+    Must produce the same string as the label-derivation in ``_render_figure``
+    and the reference rewrite in ``reconcile_figure_refs`` (pipeline/_helpers.py):
+    the stem is the only identifier the paper body and the chart directory
+    share, so all three have to agree character for character.
+    """
+    return re.sub(r"[^a-z0-9]+", "_", stem.lower()).strip("_")[:30]
+
+
+def _unique_label(kind: str, key: str) -> str:
+    """Return ``<kind>:<key>``, disambiguated if that label was already used.
+
+    Two figures whose captions collapse to the same slug — in practice, two
+    images that both carried the alt text "Caption", or the same figure
+    embedded twice — would otherwise emit the same ``\\label``. LaTeX resolves
+    a duplicated label to whichever definition comes last and emits no warning
+    that a reference is now ambiguous, so the PDF silently shows the wrong
+    float. Suffixing keeps every reference pointing at its own float.
+    """
+    used = getattr(_render_counters, "labels", None)
+    if used is None:
+        used = _render_counters.labels = set()
+    candidate = f"{kind}:{key}" if key else f"{kind}:float"
+    if candidate not in used:
+        used.add(candidate)
+        return candidate
+    n = 2
+    while f"{candidate}_{n}" in used:
+        n += 1
+    unique = f"{candidate}_{n}"
+    used.add(unique)
+    return unique
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -101,6 +139,11 @@ def markdown_to_latex(
 
     # IMP-30: Detect and remove duplicate tables
     body = _deduplicate_tables(body)
+
+    # The same chart rendered twice — once as the figure agent's float, once
+    # as the generator's copy of it — makes the PDF print the identical plot
+    # under two numbers.
+    body = _deduplicate_figures(body)
 
     # R10-Fix5: Completeness check
     completeness_warnings = check_paper_completeness(sections)
@@ -188,6 +231,14 @@ def _sanitize_latex_output(
         if _uchar in tex:
             tex = tex.replace(_uchar, _lcmd)
 
+    # 1d. Drop invisible formatting chars and emoji/pictographs. The former
+    #     render as nothing; the latter are a hard pdflatex error with no
+    #     LaTeX equivalent to convert to. Either way there is nothing to keep.
+    if _PICTOGRAPH_RE.search(tex):
+        tex = _PICTOGRAPH_RE.sub("", tex)
+    if _INVISIBLE_RE.search(tex):
+        tex = _INVISIBLE_RE.sub("", tex)
+
     # 2. Remove HTML entities that survived pre-processing
     tex = tex.replace("&nbsp;", "~")
     tex = tex.replace("&amp;", "\\&")
@@ -228,20 +279,33 @@ def _sanitize_latex_output(
         tex,
     )
 
-    # 4b. Auto-map orphan \ref{fig:X} to closest \label{fig:Y} by prefix.
+    # 4b. Auto-map orphan \ref{X} to closest \label{Y} by prefix.
     #     The converter generates long labels from captions (fig:overall_cifar_100)
-    #     but the LLM references short names (fig:overall).
-    fig_labels = set(re.findall(r"\\label\{(fig:[^}]+)\}", tex))
-    fig_refs = set(re.findall(r"\\ref\{(fig:[^}]+)\}", tex))
-    orphan_refs = fig_refs - fig_labels
-    orphan_labels = fig_labels - fig_refs
-    if orphan_refs and orphan_labels:
-        for oref in orphan_refs:
-            # Find a label that starts with the ref prefix
+    #     but the LLM references short names (fig:overall).  Tables get the same
+    #     treatment: a table built upstream carries a semantic label
+    #     (tab:main_results) and the body text cites it, so a re-rendered table
+    #     that kept only its positional number would leave the citation dangling.
+    def _remap_orphans(tex: str, kind: str) -> str:
+        labels = set(re.findall(rf"\\label\{{{kind}:([^}}]+)\}}", tex))
+        refs = set(re.findall(rf"\\ref\{{{kind}:([^}}]+)\}}", tex))
+        orphan_refs = refs - labels
+        orphan_labels = labels - refs
+        if not (orphan_refs and orphan_labels):
+            return tex
+        for oref in sorted(orphan_refs):
+            # A label that starts with the ref, or that the ref starts with —
+            # "tab:main_results" against a rendered "tab:2" has neither, so
+            # those are left alone rather than pointed at a wrong table.
             candidates = [l for l in orphan_labels if l.startswith(oref)]
+            if not candidates:
+                candidates = [l for l in orphan_labels if oref.startswith(l)]
             if len(candidates) == 1:
-                tex = tex.replace(f"\\ref{{{oref}}}", f"\\ref{{{candidates[0]}}}")
+                tex = tex.replace(f"\\ref{{{kind}:{oref}}}", f"\\ref{{{kind}:{candidates[0]}}}")
                 orphan_labels.discard(candidates[0])
+        return tex
+
+    for _kind in ("fig", "tab"):
+        tex = _remap_orphans(tex, _kind)
 
     # 5. Fix "Untitled Paper" / "Running Title" fallback titles
     tex = re.sub(
@@ -478,6 +542,14 @@ def _preprocess_markdown(md: str) -> str:
     #    Ensure each heading marker starts on its own line so _parse_sections
     #    can detect them with the ^-anchored regex.
     text = re.sub(r"(?<=[^\n]) +(#{1,4}) +", r"\n\n\1 ", text)
+
+    # A heading marker alone on its line is an empty heading, but
+    # _HEADING_RE requires text after it, so the marker escaped the parser and
+    # the *following* line was read as the heading instead. A stray "#" left
+    # between two figures therefore consumed the next image: the alt text
+    # became a section title and the figure was never rendered. Drop the bare
+    # marker; the content that follows belongs to the enclosing section.
+    text = re.sub(r"^[ \t]*#{1,4}[ \t]*$", "", text, flags=re.MULTILINE)
 
     return text
 
@@ -857,11 +929,83 @@ def _build_body(sections: list[_Section], *, title: str = "") -> str:
     return "\n\n".join(parts) + "\n"
 
 
+#: The same label on two floats means the same float twice, regardless of how
+#: the two copies were captioned or re-typeset.
+_FLOAT_LABEL_RE = re.compile(r"\\label\{([^}]*)\}")
+
+
+def _strip_caption(text: str) -> str:
+    """Remove ``\\caption{...}``, matching braces so nested math survives.
+
+    Captions carry digits that are not data ("12 conditions", the significance
+    legend ``$p<0.05$``) and are exactly what differs between the generator's
+    copy of a table and the writer's relabelled one. A lazy ``.*?`` would stop
+    at the first ``}`` inside a caption like ``\\caption{$\\{x\\}$ set}``.
+    """
+    out = []
+    i = 0
+    while True:
+        j = text.find("\\caption{", i)
+        if j < 0:
+            out.append(text[i:])
+            return "".join(out)
+        out.append(text[i:j])
+        k = j + len("\\caption{")
+        depth = 1
+        while k < len(text) and depth:
+            if text[k] == "{":
+                depth += 1
+            elif text[k] == "}":
+                depth -= 1
+            k += 1
+        i = k
+
+
+def _numeric_row_signature(table_text: str) -> str:
+    """Collapse a table to the sequence of its numbers, ignoring prose.
+
+    Two copies of one results table can differ in caption, in column headers
+    (a re-generated copy titles its columns from the metric key), and in how
+    many significant digits the same value is printed with. The numbers
+    themselves are what the reader compares, so compare on those: strip
+    LaTeX wrappers and whitespace, then keep only digit runs.
+    """
+    # \label{tab:2} would otherwise contribute its own digit and make two
+    # copies of one table look different once one of them is relabelled.
+    body = _strip_caption(table_text)
+    body = re.sub(r"\\(?:label|ref|cite|includegraphics|url)\{[^}]*\}", "", body)
+    body = re.sub(r"\\begin\{table\}.*?\\toprule", "", body, flags=re.DOTALL)
+    body = re.sub(r"\\end\{table\}.*", "", body, flags=re.DOTALL)
+    # \textbf{0.9286} and 0.9286 are the same number to the reader.
+    body = re.sub(r"\\(?:textbf|textit|emph|texttt|mathbf|underline)\{", "", body)
+    body = body.replace("$", "").replace("{", "").replace("}", "")
+    nums = re.findall(r"\d+(?:\.\d+)?", body)
+    if len(nums) < 4:
+        return ""
+    # Compare only to 3 significant decimals: a table re-printed at 2 dp is
+    # still the same table.
+    rounded = []
+    for n in nums:
+        try:
+            rounded.append(f"{round(float(n), 3):g}")
+        except ValueError:
+            continue
+    return ",".join(rounded)
+
+
 def _deduplicate_tables(body: str) -> str:
-    """IMP-30: Remove duplicate tables that share the same header row.
+    """IMP-30: Remove duplicate tables — same ``\\label``, or same numbers.
 
     LLMs sometimes repeat tables (e.g. same results table in Results and
-    Discussion). We keep the first occurrence and drop subsequent copies.
+    Discussion) and the report can hold both a hand-written summary table and
+    the generator's verbatim copy of it. We keep the first occurrence and drop
+    subsequent copies.
+
+    Matching is by ``\\label`` first, then by numeric signature. The original
+    header-row match missed the case that actually matters: a re-generated copy
+    captions its columns from the metric key ("Method & Metric & n") while the
+    original says ("Method & NDCG@10 & ..."), so the two header rows differ
+    textually while the body is identical.
     """
     import logging as _dup_log
 
@@ -873,24 +1017,99 @@ def _deduplicate_tables(body: str) -> str:
         return body
 
     seen_headers: dict[str, int] = {}
+    seen_labels: dict[str, int] = {}
+    seen_numbers: dict[str, int] = {}
     drop_spans: list[tuple[int, int]] = []
-    for m in tables:
+    _log = _dup_log.getLogger(__name__)
+
+    for idx, m in enumerate(tables, start=1):
         table_text = m.group(1)
-        # Extract header row (first row after \toprule)
-        header_match = re.search(r"\\toprule\s*\n(.+?)\\\\", table_text)
-        if not header_match:
-            continue
-        header_key = re.sub(r"\s+", " ", header_match.group(1).strip())
-        if header_key in seen_headers:
+
+        # (a) Same \label — unambiguous, even if one copy was re-typeset.
+        labels = _FLOAT_LABEL_RE.findall(table_text)
+        _dup_of = None
+        for lab in labels:
+            if lab in seen_labels:
+                _dup_of = ("label", lab, seen_labels[lab])
+                break
+        # (b) Same numbers — catches copies whose label was stripped.
+        if _dup_of is None:
+            sig = _numeric_row_signature(table_text)
+            if sig and sig in seen_numbers:
+                _dup_of = ("numbers", sig[:40], seen_numbers[sig])
+        # (c) Same header row — the original heuristic, kept as a last resort.
+        if _dup_of is None:
+            header_match = re.search(r"\\toprule\s*\n(.+?)\\\\", table_text)
+            if header_match:
+                header_key = re.sub(r"\s+", " ", header_match.group(1).strip())
+                if header_key in seen_headers:
+                    _dup_of = ("header", header_key[:40], seen_headers[header_key])
+                else:
+                    seen_headers[header_key] = idx
+
+        if _dup_of is not None:
             drop_spans.append((m.start(), m.end()))
-            _dup_log.getLogger(__name__).info(
-                "IMP-30: Dropping duplicate table (same header as table #%d)",
-                seen_headers[header_key],
+            _log.info(
+                "IMP-30: Dropping duplicate table (same %s as table #%d: %s)",
+                _dup_of[0], _dup_of[2], _dup_of[1],
             )
-        else:
-            seen_headers[header_key] = len(seen_headers) + 1
+            continue
+
+        for lab in labels:
+            seen_labels[lab] = idx
+        sig = _numeric_row_signature(table_text)
+        if sig:
+            seen_numbers[sig] = idx
 
     # Remove duplicates in reverse order to preserve offsets
+    for start, end in reversed(drop_spans):
+        body = body[:start] + body[end:]
+
+    return body
+
+
+_GRAPHICS_RE = re.compile(r"\\includegraphics(?:\[[^\]]*\])?\{([^}]*)\}")
+
+
+def _deduplicate_figures(body: str) -> str:
+    """Drop a figure that renders the same image as one already kept.
+
+    A chart can appear twice with different captions and different labels: the
+    figure agent writes one float, the results generator writes another from
+    the same PNG, and ``_unique_label`` gives the second a fresh label so the
+    two no longer collide by name. The image file is what the reader sees, so
+    that — not the label — is what identifies a duplicate.
+
+    Figures with no ``\\includegraphics`` (TikZ, hand-drawn) are left alone.
+    """
+    _fig_re = re.compile(r"(\\begin\{figure\}.*?\\end\{figure\})", re.DOTALL)
+    figs = list(_fig_re.finditer(body))
+    if len(figs) < 2:
+        return body
+
+    import logging as _fig_log
+
+    _log = _fig_log.getLogger(__name__)
+    seen: dict[str, int] = {}
+    drop_spans: list[tuple[int, int]] = []
+    for idx, m in enumerate(figs, start=1):
+        block = m.group(1)
+        img = _GRAPHICS_RE.search(block)
+        if not img:
+            continue
+        # Normalise the path so "./charts/a.png" and "charts/a.png" agree.
+        key = img.group(1).strip().replace("\\", "/").lstrip("./").lower()
+        if not key:
+            continue
+        if key in seen:
+            drop_spans.append((m.start(), m.end()))
+            _log.info(
+                "Dropping duplicate figure (same image as figure #%d: %s)",
+                seen[key], key,
+            )
+            continue
+        seen[key] = idx
+
     for start, end in reversed(drop_spans):
         body = body[:start] + body[end:]
 
@@ -909,6 +1128,13 @@ _DISPLAY_MATH_DOLLAR_RE = re.compile(
 )
 _FENCED_CODE_RE = re.compile(r"^```(\w*)\n(.*?)^```", re.MULTILINE | re.DOTALL)
 _TABLE_SEP_RE = re.compile(r"^\|[-:| ]+\|$")
+
+# A markdown "table" that is already a complete LaTeX float. Generators that
+# build tables from verified data (``results_table_builder``) emit LaTeX, not
+# pipes, and those blocks carry their own caption and label. Re-rendering one
+# as a markdown table would discard both, so ``_render_table`` passes them
+# through when this matches.
+_TABLE_LABEL_RE = re.compile(r"\\label\{", re.MULTILINE)
 
 # Markdown image pattern: ![caption](path)
 _IMAGE_RE = re.compile(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$")
@@ -1116,7 +1342,15 @@ def _render_table(table_lines: list[str], caption: str = "") -> str:
     text exceeds 25 characters, preventing overflow in conference formats.
     IMP-32: Generates descriptive captions from header columns when the
     caption is empty or just 'Table N'.
+
+    A table already written as a complete LaTeX float is passed through
+    untouched. It carries its own caption and label, and re-rendering it
+    replaced the label with a positional ``tab:<n>`` — leaving every
+    ``\\ref`` the body text had already cited dangling.
     """
+    if _TABLE_LABEL_RE.search("\n".join(table_lines)):
+        return "\n".join(table_lines) + "\n"
+
     if len(table_lines) < 2:
         return ""
 
@@ -1300,7 +1534,37 @@ _UNICODE_GREEK_TO_LATEX: dict[str, str] = {
     "\u0303": "\\~{}",         # ̃  (combining tilde — Run 61 pseudocode)
     "\u221d": "$\\propto$",    # ∝ (proportional to)
     "\u2208": "$\\in$",        # ∈
+    # Modifier letters. A paper writes a transpose as a *superscript*
+    # ("Xᵀ"), and the model reproduces it with the modifier-letter code
+    # point rather than with \top. pdflatex has no glyph for this block and
+    # errors out, so the mapping has to emit the superscript itself — \top
+    # is LaTeX's own transpose operator, which is what the character stands
+    # for.
+    "\u1d40": "$^{\\top}$",    # ᵀ (modifier letter capital T — transpose)
 }
+
+# Invisible formatting characters (zero-width space/joiner, soft hyphen, BOM,
+# bidi marks). They render as nothing, so removing them cannot lose meaning,
+# and leaving them in makes pdflatex emit UTF-8 that breaks log decoding
+# (compiler._sanitize_tex_unicode catches them later, but only after the file
+# has been written once).
+_INVISIBLE_RE = re.compile("[​‌‍﻿­‎‏⁠]")
+
+# Emoji and pictographs. pdflatex has no glyph for these — each one it meets is
+# a "Unicode character not set up for use with LaTeX" error — and no LaTeX
+# command means the same thing, so the character is dropped. Arrows are *not*
+# in this set: a paper can legitimately write "A → B" and the arrow already
+# has a LaTeX spelling, so it is left for the mapper above. These arrive from
+# the pipeline's own log lines (the stage-22 "Lessons from Prior Runs" section
+# quotes research-decision records verbatim, and those start with a warning
+# emoji), not from the model writing prose.
+_PICTOGRAPH_RE = re.compile(
+    "[\U0001f000-\U0001faff"   # emoji & symbols
+    "☀-⛿"            # misc symbols (⚠ ☀ ☁ …)
+    "✀-➿"            # dingbats, misc symbols and arrows (✅ ✏ …)
+    "︀-️"            # variation selectors (the U+FE0F in U+26A0 U+FE0F)
+    "]"
+)
 
 _ALGO_KEYWORDS = re.compile(
     r"\b(Input|Output|Return|While|For|If|Else|Repeat|Until|Function|Procedure|Algorithm)\b",
@@ -1435,14 +1699,21 @@ def _render_figure(caption: str, path: str) -> str:
     path = path.replace(" ", "_")
     cap_tex = _convert_inline(caption) if caption else f"Figure {fig_num}"
     label_key = re.sub(r"[^a-z0-9]+", "_", caption.lower()).strip("_")[:30]
-    if not label_key:
-        label_key = str(fig_num)
+    if not label_key or caption.strip().lower() == "caption":
+        # A generic alt text carries no identity; key the label on the image
+        # itself so two different figures don't collide on "fig:caption".
+        # Using the *stem* (not the whole path) matters: the pipeline's second
+        # pass, _resolve_ref_labels in pipeline/_helpers.py, reads this label
+        # back out of the figure block and matches charts by that same stem, so
+        # a label carrying "charts/" or a subdirectory would not be found.
+        label_key = _normalize_figure_stem(Path(path).stem)
+    label = _unique_label("fig", label_key or str(fig_num))
     return (
         "\\begin{figure}[t]\n"
         "\\centering\n"
         f"\\includegraphics[width=0.95\\columnwidth]{{{path}}}\n"
         f"\\caption{{{cap_tex}}}\n"
-        f"\\label{{fig:{label_key}}}\n"
+        f"\\label{{{label}}}\n"
         "\\end{figure}"
     )
 

@@ -534,7 +534,15 @@ def _load_experiment_summary(run_dir: Path) -> dict | None:
 
 
 def _load_refinement_log(run_dir: Path) -> dict | None:
-    """Load the most recent refinement_log.json."""
+    """Load the most recent refinement_log.json.
+
+    Deliberately does NOT use ``_iter_prior_stage_dirs``: this is the one path
+    that must see ``stage-13_vN``. Repair re-enters a rolled-back round's
+    workspace on purpose — that round's log is the thing being repaired — so
+    filtering versions out here would leave it with nothing to work from. The
+    run analysis paths (``_analysis.py`` R13-1, ``_paper_writing.py``) have the
+    opposite requirement and do use the shared scan.
+    """
     for candidate in sorted(run_dir.glob("stage-13*/refinement_log.json"), reverse=True):
         try:
             return json.loads(candidate.read_text(encoding="utf-8"))
