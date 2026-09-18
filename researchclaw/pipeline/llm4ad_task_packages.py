@@ -669,6 +669,15 @@ def _write_config(
         "  island_population_size: {}\n".format(
             int(island.get("island_population_size") or 2)
         ),
+        # Migration was read from config but never written out, so every run used
+        # LLM4AD's own 5 / 0.1 regardless of what the config said -- unnoticed
+        # only because those happen to be the defaults. Both now reach the file.
+        "  migration_interval: {}\n".format(
+            int(island.get("migration_interval") or 5)
+        ),
+        "  migration_rate: {}\n".format(
+            _yaml_float(island.get("migration_rate") or 0.1)
+        ),
     ]
     evolution_yaml = "".join(evo_lines)
 
